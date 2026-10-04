@@ -12,7 +12,7 @@ Resume: read this file, then docs/decision-log.md, then handoff file 28.
 | P0-play | playbook.md | done |
 | P0-review | docs/phase-0-review.md | done |
 | P1-core | engine core + memory store + six calls + lint | done: lint ok, 33 unit tests pass |
-| P1-sim | simulator: 1,000 random orders + named cases | pending |
+| P1-sim | simulator: 1,000 random orders + named cases | running (sonnet) |
 | P1-red | Opus red-team, fix confirmed | pending |
 | P2-harness | replay harness, real model via gateway | running (sonnet): world, driver, model loop, scorer; engine binding later |
 | P2-runs | replays under flag and hold, scored vs D7 | pending |
