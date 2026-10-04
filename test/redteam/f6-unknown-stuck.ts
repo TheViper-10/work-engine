@@ -1,4 +1,6 @@
 // Playbook cancel instruction: "operation still in flight marked unknown if you cannot tell". unknown keeps lease and blocks finish.
+// Updated for R22 (supersedes R17 H5 release-on-cancel): the cancel now ends as cancelled with cleanup_pending, the lease stays
+// held until readback, and the real defect to guard against is a lease held with no wake or escalation. Repro = that silent state.
 import { world, J, WF, check, MIN } from './h.ts';
 const w = world('hold');
 await w.engine.jobOpen({ workflow: WF, target: 'T1', thread: 'A' }, { session_id: 's1' });
@@ -11,7 +13,7 @@ const j = await w.peek('job', J), qj = await w.peek('job', q.job), lease = await
 await w.engine.jobOpen({ workflow: WF, target: 'T2', thread: 'D' }, { session_id: 's3' });
 const t2 = await w.engine.intend({ job: 'desktop-release:T2', action: 'publish_prod_alpha', ref: 'b9' }, { session_id: 's3' });
 check('cancel with unknown outcome (as the playbook says): 48h later job cancel_requested, alpha leased, queued job never opens, other release held',
-  j.status === 'cancel_requested' && lease.holder_job === J && qj.status === 'queued' && t2.status === 'hold',
+  lease.holder_job === J && (w.wakes.filter((x: any) => x.dm === 'dm:' + J).length === 0 || !j.cleanup_escalated || j.cleanup_pending.length === 0 || t2.status !== 'hold'),
   `job=${j.status} lease=${lease.holder_job} queued=${qj.status} T2 intend=${t2.status} wakes to cancelled job=${w.wakes.filter((x: any) => x.dm === 'dm:' + J).length}`);
 // variant: Tony never reports; sweep turns it unknown and WAKES the job to verify; once Tony reports, alpha is free
 const w2 = world('hold');

@@ -16,6 +16,14 @@ export interface EngineConfig {
   checks: Record<CheckName, CheckMode>;
   runTimeoutMinutes: number;
   sweepMinutes: number;
+  /** A2: minutes of unconfirmed attempts with no confirmed owner call before the job records escalate. */
+  identityEscalateMinutes: number;
+  /** A4: at most one notice into an active home per this many minutes. */
+  noticeCoalesceMinutes: number;
+  /** A4: unprocessed inbox items above this bound coalesce plain messages into one overflow item. */
+  inboxMaxUnprocessed: number;
+  /** R24: version of the agent guidance, recorded on each job at open. */
+  guidanceVersion?: string;
 }
 
 export type EngineConfigInput = Pick<EngineConfig, 'env' | 'bot' | 'ownBotUserId'> &
@@ -34,5 +42,9 @@ export function defineConfig(input: EngineConfigInput): EngineConfig {
     checks,
     runTimeoutMinutes: input.runTimeoutMinutes ?? 20,
     sweepMinutes: input.sweepMinutes ?? 5,
+    identityEscalateMinutes: input.identityEscalateMinutes ?? 30,
+    noticeCoalesceMinutes: input.noticeCoalesceMinutes ?? 2,
+    inboxMaxUnprocessed: input.inboxMaxUnprocessed ?? 50,
+    guidanceVersion: input.guidanceVersion,
   };
 }

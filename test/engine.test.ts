@@ -229,13 +229,17 @@ test('sender_not_listed: stand-in accepted, stranger flagged or held', async () 
   }
 });
 
-test('missing session is flagged and never held, even when every check is hold', async () => {
-  const e = setup(Object.fromEntries(CHECK_NAMES.map((n) => [n, 'hold'])) as Record<CheckName, CheckMode>);
+test('missing session is flagged; a consequential call is held (A2 replaces D1 never-hold), reads still work', async () => {
+  // A2 (job-home contract): missing identity never establishes action authority, so intend answers hold
+  // whatever the check config says. The flag stays visible and the read is never refused.
+  const e = setup();
   const job = await open(e, 't1', 'A', {});
   const r = await e.engine.intend({ job, action: 'a4', ref: 'x' }, {});
-  assert.equal(r.status, 'clear');
+  assert.equal(r.status, 'hold');
+  assert.equal(r.reason, 'ownership_unconfirmed');
   const v = await e.engine.jobView({ job });
   assert.ok(flagsOf(v).includes('missing_session'));
+  assert.ok(flagsOf(v).includes('identity_unconfirmed'));
   assert.equal(flagsOf(v).filter((f: string) => f === 'superseded_run').length, 0);
   await ok(e, [job]);
 });
@@ -312,7 +316,11 @@ test('ingest: unblock rules set next wake to now (responder, other bot, watched 
   e.clock.advance(MIN);
   await e.engine.ingest({ source: 'slack', delivery_id: 'h', kind: 'message', thread: 'A', sender_id: 'U5' });
   let j = (await e.engine.jobView({ job })).jobs as any[];
-  assert.ok(j[0].next_wake_at > e.clock.now(), 'a stranger does not wake');
+  // A4 (replaces the earlier "a stranger does not wake"): every human message in a linked thread is an inbox
+  // item, and an item for an idle home sets the wake to now. The owner reads it and decides.
+  assert.equal(j[0].next_wake_at, e.clock.now(), 'a stranger message is an inbox item and wakes the idle home');
+  assert.equal(j[0].inbox_unprocessed, 1);
+  await e.engine.checkpoint({ job, status: 'waiting', next_wake_in: '120m' }, S1);
   await e.engine.ingest({ source: 'slack', delivery_id: 'resp', kind: 'message', thread: 'A', sender_id: 'U1' });
   j = (await e.engine.jobView({ job })).jobs as any[];
   assert.equal(j[0].next_wake_at, e.clock.now(), 'responder wakes');
@@ -535,4 +543,238 @@ test('answers always carry say_to_tony and never throw on bad input', async () =
     assert.equal(typeof c.say_to_tony, 'string');
     assert.ok(c.say_to_tony.length > 10);
   }
+});
+
+// ---------------------------------------------------------------- job-home contract (A1 to A4, R20 to R24)
+
+import { FakeSessionDirectory, homeForAllSessions } from '../src/session-directory.ts';
+
+function homeSetup(extra: { inboxMaxUnprocessed?: number; noticeCoalesceMinutes?: number; identityEscalateMinutes?: number; guidanceVersion?: string } = {}) {
+  const store = new MemoryStore();
+  const clock = new ManualClock(T0);
+  const dir = new FakeSessionDirectory();
+  const wakes: Array<{ dm: string; text: string }> = [];
+  const state = { stale: false, builds: { g1: 'b1', g2: 'b1' } as Record<string, string | null> };
+  const engine = new Engine({
+    store, clock, sessionDirectory: dir,
+    sourceReader: { currentBuild: async (_j, g) => state.builds[g] ?? null },
+    slackReader: { findOwnPostAfter: async () => null },
+    waker: { postWake: async (dm, text) => { wakes.push({ dm, text }); if (state.stale && !/notice/.test(text)) { state.stale = false; return { stale_version: true }; } } },
+    config: defineConfig({ env: 'test', bot: 'bot', ownBotUserId: BOT, ...extra }),
+    specs: [SPEC],
+  });
+  const JOB = 'wf-test:t1';
+  dir.set('h1', `dm:${JOB}`); dir.set('h2', `dm:${JOB}:g2`); dir.set('m1', 'dm:mention:m1');
+  return { store, clock, dir, wakes, state, engine, JOB };
+}
+const H1 = { session_id: 'h1' };
+const M1 = { session_id: 'm1' };
+
+test('A1: a mention session can read, join and promise, but intend and say are routed to the owner', async () => {
+  const e = homeSetup();
+  const r = await e.engine.jobOpen({ workflow: 'wf-test', target: 't1', thread: 'A' }, M1);
+  assert.equal(r.work_run, 'none', 'a mention session never becomes the work run');
+  const h = await e.engine.checkpoint({ job: e.JOB, status: 'working' }, H1);
+  assert.equal(h.ok, true);
+  const i = await e.engine.intend({ job: e.JOB, action: 'a3', ref: 'x' }, M1);
+  assert.equal(i.status, 'route');
+  assert.equal(i.operation, undefined);
+  const s = await e.engine.say({ job: e.JOB, thread: 'A', milestone: 'm1' }, M1);
+  assert.equal(s.status, 'route');
+  assert.match(s.say_to_tony, /job owner will tell/);
+  const c = await e.engine.checkpoint({ job: e.JOB, status: 'done', operations: [{ ref: 'x', action: 'a3', outcome: 'done' }], reached: ['m1'] }, M1);
+  assert.equal((c as any).job_status, 'open', 'a non-home checkpoint never changes status');
+  assert.match(c.say_to_tony, /not applied/);
+  const q = await e.engine.jobOpen({ workflow: 'wf-test', target: 't1', thread: 'B', intent: 'replace' }, M1);
+  assert.equal(q.status, 'route');
+  assert.equal((await e.engine.promiseAdd({ job: e.JOB, thread: 'A', about: 'm_final' }, M1)).status, 'promised');
+  const v = (await e.engine.jobView({ job: e.JOB }, H1)).jobs as any[];
+  assert.ok(v[0].inbox_unprocessed >= 4);
+  assert.equal(v[0].status, 'open');
+  const run = await e.store.get<any>(makeKey('test', 'bot', 'run', `${e.JOB}:1`));
+  assert.equal(run.session_id, 'h1');
+  await ok(e as unknown as Env, [e.JOB]);
+});
+
+test('A2: lookup failure or no session holds consequential calls in every config; reads and promises work; escalates', async () => {
+  const e = homeSetup();
+  await e.engine.jobOpen({ workflow: 'wf-test', target: 't1', thread: 'A' }, H1);
+  e.dir.set('h3', `dm:${e.JOB}`); // a session whose lookup was never cached
+  const H3 = { session_id: 'h3' };
+  e.dir.fail('*');
+  for (const [name, r] of [
+    ['intend', await e.engine.intend({ job: e.JOB, action: 'a4', ref: 'x' }, H3)],
+    ['say', await e.engine.say({ job: e.JOB, thread: 'A', milestone: 'm1' }, H3)],
+    ['checkpoint', await e.engine.checkpoint({ job: e.JOB, status: 'done' }, H3)],
+    ['no session', await e.engine.intend({ job: e.JOB, action: 'a4', ref: 'x' }, {})],
+  ] as const) {
+    assert.equal(r.status, 'hold', name);
+    assert.equal(r.reason, 'ownership_unconfirmed', name);
+  }
+  const job = await e.store.get<any>(makeKey('test', 'bot', 'job', e.JOB));
+  assert.equal(job.op_keys.length, 0);
+  assert.equal(job.status, 'open');
+  assert.equal((await e.engine.promiseAdd({ job: e.JOB, thread: 'A', about: 'm_final' }, H3)).status, 'promised');
+  const v = await e.engine.jobView({ job: e.JOB }, H3);
+  assert.ok(flagsOf(v).includes('identity_unconfirmed'));
+  const job2 = await e.store.get<any>(makeKey('test', 'bot', 'job', e.JOB));
+  assert.match(job2.wake_reasons.join(';'), /identity unconfirmed for h3; resume from the job home/);
+  e.clock.advanceMinutes(31);
+  await e.engine.intend({ job: e.JOB, action: 'a4', ref: 'x' }, H3);
+  await e.engine.sweep();
+  assert.ok(flagsOf(await e.engine.jobView({ job: e.JOB }, H1)).includes('escalate'));
+  assert.ok(e.wakes.some((w) => /escalate: identity/.test(w.text)));
+  e.dir.fail('*', false); // failures are never cached
+  assert.equal((await e.engine.intend({ job: e.JOB, action: 'a4', ref: 'x' }, H3)).status, 'clear');
+  assert.equal((await e.store.get<any>(makeKey('test', 'bot', 'job', e.JOB))).identity, null);
+});
+
+test('A1: successful lookups are cached, failures are not', async () => {
+  const e = homeSetup();
+  await e.engine.jobOpen({ workflow: 'wf-test', target: 't1', thread: 'A' }, H1);
+  await e.engine.intend({ job: e.JOB, action: 'a4', ref: 'x' }, H1);
+  await e.engine.intend({ job: e.JOB, action: 'a4', ref: 'y' }, H1);
+  assert.equal(e.dir.lookups, 1);
+  e.dir.fail('m1');
+  await e.engine.intend({ job: e.JOB, action: 'a4', ref: 'z' }, M1);
+  await e.engine.intend({ job: e.JOB, action: 'a4', ref: 'z' }, M1);
+  assert.equal(e.dir.lookups, 3);
+});
+
+test('A3: replaceHome bumps the generation, fences the old session, hands over unknown operations', async () => {
+  const e = homeSetup();
+  await e.engine.jobOpen({ workflow: 'wf-test', target: 't1', thread: 'A' }, H1);
+  await e.engine.intend({ job: e.JOB, action: 'a3', ref: 'x' }, H1);
+  const r = await e.engine.replaceHome(e.JOB, 'test');
+  assert.equal(r.status, 'replaced');
+  const job = await e.store.get<any>(makeKey('test', 'bot', 'job', e.JOB));
+  assert.equal(job.generation, 2);
+  assert.equal(job.dm_id, `dm:${e.JOB}:g2`);
+  assert.deepEqual(job.homes.map((h: any) => h.closed_at !== null), [true, false]);
+  assert.match(e.wakes[e.wakes.length - 1].text, /read back first: a3 x \(unknown\)/);
+  assert.equal(e.wakes[e.wakes.length - 1].dm, `dm:${e.JOB}:g2`);
+  const old = await e.engine.checkpoint({ job: e.JOB, status: 'done' }, H1);
+  assert.equal(old.status, 'superseded');
+  assert.match(old.say_to_tony, /moved to a new home/);
+  assert.equal((await e.engine.intend({ job: e.JOB, action: 'a4', ref: 'q' }, H1)).status, 'superseded');
+  assert.equal((await e.store.get<any>(makeKey('test', 'bot', 'job', e.JOB))).status, 'open');
+  assert.equal((await e.engine.intend({ job: e.JOB, action: 'a4', ref: 'q' }, { session_id: 'h2' })).status, 'clear');
+  await ok(e as unknown as Env, [e.JOB]);
+});
+
+test('A3: a wake that reports a stale version replaces the home', async () => {
+  const e = homeSetup();
+  await e.engine.jobOpen({ workflow: 'wf-test', target: 't1', thread: 'A' }, H1);
+  e.state.stale = true;
+  e.clock.advanceMinutes(45);
+  await e.engine.sweep();
+  assert.equal((await e.store.get<any>(makeKey('test', 'bot', 'job', e.JOB))).generation, 2);
+  assert.equal(e.wakes[e.wakes.length - 1].dm, `dm:${e.JOB}:g2`);
+});
+
+test('A4: inbox items are per job, ambiguous for shared threads, folded over the bound, acknowledged by processed', async () => {
+  const e = homeSetup({ inboxMaxUnprocessed: 3 });
+  await e.engine.jobOpen({ workflow: 'wf-test', target: 't1', thread: 'A' }, H1);
+  await e.engine.jobOpen({ workflow: 'wf-test', target: 't2', thread: 'A' }, H1);
+  await e.engine.ingest({ source: 'slack', delivery_id: 'x1', kind: 'message', thread: 'A', sender_id: 'U1' });
+  let v = (await e.engine.jobView({ job: 'wf-test:t1' }, H1)).jobs as any[];
+  assert.equal(v[0].inbox.length, 1);
+  assert.equal(v[0].inbox[0].ambiguous, true);
+  const amb = await e.engine.intend({ job: 'wf-test:t1', action: 'a2', ref: 'p', because: 'slack:x1' }, H1);
+  assert.ok(flagsOf(await e.engine.jobView({ job: 'wf-test:t1' }, H1)).includes('ambiguous_association'));
+  assert.match(amb.say_to_tony, /ambiguous_association/);
+  for (let i = 0; i < 6; i++) await e.engine.ingest({ source: 'slack', delivery_id: `m${i}`, kind: 'message', thread: 'A', sender_id: 'U9' });
+  v = (await e.engine.jobView({ job: 'wf-test:t1' }, H1)).jobs as any[];
+  assert.ok(v[0].inbox.some((i: any) => i.count > 0), 'overflow item');
+  assert.equal(v[0].inbox.filter((i: any) => i.count).length, 1);
+  const explicit = await e.engine.checkpoint({ job: 'wf-test:t1', status: 'working', processed: ['slack:x1'] }, H1);
+  assert.match(explicit.say_to_tony, /processed/);
+  v = (await e.engine.jobView({ job: 'wf-test:t1' }, H1)).jobs as any[];
+  assert.equal(v[0].inbox_unprocessed, 0, 'items shown in the view are processed by the next owner checkpoint');
+});
+
+test('A4: a notice is posted into an active home, coalesced; an idle home is woken instead', async () => {
+  const e = homeSetup();
+  await e.engine.jobOpen({ workflow: 'wf-test', target: 't1', thread: 'A' }, H1);
+  await e.engine.intend({ job: e.JOB, action: 'a4', ref: 'x' }, H1); // the owner is mid-work: run active
+  await e.engine.ingest({ source: 'slack', delivery_id: 'a', kind: 'message', thread: 'A', sender_id: 'U9' });
+  await e.engine.ingest({ source: 'slack', delivery_id: 'b', kind: 'message', thread: 'A', sender_id: 'U9' });
+  assert.equal(e.wakes.filter((w) => /notice/.test(w.text)).length, 1);
+  e.clock.advanceMinutes(3);
+  await e.engine.ingest({ source: 'slack', delivery_id: 'c', kind: 'message', thread: 'A', sender_id: 'U9' });
+  assert.equal(e.wakes.filter((w) => /notice/.test(w.text)).length, 2);
+  e.clock.advanceMinutes(60); // the run goes quiet
+  await e.engine.ingest({ source: 'slack', delivery_id: 'd', kind: 'message', thread: 'A', sender_id: 'U9' });
+  const job = await e.store.get<any>(makeKey('test', 'bot', 'job', e.JOB));
+  assert.ok(job.next_wake_at <= e.clock.now(), 'idle home: wake now');
+});
+
+test('A4: input after the job ended is a late item and never reopens it', async () => {
+  const e = homeSetup();
+  await e.engine.jobOpen({ workflow: 'wf-test', target: 't1', thread: 'A' }, H1);
+  await e.engine.checkpoint({ job: e.JOB, status: 'done' }, H1);
+  await e.engine.ingest({ source: 'slack', delivery_id: 'l', kind: 'message', thread: 'A', sender_id: 'U1' });
+  const v = (await e.engine.jobView({ job: e.JOB }, H1)).jobs as any[];
+  assert.equal(v[0].status, 'done');
+  assert.equal(v[0].late.length, 1);
+});
+
+test('R20 and R21: a revoked go is caught at intend; a cancel from an unlisted sender is recorded and flagged', async () => {
+  const e = homeSetup();
+  await e.engine.jobOpen({ workflow: 'wf-test', target: 't1', thread: 'A' }, H1);
+  await e.engine.say({ job: e.JOB, thread: 'A', milestone: 'm1' }, H1);
+  await e.engine.ingest({ source: 'slack', delivery_id: 'go', kind: 'message', thread: 'A', sender_id: 'U1' });
+  e.clock.advance(MIN);
+  await e.engine.ingest({ source: 'slack', delivery_id: 'stop', kind: 'message', thread: 'A', sender_id: 'U1', attrs: { inbox_kind: 'cancel' } });
+  const r = await e.engine.intend({ job: e.JOB, action: 'a1', ref: 'pr', because: 'slack:go' }, H1);
+  assert.match(r.say_to_tony, /revoked/);
+  await e.engine.ingest({ source: 'slack', delivery_id: 'cx', kind: 'message', thread: 'A', sender_id: 'U9', attrs: { inbox_kind: 'cancel' } });
+  assert.ok(flagsOf(await e.engine.jobView({ job: e.JOB }, H1)).includes('sender_not_listed'));
+});
+
+test('R22: a cancel with an unknown operation keeps the lease and a wake until readback', async () => {
+  const e = homeSetup();
+  await e.engine.jobOpen({ workflow: 'wf-test', target: 't1', thread: 'A' }, H1);
+  await e.engine.intend({ job: e.JOB, action: 'a3', ref: 'x' }, H1);
+  const c = await e.engine.checkpoint({ job: e.JOB, status: 'cancelled', operations: [{ ref: 'x', action: 'a3', outcome: 'unknown' }] }, H1);
+  assert.equal((c as any).job_status, 'cancelled');
+  const lk = makeKey('test', 'bot', 'lease', 'r1');
+  assert.equal((await e.store.get<any>(lk)).holder_job, e.JOB);
+  let job = await e.store.get<any>(makeKey('test', 'bot', 'job', e.JOB));
+  assert.deepEqual(job.cleanup_pending, [`${e.JOB}:a3:x`]);
+  assert.notEqual(job.next_wake_at, null);
+  e.clock.advanceMinutes(125);
+  await e.engine.sweep();
+  job = await e.store.get<any>(makeKey('test', 'bot', 'job', e.JOB));
+  assert.equal(job.cleanup_escalated, true);
+  await e.engine.checkpoint({ job: e.JOB, status: 'working', operations: [{ ref: 'x', action: 'a3', outcome: 'failed' }] }, H1);
+  assert.equal((await e.store.get<any>(lk)).holder_job, null);
+  job = await e.store.get<any>(makeKey('test', 'bot', 'job', e.JOB));
+  assert.deepEqual(job.cleanup_pending, []);
+  assert.equal(job.next_wake_at, null);
+  await ok(e as unknown as Env, [e.JOB]);
+});
+
+test('R23: no check changes with the contract; config defaults for the new bounds', () => {
+  const c = defineConfig({ env: 'e', bot: 'b', ownBotUserId: 'U' });
+  assert.equal(c.identityEscalateMinutes, 30);
+  assert.equal(c.noticeCoalesceMinutes, 2);
+  assert.equal(c.inboxMaxUnprocessed, 50);
+  for (const n of CHECK_NAMES) assert.equal(c.checks[n], 'flag');
+});
+
+test('R24: guidance_version is recorded at open from config or deps; a later change shows in the view', async () => {
+  const e = homeSetup({ guidanceVersion: 'g-aaa' });
+  await e.engine.jobOpen({ workflow: 'wf-test', target: 't1', thread: 'A' }, H1);
+  assert.equal((await e.store.get<any>(makeKey('test', 'bot', 'job', e.JOB))).guidance_version, 'g-aaa');
+  const e2 = new Engine({ store: e.store, clock: e.clock, sessionDirectory: e.dir, sourceReader: { currentBuild: async () => 'b1' }, slackReader: { findOwnPostAfter: async () => null }, waker: { postWake: async () => {} }, config: defineConfig({ env: 'test', bot: 'bot', ownBotUserId: BOT }), specs: [SPEC], guidanceVersion: 'g-bbb' });
+  const v = await e2.jobView({ job: e.JOB }, H1);
+  assert.match(v.say_to_tony, /Guidance changed/);
+});
+
+test('default directory homeForAllSessions maps every session to the job home (harness transition only)', async () => {
+  const e = setup();
+  const job = await open(e);
+  assert.equal((await e.engine.intend({ job, action: 'a4', ref: 'x' }, S2)).status, 'clear');
+  assert.deepEqual(await homeForAllSessions.dmOf('any', { id: 'j', dm: 'dm:j', generation: 1 }), { dm: 'dm:j' });
 });

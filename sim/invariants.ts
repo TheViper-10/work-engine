@@ -8,14 +8,27 @@ import { MIN } from './world.ts';
 export const THREADS = ['A', 'B', 'D', 'E', 'Q', 'C', 'Z'];
 const OK_FALSE = new Set(['no_job', 'no_such_job', 'bad_input', 'unknown_workflow', 'job_ended', 'bad_event']);
 
+
 /** Checks on one answer: no protocol refusal, holds only from the five checks, privacy. */
-export function checkAnswer(w: World, call: string, args: any, ans: Answer): string[] {
+export function checkAnswer(w: World, call: string, args: any, ans: Answer, sid: string | null = null): string[] {
   const bad: string[] = [];
   if (!ans || typeof ans !== 'object') return [`${call}: answer is not an object`];
   if (typeof ans.say_to_tony !== 'string' || ans.say_to_tony.length === 0) bad.push(`${call}: empty say_to_tony`);
   if ((ans as any).kind === 'refused' || /refus|denied|forbidden|rejected|not allowed/i.test(ans.status)) bad.push(`${call}: protocol refusal (${ans.status})`);
   if (!ans.ok && !OK_FALSE.has(ans.status) && !(ans.status === 'wake_failed' && w.wakerFail)) bad.push(`${call}: ok=false with unexpected status ${ans.status}`);
-  if (ans.status === 'hold') {
+  if (ans.status === 'route' || ans.status === 'superseded') {
+    if (!['intend', 'say', 'checkpoint', 'jobOpen', 'promiseAdd'].includes(call)) bad.push(`${call}: ${ans.status} from a call that cannot be routed`);
+    if (ans.status === 'route' && (!sid || !w.dir.mention.has(sid))) bad.push(`${call}: route for ${sid ?? 'no session'}, which is not a mention session`);
+    if (ans.status === 'superseded' && !/moved to a new home/.test(ans.say_to_tony)) bad.push(`${call}: superseded without saying the job moved`);
+    if (call === 'intend' && (ans as any).operation) bad.push('intend: route or superseded opened an operation');
+  }
+  if (ans.status === 'hold' && (ans as any).reason === 'ownership_unconfirmed') {
+    // A2: the one fixed hold. It must never leave anything in flight and is valid in both modes.
+    if (!['intend', 'say', 'checkpoint', 'jobOpen'].includes(call)) bad.push(`${call}: ownership hold from a call that is not consequential`);
+    if (sid && !w.dir.broken(sid)) bad.push(`${call}: ownership hold for ${sid}, whose lookup works`);
+    if ((ans as any).operation) bad.push(`${call}: ownership hold left an operation behind`);
+    if (!/ownership unconfirmed/i.test(ans.say_to_tony)) bad.push(`${call}: ownership hold without saying so`);
+  } else if (ans.status === 'hold') {
     if (call !== 'intend') bad.push(`${call}: hold answer from a call that has no checks`);
     const holds = (ans.holds as string[] | undefined) ?? [];
     if (w.mode !== 'hold') bad.push(`intend: hold under flag config`);
@@ -59,7 +72,7 @@ export async function checkState(w: World, afterSweep: boolean): Promise<string[
     if (terminal) {
       for (const p of proms) if (p.state === 'open' || p.state === 'due') bad.push(`${job.id}: ${job.status} job still has ${p.state} promise ${p.key}`);
       if (Object.keys(job.claims).length) bad.push(`${job.id}: ${job.status} job still has claims ${JSON.stringify(job.claims)}`);
-      if (job.next_wake_at !== null) bad.push(`${job.id}: ${job.status} job has next_wake_at`);
+      if (job.next_wake_at !== null && !(job.status === 'cancelled' && job.cleanup_pending?.length)) bad.push(`${job.id}: ${job.status} job has next_wake_at`);
     } else if (job.status === 'open' || job.status === 'closing') {
       const l = openPerTarget.get(`${job.workflow}:${job.target}`) ?? [];
       l.push(job.id);
@@ -114,7 +127,8 @@ export async function checkState(w: World, afterSweep: boolean): Promise<string[
       const live = lops.filter((o: any) => o.job === lease.holder_job && o.lease_taken && (o.outcome === 'in_flight' || o.outcome === 'unknown'));
       if (live.length === 0) bad.push(`lease ${res}: held by ${lease.holder_job} without an in-flight operation`);
       const h = jobs.find((j) => j.id === lease.holder_job);
-      if (h && (h.status === 'done' || h.status === 'cancelled')) bad.push(`lease ${res}: held by ended job ${h.id}`);
+      // R22: a cancelled job keeps a lease only through an unknown operation listed in cleanup_pending.
+      if (h && (h.status === 'done' || (h.status === 'cancelled' && !lops.some((o: any) => o.job === h.id && h.cleanup_pending?.includes(o.key) && o.lease_taken)))) bad.push(`lease ${res}: held by ended job ${h.id}`);
       // no lease held forever by an unknown outcome once its job is cancelled or has been unknown for a long time with no wake
       const stuck = lops.filter((o: any) => o.outcome === 'unknown' && o.outcome_at === null && now - o.intent_at > 24 * 60 * MIN);
       if (afterSweep && h && stuck.length && h.status === 'cancel_requested') bad.push(`lease ${res}: held by cancelled job ${h.id} through an unknown operation for over a day`);

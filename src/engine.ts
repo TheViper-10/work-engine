@@ -3,9 +3,11 @@
 
 import { CHECK_NAMES, type EngineConfig } from './config.ts';
 import { makeKey, MAX_BATCH, type Store } from './store.ts';
+import { homeForAllSessions } from './session-directory.ts';
 import type {
   Answer, Ask, CheckName, Claim, Clock, Ctx, Delivery, EventRecord, FlagKind, FlagRecord, IngestEvent,
-  Job, JobStatus, Lease, Operation, Promise_, Run, SlackReader, SourceReader, Spec, Waker,
+  InboxItem, InboxKind, Job, JobStatus, Lease, Operation, Promise_, Run, SessionDirectory, SlackReader, SourceReader,
+  Spec, Waker,
 } from './types.ts';
 import { chunk, fmtAge, MIN, parseDuration, parseTime, uniq } from './util.ts';
 
@@ -17,7 +19,23 @@ export interface EngineDeps {
   waker: Waker;
   config: EngineConfig;
   specs: Spec[] | Record<string, Spec>;
+  /** A1: which DM a session lives in. Optional; the default maps every session to the job's home (harness transition only). */
+  sessionDirectory?: SessionDirectory;
+  /** R24: version of the agent guidance, recorded on each job at open. */
+  guidanceVersion?: string;
 }
+
+/** The caller's relation to the job's home (A1, A2, A3). */
+type Own =
+  | { state: 'home' }
+  | { state: 'non_home'; dm: string }
+  | { state: 'superseded'; why: string }
+  | { state: 'unconfirmed'; why: string };
+
+const INBOX_REASON = 'new input is waiting in the inbox; read job_view';
+const MAX_SEEN = 12;
+const INBOX_SHOWN = 25;
+const MAX_LATE_ITEMS = 10;
 
 interface JobIndex { seq: number; primary: string | null; queued: string[]; winding: string[] }
 interface ThreadIndex { jobs: string[] }
@@ -48,8 +66,16 @@ export class Engine {
   readonly config: EngineConfig;
   private readonly specs: Record<string, Spec>;
   private chain: Promise<unknown> = Promise.resolve();
+  private readonly directory: SessionDirectory;
+  private readonly guidance: string | null;
+  /** Successful session lookups only; failures are never cached (A1). */
+  private readonly dmCache = new Map<string, string>();
+  /** Set by addInboxItem: the item already existed (a duplicate or a retry), so no new notice is owed. */
+  private lastInboxExisting = false;
 
   constructor(deps: EngineDeps) {
+    this.directory = deps.sessionDirectory ?? homeForAllSessions;
+    this.guidance = deps.guidanceVersion ?? deps.config.guidanceVersion ?? null;
     this.store = deps.store;
     this.clock = deps.clock;
     this.sourceReader = deps.sourceReader;
@@ -88,7 +114,7 @@ export class Engine {
   checkpoint(
     args: { job: string; status: string; waiting_for?: string; next_wake_in?: number | string;
       operations?: Array<{ ref: string; action?: string; outcome: 'done' | 'failed' | 'unknown'; note?: string }>;
-      reached?: string[] },
+      reached?: string[]; processed?: string[] },
     ctx: Ctx = {},
   ): Promise<Answer> {
     return this.serial(() => this.doCheckpoint(args, ctx));
@@ -101,6 +127,10 @@ export class Engine {
   }
   sweep(): Promise<Answer> {
     return this.serial(() => this.doSweep());
+  }
+  /** A3: controlled replacement. Bumps the generation, opens a new home, supersedes the run and wakes the new home. */
+  replaceHome(job: string, reason: string): Promise<Answer> {
+    return this.serial(() => this.doReplaceHome(job, reason, true));
   }
   wake(job: string, reason: string): Promise<Answer> {
     // Serialised in-process; across processes a twin wake loses the compare-and-set on the job.
@@ -231,15 +261,18 @@ export class Engine {
    * mayAdopt: a write call may become the work run when none is active.
    * bindPending: a pending wake run binds to this caller (writes do; reads never do, M2).
    */
-  private async touchRun(job: Job, ctx: Ctx, origin: Run['origin'], mayAdopt: boolean, bindPending = true): Promise<'you' | 'other' | 'none' | 'unknown'> {
+  private async touchRun(job: Job, ctx: Ctx, origin: Run['origin'], mayAdopt: boolean, bindPending: boolean, own: Own): Promise<'you' | 'other' | 'none' | 'unknown'> {
     const sid = ctx.session_id;
     const now = this.now();
     const cr = job.current_run ? await this.get<Run>('run', `${job.id}:${job.current_run}`) : null;
     if (!sid) return 'unknown';
+    // A1: only a session in the job's home can be, bind or refresh the run. Everyone else just reads the run state.
+    if (own.state !== 'home') return cr && this.runActive(cr) ? 'other' : 'none';
     if (cr && cr.session_id === sid) {
       cr.state = 'active';
       cr.last_activity_at = now;
       await this.save('run', cr.id, cr);
+      if (job.session_gen[sid] !== job.generation) job.session_gen[sid] = job.generation;
       return 'you';
     }
     if (cr && cr.session_id === null && cr.state === 'active') {
@@ -247,16 +280,18 @@ export class Engine {
       cr.session_id = sid;
       cr.last_activity_at = now;
       await this.save('run', cr.id, cr);
+      job.session_gen[sid] = job.generation;
       return 'you';
     }
     if (cr && this.runActive(cr)) return 'other';
     if (!mayAdopt) return 'none';
     if (cr && cr.state === 'active') { cr.state = 'superseded'; await this.save('run', cr.id, cr); }
     const n = job.run_seq + 1;
-    const run: Run = { id: `${job.id}:${n}`, job: job.id, n, session_id: sid, origin, started_at: now, last_activity_at: now, state: 'active' };
+    const run: Run = { id: `${job.id}:${n}`, job: job.id, n, generation: job.generation, session_id: sid, origin, started_at: now, last_activity_at: now, state: 'active' };
     const r = await this.create('run', run.id, run);
     job.run_seq = n;
     job.current_run = n;
+    job.session_gen[sid] = job.generation;
     return r.created || r.value.session_id === sid ? 'you' : 'other';
   }
 
@@ -266,6 +301,283 @@ export class Engine {
     } else if (rel === 'other' && flagOther) {
       await this.addFlag(job, 'not_work_run', `${call} came from session ${ctx.session_id}, which is not the work run`, call);
     }
+  }
+
+
+  // ---------------------------------------------------------------- ownership (A1, A2, A3)
+
+  /** The caller's relation to the job's home. Successful lookups are cached per session; failures never are. */
+  private async ownership(job: Job, ctx: Ctx): Promise<Own> {
+    const sid = ctx.session_id;
+    if (!sid) return { state: 'unconfirmed', why: 'no session id arrived' };
+    const g = job.session_gen[sid];
+    if (g !== undefined && g < job.generation) return { state: 'superseded', why: `session ${sid} belongs to home generation ${g}; the job is at ${job.generation}` };
+    let dm = this.dmCache.get(sid);
+    if (dm === undefined) {
+      let r: Awaited<ReturnType<SessionDirectory['dmOf']>>;
+      try { r = await this.directory.dmOf(sid, { id: job.id, dm: job.dm_id, generation: job.generation }); } catch (e) { r = { error: (e as Error).message }; }
+      if ('error' in r) return { state: 'unconfirmed', why: `the session lookup failed (${r.error})` };
+      dm = r.dm;
+      if (this.directory.cacheable !== false) this.dmCache.set(sid, dm);
+    }
+    if (dm === job.dm_id) return { state: 'home' };
+    if (job.homes.some((h) => h.dm === dm && h.closed_at !== null)) return { state: 'superseded', why: `session ${sid} lives in a closed home of this job` };
+    return { state: 'non_home', dm };
+  }
+
+  /** A confirmed owner call ends an identity episode. Returns true when the job changed. */
+  private ownerConfirmed(job: Job): boolean {
+    let changed = false;
+    if (job.identity) { job.identity = null; changed = true; }
+    const keep = job.wake_reasons.filter((r) => !r.startsWith('identity unconfirmed') && !r.startsWith('escalate: identity'));
+    if (keep.length !== job.wake_reasons.length) { job.wake_reasons = keep; changed = true; }
+    return changed;
+  }
+
+  /** A2: diagnostic flag, and a wake reason so the home is resumed. The caller saves the job. */
+  private async noteUnconfirmed(job: Job, ctx: Ctx, call: string, why: string, withWake: boolean): Promise<void> {
+    const now = this.now();
+    const sid = ctx.session_id ?? null;
+    await this.addFlag(job, 'identity_unconfirmed', `${call} from ${sid ?? 'a call with no session id'}: ${why}`, call);
+    const idn = job.identity ?? { since: now, last: now, sessions: [], attempts: 0, escalated: false };
+    idn.last = now;
+    idn.attempts += 1;
+    if (sid && !idn.sessions.includes(sid)) idn.sessions.push(sid);
+    if (idn.sessions.length > 5) idn.sessions.shift();
+    job.identity = idn;
+    const ended = job.status === 'done' || job.status === 'cancelled' || job.status === 'queued';
+    if (withWake && !ended) {
+      this.addReason(job, `identity unconfirmed for ${sid ?? 'an unknown session'}; resume from the job home`);
+      job.next_wake_at = Math.min(job.next_wake_at ?? now, now);
+      await this.schedule(job.id, now);
+    }
+    await this.escalateIdentity(job);
+    if (!ended) await this.schedule(job.id, idn.since + this.config.identityEscalateMinutes * MIN);
+  }
+
+  private async escalateIdentity(job: Job): Promise<void> {
+    const idn = job.identity;
+    if (!idn || idn.escalated || this.now() - idn.since < this.config.identityEscalateMinutes * MIN) return;
+    if (job.status === 'done' || job.status === 'cancelled') return;
+    idn.escalated = true;
+    await this.addFlag(job, 'escalate', `identity has been unconfirmed for ${fmtAge(this.now() - idn.since)} with no confirmed owner call`, 'identity');
+    this.addReason(job, `escalate: identity unconfirmed for ${fmtAge(this.now() - idn.since)}; tell ${job.requester ?? 'the job owner'} that nobody in the job home has confirmed the job`);
+    job.next_wake_at = Math.min(job.next_wake_at ?? this.now(), this.now());
+  }
+
+  private holdAnswer(job: Job, what: string): Answer {
+    const why = 'ownership_unconfirmed: nobody has confirmed that this session is in the job home';
+    return ans(true, 'hold',
+      `Hold: ownership unconfirmed. The engine cannot confirm that this session is the agent in the job home, so ${what} was not recorded as an action: no clear, no lease, nothing in flight. Next: the job home is being woken; the agent there resumes the job. If you are that agent, call job_view and try again.`,
+      { job: job.id, reason: 'ownership_unconfirmed', holds: [why], flags: [] });
+  }
+  private async fencedAnswer(job: Job, ctx: Ctx, call: string, what: string): Promise<Answer> {
+    await this.addInboxItem(job, { event: `note:${call}:${ctx.session_id}:${this.now()}:${job.inbox_seq + 1}`, sender: ctx.session_id ?? null, sender_kind: 'system', thread: null, kind: 'note', source: 'engine', text: `an older session (${ctx.session_id}) tried ${what} after the job moved to a new home` });
+    await this.saveJob(job);
+    return ans(true, 'superseded', `Superseded: this job moved to a new home. Nothing was changed; your ${what} was recorded as a note for the new home. Stop working on this job.`, { job: job.id, reason: 'superseded', generation: job.generation });
+  }
+  private async routedAnswer(job: Job, ctx: Ctx, call: string, what: string, kind: InboxKind, thread: string | null, tail = 'Tell the person the job owner will handle it; do not act on it yourself.'): Promise<Answer> {
+    const it = await this.addInboxItem(job, { event: `route:${call}:${ctx.session_id}:${this.now()}:${job.inbox_seq + 1}`, sender: ctx.session_id ?? null, sender_kind: 'system', thread, kind, source: 'engine', text: `${ctx.session_id} asked for ${what}` });
+    await this.routeInbox(job);
+    await this.saveJob(job);
+    return ans(true, 'route', `Routed: this session is not in the job home, so ${what} was not started. The job owner was told ("${ctx.session_id} asked for ${what}") and decides. ${tail}`, { job: job.id, reason: 'not_home', inbox: it?.key ?? null });
+  }
+  private async unconfirmedCall(job: Job, ctx: Ctx, call: string, why: string, what: string): Promise<Answer> {
+    if (!ctx.session_id) await this.addFlag(job, 'missing_session', `${call} arrived without a session id`, call);
+    await this.noteUnconfirmed(job, ctx, call, why, true);
+    await this.saveJob(job);
+    return this.holdAnswer(job, what);
+  }
+
+  // ---------------------------------------------------------------- inbox (A4)
+
+  private async inboxItems(job: Job): Promise<InboxItem[]> {
+    const items = await this.manyPresent<InboxItem>('inbox', job.inbox_keys);
+    return items.sort((a, b) => a.received_at - b.received_at || a.seq - b.seq);
+  }
+  private unprocessed(items: InboxItem[]): InboxItem[] { return items.filter((i) => i.state !== 'processed'); }
+
+  /** Writes one inbox item for the job (create-if-absent by event). The caller saves the job. */
+  private async addInboxItem(job: Job, f: {
+    event: string; sender: string | null; sender_kind: string; thread: string | null; kind: InboxKind; source: string;
+    refs?: string[]; priv?: boolean; origin_message?: string | null; ambiguous?: boolean; text?: string;
+  }): Promise<InboxItem | null> {
+    const key = `${job.id}:${f.event}`;
+    const existing = await this.get<InboxItem>('inbox', key);
+    if (existing) { if (!job.inbox_keys.includes(key)) job.inbox_keys.push(key); this.lastInboxExisting = true; return existing; }
+    this.lastInboxExisting = false;
+    const items = await this.inboxItems(job);
+    const open = this.unprocessed(items);
+    const coalesce = (f.kind === 'message' || f.kind === 'note') && open.length >= this.config.inboxMaxUnprocessed;
+    const now = this.now();
+    if (coalesce) {
+      // Over the bound: plain messages fold into one overflow item. Approval, cancel and route kinds never do.
+      const okey = `${job.id}:overflow`;
+      const refs = [f.event, ...(f.refs ?? [])];
+      const got = await this.update<InboxItem>('inbox', okey, () => {
+        job.inbox_seq += 1;
+        return { key: okey, seq: job.inbox_seq, event: 'overflow', job: job.id, sender: null, sender_kind: 'system', thread: null, origin_message: null, source: 'engine', received_at: now, refs: [], private: false, kind: 'message', state: 'associated', processed_at: null, processed_by_run: null, overflow: { count: 0 } };
+      }, (o) => {
+        if (o.state === 'processed') { o.state = 'associated'; o.processed_at = null; o.processed_by_run = null; o.overflow = { count: 0 }; o.received_at = now; }
+        o.overflow = { count: (o.overflow?.count ?? 0) + 1 };
+        o.refs = [...o.refs, ...refs].slice(-20);
+      });
+      if (!job.inbox_keys.includes(okey)) job.inbox_keys.push(okey);
+      return got;
+    }
+    job.inbox_seq += 1;
+    const item: InboxItem = {
+      key, seq: job.inbox_seq, event: f.event, job: job.id, sender: f.sender, sender_kind: f.sender_kind, thread: f.thread,
+      origin_message: f.origin_message ?? null, source: f.source, received_at: now, refs: f.refs ?? [], private: !!f.priv,
+      kind: f.kind, state: 'associated', processed_at: null, processed_by_run: null,
+      ...(f.ambiguous ? { ambiguous: true } : {}), ...(f.text ? { text: f.text.slice(0, 200) } : {}),
+    };
+    const r = await this.create('inbox', key, item);
+    if (!r.created) this.lastInboxExisting = true; // a twin ingest got there first
+    if (!job.inbox_keys.includes(key)) job.inbox_keys.push(key);
+    // keep the retained list bounded: drop the oldest processed keys first
+    if (job.inbox_keys.length > 100) {
+      const all = await this.inboxItems(job);
+      const drop = new Set(all.filter((i) => i.state === 'processed').slice(0, job.inbox_keys.length - 100).map((i) => i.key));
+      job.inbox_keys = job.inbox_keys.filter((k) => !drop.has(k));
+    }
+    return r.value;
+  }
+
+  /** A4 routing by worker state. The caller saves the job. Returns true when a wake or a notice was arranged. */
+  private async routeInbox(job: Job): Promise<boolean> {
+    const now = this.now();
+    if (job.status === 'done' || (job.status === 'cancelled' && job.cleanup_pending.length === 0)) return false;
+    if (job.status === 'queued') return false;
+    this.addReason(job, INBOX_REASON);
+    const cr = job.current_run ? await this.get<Run>('run', `${job.id}:${job.current_run}`) : null;
+    if (this.runActive(cr)) {
+      // The owner is working: one short notice into the home, at most once per coalesce window.
+      if (!cr!.session_id) return false; // a wake run nobody has bound yet will read the inbox in its first view
+      if (job.inbox_notice_at !== null && now - job.inbox_notice_at < this.config.noticeCoalesceMinutes * MIN) return false;
+      job.inbox_notice_at = now;
+      const n = this.unprocessed(await this.inboxItems(job)).length;
+      try { await this.waker.postWake(job.dm_id, `Work engine notice for job ${job.id}: new input: ${n} item(s); read job_view.`); } catch { /* the item and the wake reason stay; the next wake carries them */ }
+      return true;
+    }
+    job.next_wake_at = Math.min(job.next_wake_at ?? now, now);
+    await this.schedule(job.id, now);
+    return true;
+  }
+
+  /** Owner checkpoint: explicit ids (event id, inbox key or #seq) plus the items shown in the view this session last read. */
+  private async processInbox(job: Job, sid: string, explicit: string[] | undefined, runId: string | null): Promise<number> {
+    const items = await this.inboxItems(job);
+    const want = new Set<string>(job.inbox_seen[sid] ?? []);
+    for (const x of explicit ?? []) {
+      const t = String(x).replace(/^#/, '');
+      for (const i of items) if (i.event === x || i.key === x || String(i.seq) === t) want.add(i.key);
+    }
+    let n = 0;
+    for (const i of items) {
+      if (i.state === 'processed' || !want.has(i.key)) continue;
+      i.state = 'processed'; i.processed_at = this.now(); i.processed_by_run = runId;
+      await this.save('inbox', i.key, i);
+      n += 1;
+    }
+    delete job.inbox_seen[sid];
+    if (this.unprocessed(await this.inboxItems(job)).length === 0) {
+      job.wake_reasons = job.wake_reasons.filter((r) => r !== INBOX_REASON);
+      job.inbox_escalated = false;
+    }
+    return n;
+  }
+
+  /** Items for ended jobs: recorded as late, never reopen (R12). */
+  private async lateInput(ev: IngestEvent, senderKind: string, priv: boolean, activeThreadJobs: number): Promise<string[]> {
+    if (!ev.thread || senderKind === 'own_bot' || activeThreadJobs > 0) return [];
+    const idx = await this.get<IdList>('ended_thread', ev.thread);
+    const out: string[] = [];
+    for (const j of await this.manyPresent<Job>('job', idx?.ids ?? [])) {
+      if (j.status !== 'done' && j.status !== 'cancelled') continue;
+      const late = (await this.inboxItems(j)).filter((i) => i.kind === 'late').length;
+      if (late >= MAX_LATE_ITEMS) continue;
+      await this.addInboxItem(j, { event: `${ev.source}:${ev.delivery_id}`, sender: ev.sender_id ?? null, sender_kind: senderKind, thread: ev.thread, kind: 'late', source: ev.source, priv, text: `late input: ${j.id} has ended` });
+      await this.saveJob(j);
+      out.push(j.id);
+    }
+    return out;
+  }
+
+  // ---------------------------------------------------------------- replacement (A3)
+
+  /** R22: drop cleanup entries whose outcome has been read back; when none are left the wake is cleared. */
+  private async settleCleanup(job: Job): Promise<void> {
+    if (job.cleanup_pending.length === 0) return;
+    const ops = await this.manyPresent<Operation>('operation', job.cleanup_pending);
+    const still = ops.filter((o) => o.outcome === 'unknown').map((o) => o.key);
+    if (still.length === job.cleanup_pending.length) return;
+    job.cleanup_pending = still;
+    if (still.length === 0) {
+      job.next_wake_at = null;
+      job.wake_reasons = [];
+      job.cleanup_escalated = false;
+    }
+  }
+
+  private async handoffSummary(job: Job): Promise<string> {
+    const parts: string[] = [];
+    const ops = (await this.manyPresent<Operation>('operation', job.op_keys)).filter((o) => o.outcome === 'in_flight' || o.outcome === 'unknown');
+    if (ops.length) parts.push(`read back first: ${ops.map((o) => `${o.action} ${o.ref} (${o.outcome})`).join(', ')}`);
+    const un = this.unprocessed(await this.inboxItems(job));
+    if (un.length) parts.push(`${un.length} inbox item(s) waiting`);
+    const owed = await this.owedDeliveries(job);
+    if (owed.length) parts.push(`owed: ${owed.map((d) => `${d.milestone} to ${d.thread}`).join(', ')}`);
+    const proms = await this.openPromises(job);
+    if (proms.length) parts.push(`promises: ${proms.map((p) => `${p.milestone} to ${p.thread}`).join(', ')}`);
+    return parts.join('; ');
+  }
+
+  private async doReplaceHome(jobId: string, reason: string, _explicit: boolean): Promise<Answer> {
+    const now = this.now();
+    const cur = await this.get<Job>('job', jobId);
+    if (!cur) return ans(false, 'no_such_job', `replace_home: there is no job "${jobId}".`);
+    if (cur.status === 'done' || cur.status === 'cancelled') return ans(true, 'job_ended', `replace_home: ${jobId} has ended; nothing to replace.`, { job: jobId });
+    const oldRun = cur.current_run;
+    const oldDm = cur.dm_id;
+    const job = (await this.updateJob(jobId, (j) => {
+      const closing = j.homes.find((h) => h.closed_at === null);
+      if (closing) { closing.closed_at = now; closing.reason = reason; }
+      j.generation += 1;
+      j.dm_id = `dm:${j.id}:g${j.generation}`;
+      j.homes.push({ dm: j.dm_id, generation: j.generation, opened_at: now, closed_at: null, reason });
+      j.inbox_seen = {};
+      j.inbox_notice_at = null;
+      j.next_wake_at = now;
+    }))!;
+    if (oldRun) {
+      const r = await this.get<Run>('run', `${job.id}:${oldRun}`);
+      if (r && r.state !== 'superseded') { r.state = 'superseded'; await this.save('run', r.id, r); }
+    }
+    // A call the old session already started cannot be fenced: it becomes an operation the new home reads back.
+    for (const o of await this.manyPresent<Operation>('operation', job.op_keys)) {
+      if (o.outcome !== 'in_flight') continue;
+      o.outcome = 'unknown';
+      o.note = o.note || 'the home was replaced while this was in flight; read it back';
+      await this.save('operation', o.key, o);
+    }
+    // The old session can no longer post: let the new home take over any open claim at once (read the thread first).
+    for (const [thread, m] of Object.entries(job.claims)) {
+      await this.update<Claim>('claim', thread, null, (c) => {
+        if (c.state !== 'open' || c.job !== job.id || c.milestone !== m) return false;
+        c.touched = Math.min(c.touched, now - this.staleMs(this.spec(job)));
+      });
+    }
+    if (job.status === 'cancel_requested') await this.maybeClose(job);
+    await this.schedule(job.id, now);
+    await this.saveJob(job);
+    const summary = await this.handoffSummary(job);
+    const prior = job.wake_reasons.filter((r) => r !== INBOX_REASON);
+    const text = `the home was replaced (${reason}); you are the new home, generation ${job.generation}${summary ? `; ${summary}` : ''}${prior.length ? `; also: ${prior.join('; ')}` : ''}`;
+    if (job.status === 'cancelled' && job.cleanup_pending.length === 0) return ans(true, 'replaced', `Replaced the home of ${job.id} (generation ${job.generation}); the job ended, so no wake was posted.`, { job: job.id, generation: job.generation, dm: job.dm_id, previous_dm: oldDm });
+    if (job.status === 'queued') return ans(true, 'replaced', `Replaced the home of ${job.id} (generation ${job.generation}); the job is queued, so no wake was posted.`, { job: job.id, generation: job.generation, dm: job.dm_id, previous_dm: oldDm });
+    const w = await this.wakeInner(job.id, text, true);
+    return ans(true, 'replaced', `Replaced the home of ${job.id}: generation ${job.generation}, home ${job.dm_id}. ${w.say_to_tony}`, { job: job.id, generation: job.generation, dm: job.dm_id, previous_dm: oldDm, woke: w.woke });
   }
 
   // ---------------------------------------------------------------- indexes
@@ -302,6 +614,9 @@ export class Engine {
       op_keys: [], ask_keys: [], latest_ask: {}, delivery_keys: [], promise_keys: [], flag_keys: [], event_ids: [],
       flag_seq: 0, wake_reasons: [], claims: {}, notes: [], sched_bucket: 0, blocked_by_jobs: [], replaced_by: null,
       opened_at: now, closed_at: null,
+      generation: 1, homes: [{ dm: `dm:${id}`, generation: 1, opened_at: now, closed_at: null, reason: 'opened' }],
+      session_gen: {}, inbox_keys: [], inbox_seq: 0, inbox_notice_at: null, inbox_seen: {}, inbox_escalated: false,
+      identity: null, cleanup_pending: [], cleanup_escalated: false, guidance_version: this.guidance,
     };
   }
 
@@ -326,6 +641,15 @@ export class Engine {
     const idxId = `${a.workflow}:${a.target}`;
     let idx = (await this.get<JobIndex>('job_index', idxId)) ?? { seq: 0, primary: null, queued: [], winding: [] };
     const primary = idx.primary ? await this.get<Job>('job', idx.primary) : null;
+
+    // A1: replacing or queueing is the job owner's call; anyone else leaves an inbox item instead.
+    if (primary && (intent === 'replace' || intent === 'queue')) {
+      const po = await this.ownership(primary, ctx);
+      const what = `job_open (${intent}) for ${a.target} from ${a.thread}`;
+      if (po.state === 'superseded') return this.fencedAnswer(primary, ctx, 'job_open', what);
+      if (po.state === 'unconfirmed') return this.unconfirmedCall(primary, ctx, 'job_open', po.why, what);
+      if (po.state === 'non_home') return this.routedAnswer(primary, ctx, 'job_open', what, 'request', a.thread, `Tell the person the job owner decides whether to ${intent} the running job.`);
+    }
 
     let job: Job;
     let opened = false;
@@ -363,8 +687,16 @@ export class Engine {
     }
     if (idx.primary === null && !opened) idx.primary = job.id;
     const linked = await this.linkThread(job, a.thread, role, !!a.private);
-    const rel = await this.touchRun(job, ctx, 'job_open', job.status !== 'queued');
+    const own = await this.ownership(job, ctx);
+    if (own.state === 'unconfirmed') await this.noteUnconfirmed(job, ctx, 'job_open', own.why, true);
+    const rel = await this.touchRun(job, ctx, 'job_open', job.status !== 'queued', true, own);
+    if (own.state === 'home') this.ownerConfirmed(job);
     await this.sessionFlags(job, ctx, 'job_open', rel, false);
+    if (opened && own.state === 'non_home' && job.status !== 'queued') {
+      // The opener is not in the job home: wake the home now so the work starts there.
+      this.addReason(job, `job opened from ${a.thread}; start the work in the job home`);
+      job.next_wake_at = now;
+    }
     await this.saveJob(job);
     await this.save('job_index', idxId, idx);
     if (opened) await this.schedule(job.id, job.next_wake_at ?? now);
@@ -374,7 +706,8 @@ export class Engine {
     const head = joined
       ? `Already running as ${job.id}. ${linked ? 'Linked this thread.' : 'This thread was already linked.'}`
       : job.status === 'queued' ? `Queued ${job.id}.` : `Opened ${job.id}; this thread is linked as ${role}.`;
-    const runText = workRun === 'you' ? 'You are the work run.'
+    const runText = own.state === 'non_home' ? 'This session is not in the job home: you can read and link threads, but the job owner in the home does the work. Your requests are left in its inbox.'
+      : workRun === 'you' ? 'You are the work run.'
       : workRun === 'other' ? 'Another session is the work run right now; read freely, your writes are recorded as "not the work run".'
       : rel === 'unknown' ? 'No session id arrived, so no work run was assigned (flagged).' : 'No one is the work run yet.';
     return ans(true, joined ? 'joined' : job.status === 'queued' ? 'queued' : 'opened',
@@ -439,11 +772,17 @@ export class Engine {
       for (const d of ds) if (d.state === 'owed' || d.state === 'claimed') { d.state = 'void'; await this.save('delivery', d.key, d); }
       for (const [thread, m] of Object.entries(job.claims)) await this.closeClaim(thread, job.id, m);
       job.claims = {};
+      // R22 (supersedes R17 H5): an unknown operation may still be publishing, so its lease stays held until readback.
+      job.cleanup_pending = [];
       for (const o of await this.manyPresent<Operation>('operation', job.op_keys)) {
         if (o.outcome !== 'unknown') continue;
-        await this.releaseLease(o);
-        await this.save('operation', o.key, o);
-        await this.addFlag(job, 'unknown_outcome', `${o.action} on ${o.ref} ended the job with an unknown outcome; its lease was released and the operation stays on the record`, 'cancel');
+        job.cleanup_pending.push(o.key);
+        await this.addFlag(job, 'unknown_outcome', `${o.action} on ${o.ref} ended the job with an unknown outcome; its lease stays held until the outcome is read back (cleanup pending)`, 'cancel');
+      }
+      if (job.cleanup_pending.length) {
+        job.cleanup_escalated = false;
+        job.next_wake_at = now + this.nextWakeMs(this.spec(job));
+        this.addReason(job, `cleanup pending after the cancel: read back ${job.cleanup_pending.map((k) => k.slice(job.id.length + 1)).join(', ')} and report done or failed`);
       }
     }
     const idxId = `${job.workflow}:${job.target}`;
@@ -467,7 +806,18 @@ export class Engine {
         ti.jobs = ti.jobs.filter((x) => x !== job.id);
       });
     }
+    for (const t of job.threads) {
+      await this.update<IdList>('ended_thread', t, () => ({ ids: [] }), (x) => {
+        if (x.ids.includes(job.id)) return false;
+        x.ids.push(job.id);
+        if (x.ids.length > 5) x.ids.shift();
+      });
+    }
     await this.saveJob(job);
+    if (job.cleanup_pending.length && job.next_wake_at !== null) {
+      await this.schedule(job.id, job.next_wake_at);
+      await this.schedule(job.id, now + this.unknownMs(this.spec(job)) * 4);
+    }
     for (const id of promote) {
       await this.updateJob(id, (q) => {
         if (q.status !== 'queued') return false;
@@ -611,9 +961,23 @@ export class Engine {
     const existing = await this.get<Operation>('operation', opId);
     const sameOp = !!existing && existing.outcome !== 'held' && existing.outcome !== 'failed';
 
+    // A1, A2, A3: only the owner session acts; the ownership hold is the one non-configurable hold.
+    const own = await this.ownership(job, ctx);
+    const what = `${a.action} on ${a.ref}`;
+    if (own.state === 'superseded') return this.fencedAnswer(job, ctx, 'intend', what);
+    if (own.state === 'unconfirmed') return this.unconfirmedCall(job, ctx, 'intend', own.why, what);
+    if (own.state === 'non_home') return this.routedAnswer(job, ctx, 'intend', what, 'route', null);
+    // An inbox id (#n) from job_view stands for the event behind it, also when the view held the event id back (privacy).
+    if (a.because?.startsWith('#')) {
+      const n = Number(a.because.slice(1));
+      const it = (await this.inboxItems(job)).find((i) => i.seq === n);
+      if (it) a = { ...a, because: it.event };
+    }
     // The session checks always run, also on a retry of the same ref (H4).
-    const rel = await this.touchRun(job, ctx, 'adopted', true);
+    const rel = await this.touchRun(job, ctx, 'adopted', true, true, own);
+    this.ownerConfirmed(job);
     await this.sessionFlags(job, ctx, 'intend', rel, false);
+    const extraFlags: string[] = [];
 
     const findings: Array<{ check: CheckName; detail: string; next: string }> = [];
     if (ctx.session_id && rel === 'other') {
@@ -643,6 +1007,17 @@ export class Engine {
       if (a.because) {
         const ev = await this.get<EventRecord>('event', a.because);
         if (ev) {
+          const item = await this.get<InboxItem>('inbox', `${job.id}:${a.because}`);
+          if (item?.ambiguous) {
+            const d = `${a.because} reached several jobs through a thread they share; it is not clear this job is the one meant. Clarify which job with the sender`;
+            extraFlags.push(`ambiguous_association: ${d}`);
+            await this.addFlag(job, 'ambiguous_association', d, 'intend');
+          }
+          // R20: a go is checked again here. A later message of the same sender marked cancel revokes it.
+          if (ev.sender_id) {
+            const later = (await this.inboxItems(job)).find((i) => i.kind === 'cancel' && i.sender === ev.sender_id && i.received_at >= ev.received_at && i.event !== a.because);
+            if (later) findings.push({ check: 'sender_not_listed', detail: `the go in ${a.because} was revoked by a later message from ${ev.sender_id} (${later.event})`, next: `Ask ${ev.sender_id} again, then call intend again with the new go.` });
+          }
           const ok = ask ? ask.responder_slack : this.gateSlack(spec, act.gate);
           if (!ev.sender_id || !ok.includes(ev.sender_id)) {
             const priv = ev.private_origin || (!!ev.thread && job.private_threads.includes(ev.thread));
@@ -653,7 +1028,7 @@ export class Engine {
     }
 
     const holds: string[] = [];
-    const flags: string[] = [];
+    const flags: string[] = [...extraFlags];
     const nexts: string[] = [];
     for (const f of findings) {
       const mode = this.config.checks[f.check];
@@ -724,6 +1099,7 @@ export class Engine {
       // flagged work went ahead on a cancelled job: keep the job visible until the outcome is reported
       job.status = 'cancel_requested';
       job.closed_at = null;
+      job.cleanup_pending = [];
       job.next_wake_at = this.now() + this.nextWakeMs(spec);
       await this.openJobsIndex((ids) => uniq([...ids, job.id]));
       for (const t of job.threads) await this.update<ThreadIndex>('thread_index', t, () => ({ jobs: [] }), (ti) => { if (ti.jobs.includes(job.id)) return false; ti.jobs.push(job.id); });
@@ -785,7 +1161,13 @@ export class Engine {
     }
     const spec = this.spec(job);
     const sid = ctx.session_id ?? null;
-    const rel = await this.touchRun(job, ctx, 'adopted', true);
+    const own = await this.ownership(job, ctx);
+    const what = `say ${a.milestone} in ${a.thread}`;
+    if (own.state === 'superseded') return this.fencedAnswer(job, ctx, 'say', what);
+    if (own.state === 'unconfirmed') return this.unconfirmedCall(job, ctx, 'say', own.why, what);
+    if (own.state === 'non_home') return this.routedAnswer(job, ctx, 'say', what, 'request', a.thread, `The job owner will tell this thread (${a.milestone}); do not post it yourself. Answering the person's question in your own reply is fine.`);
+    const rel = await this.touchRun(job, ctx, 'adopted', true, true, own);
+    this.ownerConfirmed(job);
     await this.sessionFlags(job, ctx, 'say', rel, true);
     const now = this.now();
     const dKey = `${job.id}:${a.thread}:${a.milestone}`;
@@ -916,7 +1298,11 @@ export class Engine {
     }
     const spec = this.spec(job);
     const now = this.now();
-    const rel = await this.touchRun(job, ctx, 'adopted', true);
+    const own = await this.ownership(job, ctx);
+    if (own.state === 'superseded') return this.fencedAnswer(job, ctx, 'promise_add', `promise_add for ${a.about}`);
+    if (own.state === 'unconfirmed' && ctx.session_id) await this.noteUnconfirmed(job, ctx, 'promise_add', own.why, false);
+    const rel = await this.touchRun(job, ctx, 'adopted', true, true, own);
+    if (own.state === 'home') this.ownerConfirmed(job);
     await this.sessionFlags(job, ctx, 'promise_add', rel, false); // a promise from any session is a valid record (D10)
     const notes: string[] = [];
     let fallback: number | null = null;
@@ -953,7 +1339,7 @@ export class Engine {
 
   private async doCheckpoint(
     a: { job: string; status: string; waiting_for?: string; next_wake_in?: number | string;
-      operations?: Array<{ ref: string; action?: string; outcome: 'done' | 'failed' | 'unknown'; note?: string }>; reached?: string[] },
+      operations?: Array<{ ref: string; action?: string; outcome: 'done' | 'failed' | 'unknown'; note?: string }>; reached?: string[]; processed?: string[] },
     ctx: Ctx,
   ): Promise<Answer> {
     const L = await this.loadJob(a.job, 'checkpoint');
@@ -962,14 +1348,28 @@ export class Engine {
     const spec = this.spec(job);
     const now = this.now();
     const notes: string[] = [];
+    const own = await this.ownership(job, ctx);
+    const summary = `checkpoint "${a.status}"${a.waiting_for ? ` (waiting for ${a.waiting_for})` : ''}${a.operations?.length ? ` with ${a.operations.length} operation outcome(s)` : ''}`;
+    if (own.state === 'superseded') return this.fencedAnswer(job, ctx, 'checkpoint', summary);
+    if (own.state === 'unconfirmed') {
+      // Nothing is applied, but what the session reported is kept for the home to read.
+      await this.addInboxItem(job, { event: `note:checkpoint:${ctx.session_id ?? 'nosession'}:${now}:${job.inbox_seq + 1}`, sender: ctx.session_id ?? null, sender_kind: 'system', thread: null, kind: 'note', source: 'engine', text: `an unconfirmed session reported ${summary}${a.operations?.length ? ': ' + a.operations.map((o) => `${o.ref} ${o.outcome}`).join(', ') : ''}` });
+      return this.unconfirmedCall(job, ctx, 'checkpoint', own.why, 'this checkpoint');
+    }
+    const nonHome = own.state === 'non_home';
     // A checkpoint never takes over a run; only a session that is the work run (or arrives with no run yet) commits (H8).
-    const rel = await this.touchRun(job, ctx, 'adopted', !job.current_run);
+    const rel = await this.touchRun(job, ctx, 'adopted', !job.current_run, true, own);
     await this.sessionFlags(job, ctx, 'checkpoint', rel, false);
     const convo = !!ctx.session_id && rel !== 'you';
-    if (convo) await this.addFlag(job, 'not_work_run', `checkpoint came from session ${ctx.session_id}, which is not the work run; recorded as a note, status and wake unchanged`, 'checkpoint');
+    if (convo) await this.addFlag(job, 'not_work_run', `checkpoint came from session ${ctx.session_id}, which is not ${nonHome ? 'in the job home' : 'the work run'}; recorded as a note, status and wake unchanged`, 'checkpoint');
+    if (nonHome) {
+      // A1: a non-home checkpoint is a note plus an inbox item. It never changes outcomes or milestones either.
+      await this.addInboxItem(job, { event: `note:checkpoint:${ctx.session_id}:${now}:${job.inbox_seq + 1}`, sender: ctx.session_id ?? null, sender_kind: 'system', thread: null, kind: a.status === 'cancelled' ? 'cancel' : 'note', source: 'engine', text: `${ctx.session_id} reported ${summary}` });
+      if (a.operations?.length || a.reached?.length) notes.push('This session is not in the job home, so reported operation outcomes and milestones were not applied; the job owner was told.');
+    } else if (own.state === 'home') this.ownerConfirmed(job);
 
     // operation outcomes (D5)
-    if (a.operations?.length) {
+    if (a.operations?.length && !nonHome) {
       const ops = await this.manyPresent<Operation>('operation', job.op_keys);
       for (const o of a.operations) {
         if (!['done', 'failed', 'unknown'].includes(o.outcome)) {
@@ -1007,9 +1407,10 @@ export class Engine {
         await this.save('operation', m.key, m);
       }
     }
+    await this.settleCleanup(job);
     const ended = job.status === 'done' || job.status === 'cancelled';
-    if (ended && a.reached?.length) notes.push('The job has ended, so the reached milestones were not recorded (nothing can be owed on an ended job).');
-    for (const m of ended ? [] : a.reached ?? []) {
+    if (ended && a.reached?.length && !nonHome) notes.push('The job has ended, so the reached milestones were not recorded (nothing can be owed on an ended job).');
+    for (const m of ended || nonHome ? [] : a.reached ?? []) {
       if (await this.markReached(job, spec, m)) notes.push(`Milestone ${m} marked reached (reported by you).`);
     }
 
@@ -1072,8 +1473,13 @@ export class Engine {
       if (job.status === 'cancel_requested') await this.maybeClose(job);
     }
 
-    // Outcomes reported by any session can be what a cancel was waiting for.
-    if (convo && job.status === 'cancel_requested') await this.maybeClose(job);
+    // Outcomes reported by a session in the home can be what a cancel was waiting for.
+    if (convo && !nonHome && job.status === 'cancel_requested') await this.maybeClose(job);
+    if (!convo && ctx.session_id && own.state === 'home') {
+      const n = await this.processInbox(job, ctx.session_id, a.processed, job.current_run ? `${job.id}:${job.current_run}` : null);
+      if (n > 0) notes.push(`${n} inbox item(s) marked processed.`);
+    }
+    if (job.status === 'cancelled') await this.settleCleanup(job);
     if (job.closed_at === null) {
       // A pending unblock reason survives: a checkpoint can only bring the wake earlier (H8, M3).
       if (job.wake_reasons.length > 0) {
@@ -1141,9 +1547,26 @@ export class Engine {
     const views = [];
     const texts = [];
     for (const job of jobs) {
-      // A pure read never binds a run and never clears anything (M2, M3).
-      const rel = await this.touchRun(job, ctx, 'adopted', false, false);
-      const v = await this.buildView(job, viewer, rel === 'other' ? 'other' : rel === 'you' ? 'you' : 'none');
+      // A pure read never binds a run and never clears anything (M2, M3). Reads are never refused (A2).
+      let own = await this.ownership(job, ctx);
+      if (own.state === 'unconfirmed' && ctx.session_id && !job.identity?.sessions.includes(ctx.session_id)) {
+        await this.noteUnconfirmed(job, ctx, 'job_view', own.why, false);
+        await this.saveJob(job);
+      }
+      const rel = await this.touchRun(job, ctx, 'adopted', false, false, own);
+      const v = await this.buildView(job, viewer, rel === 'other' ? 'other' : rel === 'you' ? 'you' : 'none', own.state === 'home' ? ctx.session_id : undefined);
+      if (own.state === 'home' && ctx.session_id && v.shown.length) {
+        // The home session has now read these items; its next checkpoint acknowledges them (A4).
+        const sid = ctx.session_id;
+        await this.updateJob(job.id, (j) => {
+          const cur = j.inbox_seen[sid] ?? [];
+          const merged = uniq([...cur, ...v.shown]);
+          if (merged.length === cur.length) return false;
+          j.inbox_seen[sid] = merged.slice(-100);
+          const ks = Object.keys(j.inbox_seen);
+          if (ks.length > MAX_SEEN) delete j.inbox_seen[ks[0]];
+        });
+      }
       views.push(v.data);
       texts.push(v.text);
     }
@@ -1151,17 +1574,18 @@ export class Engine {
     return ans(true, 'view', head + texts.join('\n\n'), { jobs: views });
   }
 
-  private async buildView(job: Job, viewerThread: string | null, workRunOverride?: 'you' | 'other' | 'none'): Promise<{ text: string; data: Record<string, unknown> }> {
+  private async buildView(job: Job, viewerThread: string | null, workRunOverride?: 'you' | 'other' | 'none', _homeSession?: string): Promise<{ text: string; data: Record<string, unknown>; shown: string[] }> {
     const now = this.now();
     const spec = this.spec(job);
     const unknownMs = this.unknownMs(spec);
-    const [ops, asks, dels, proms, flags, evs] = await Promise.all([
+    const [ops, asks, dels, proms, flags, evs, inboxAll] = await Promise.all([
       this.manyPresent<Operation>('operation', job.op_keys),
       this.manyPresent<Ask>('ask', job.ask_keys),
       this.manyPresent<Delivery>('delivery', job.delivery_keys),
       this.manyPresent<Promise_>('promise', job.promise_keys),
       this.manyPresent<FlagRecord>('flag', job.flag_keys.slice(-50)),
       this.manyPresent<EventRecord>('event', job.event_ids.slice(-15)),
+      this.inboxItems(job),
     ]);
     const run = job.current_run ? await this.get<Run>('run', `${job.id}:${job.current_run}`) : null;
     const runBusy = this.runActive(run);
@@ -1198,7 +1622,27 @@ export class Engine {
     if (flags.length) L.push(`Flags: ${flags.map((f) => `${f.check}: ${f.detail}`).join('; ')}.`);
     if (job.wake_reasons.length) L.push(`Since last look: ${job.wake_reasons.join('; ')}.`);
 
+    // A4: unprocessed inbox items, oldest first. A read never consumes them.
+    const open = this.unprocessed(inboxAll.filter((i) => i.kind !== 'late'));
+    const shownItems = open.slice(0, INBOX_SHOWN);
+    const inboxView = shownItems.map((i) => {
+      const held = i.private && !!i.thread && i.thread !== viewerThread;
+      return held
+        ? { id: `#${i.seq}`, held: true, kind: i.kind, age: fmtAge(now - i.received_at), summary: 'held: evidence from another thread' }
+        : { id: `#${i.seq}`, held: false, event: i.event, kind: i.kind, sender: i.sender, thread: i.thread, refs: i.refs, age: fmtAge(now - i.received_at), ambiguous: !!i.ambiguous, note: i.text ?? null, count: i.overflow?.count ?? null };
+    });
+    if (open.length) {
+      L.push(`Inbox (${open.length} unprocessed, oldest first; acknowledge with checkpoint processed): ${inboxView.map((i) => (i.held ? `${i.id} ${i.age} ago, ${i.summary}` : `${i.id} ${i.kind} ${i.age} ago from ${i.sender ?? 'n/a'}${i.thread ? ` in ${i.thread}` : ''}${i.count ? ` (${i.count} folded messages)` : ''}${i.ambiguous ? ' (clarify which job this is about)' : ''}${i.note ? ` - ${i.note}` : ''}`)).join('; ')}${open.length > shownItems.length ? `; and ${open.length - shownItems.length} more` : ''}.`);
+    }
+    const lateItems = inboxAll.filter((i) => i.kind === 'late' && i.state !== 'processed');
+    if (lateItems.length) L.push(`Late input after the job ended (${job.status}): ${lateItems.map((i) => `${i.sender ?? 'someone'} in ${i.thread}`).join('; ')}. Answer each sender in one line; the job does not reopen (use job_open to reopen).`);
+    if (job.cleanup_pending.length) L.push(`Cleanup pending after cancel: ${job.cleanup_pending.map((k) => k.slice(job.id.length + 1)).join(', ')} (unknown; their leases stay held until you read them back and report done or failed).`);
+    if (job.identity) L.push(`Identity unconfirmed since ${fmtAge(now - job.identity.since)} ago (${job.identity.sessions.join(', ') || 'no session'}); no action has been accepted from those sessions.`);
+    if (job.generation > 1) L.push(`Home: generation ${job.generation} (${job.dm_id}); earlier home(s) closed.`);
+    if (job.guidance_version && this.guidance && job.guidance_version !== this.guidance) L.push(`Guidance changed since this job opened (${job.guidance_version} then, ${this.guidance} now); it is not applied silently: keep to the version the job started with unless the job owner says otherwise.`);
+
     return {
+      shown: shownItems.map((i) => i.key),
       text: L.join('\n'),
       data: {
         job: job.id, workflow: job.workflow, target: job.target, status: job.status, reported_status: job.reported_status,
@@ -1207,6 +1651,10 @@ export class Engine {
         milestones: job.milestones, events: evView, open_asks: openAsks, operations: opsView,
         owed, claims: claimed, sent, promises: proms.map((p) => ({ milestone: p.milestone, thread: p.thread, state: p.state, fallback_at: p.fallback_at })),
         flags: flags.map((f) => ({ check: f.check, mode: f.mode, detail: f.detail, call: f.call })),
+        inbox: inboxView, inbox_unprocessed: open.length, late: lateItems.map((i) => ({ sender: i.sender, thread: i.thread })),
+        generation: job.generation, home: job.dm_id, guidance_version: job.guidance_version,
+        guidance_changed: !!job.guidance_version && !!this.guidance && job.guidance_version !== this.guidance,
+        cleanup_pending: job.cleanup_pending, identity_unconfirmed: !!job.identity,
       },
     };
   }
@@ -1243,11 +1691,13 @@ export class Engine {
     const jobs = await this.manyPresent<Job>('job', jobIds);
     const woken: string[] = [];
     const actions: string[] = [];
+    const activeOnThread = jobs.filter((j) => ev.thread && j.threads.includes(ev.thread) && j.status !== 'done' && j.status !== 'cancelled');
+    const ambiguous = activeOnThread.length > 1;
     // An event from a private link stays private in every job it reaches (also by ref), not only the job that linked it.
     if (ev.thread && jobs.some((j) => j.private_threads.includes(ev.thread!))) rec.private_origin = true;
     const matched = new Set<string>(rec.matched_jobs);
     for (const job of jobs) {
-      if (job.status === 'done' || job.status === 'cancelled') continue;
+      if (job.status === 'done' || (job.status === 'cancelled' && job.cleanup_pending.length === 0)) continue;
       const spec = this.spec(job);
       matched.add(job.id);
       if (!job.event_ids.includes(id)) job.event_ids.push(id);
@@ -1285,7 +1735,29 @@ export class Engine {
           await this.addFlag(job, 'unclaimed_post', `your bot posted in ${ev.thread} with no open claim (event ${id})`, 'ingest');
           actions.push(`unclaimed own post in ${ev.thread} flagged on ${job.id}`);
         }
-      } else if (ev.thread && job.threads.includes(ev.thread)) {
+      } else if (ev.thread && job.threads.includes(ev.thread) && job.status !== 'cancelled') {
+        // A4: every human or other-bot message in a linked thread becomes an inbox item for this job.
+        const priv = job.private_threads.includes(ev.thread) || !!rec.private_origin;
+        const hinted = typeof ev.attrs?.inbox_kind === 'string' ? ev.attrs.inbox_kind : null;
+        const asks0 = ev.sender_id ? await this.manyPresent<Ask>('ask', job.ask_keys) : [];
+        const isResponder = !!ev.sender_id && asks0.some((x) => x.state !== 'stale' && x.responder_slack.includes(ev.sender_id!));
+        let kind: InboxKind = hinted === 'cancel' || hinted === 'request' || hinted === 'approval' || hinted === 'message' ? hinted : isResponder ? 'approval' : 'message';
+        let note: string | undefined;
+        if (kind === 'cancel') {
+          // R21: the owner and listed stand-ins may cancel; anyone else is recorded and routed for the owner to ask about.
+          const listed = this.gateSlack(spec, 'cancel');
+          if (!ev.sender_id || !listed.includes(ev.sender_id)) {
+            note = 'sender_not_listed: this sender is not on the cancel list; ask the owner before acting';
+            await this.addFlag(job, 'sender_not_listed', `cancel from ${ev.sender_id ?? 'an unknown sender'} in ${priv ? 'a linked thread' : ev.thread} is not on the cancel list; recorded and routed to the home`, 'ingest');
+          }
+        }
+        if (ambiguous) note = `${note ? note + '; ' : ''}this thread is linked to ${activeOnThread.length} jobs`;
+        const item = await this.addInboxItem(job, { event: id, sender: ev.sender_id ?? null, sender_kind: senderKind, thread: ev.thread, kind, source: ev.source, refs: ev.ref ? [ev.ref] : [], priv, origin_message: id, ambiguous, text: note });
+        if (item) {
+          actions.push(`inbox item ${item.key} (${kind}${ambiguous ? ', ambiguous' : ''}) for ${job.id}`);
+          if (!this.lastInboxExisting) await this.routeInbox(job);
+          else this.addReason(job, INBOX_REASON);
+        }
         if (senderKind === 'other_bot') {
           wakeReason = `another bot posted in ${job.private_threads.includes(ev.thread) ? 'a linked thread' : ev.thread}`;
         } else if (ev.sender_id) {
@@ -1303,6 +1775,7 @@ export class Engine {
           const act = spec?.actions?.[op.action];
           // Kind, ref and (when the action names a gate) the event's gate must all match (M5).
           if (act?.proved_by && act.proved_by === ev.kind && (!act.gate || evGates.includes(act.gate))) {
+
             op.source = 'webhook_verified';
             if (op.outcome === 'in_flight' || op.outcome === 'unknown') { op.outcome = 'done'; op.outcome_at = now; await this.releaseLease(op); }
             await this.save('operation', op.key, op);
@@ -1311,6 +1784,7 @@ export class Engine {
         }
         wakeReason = wakeReason ?? `external event ${ev.source}/${ev.kind} for ${ev.ref}`;
         await this.maybeClose(job); // a verified outcome may be what a cancel or a closing job was waiting for
+        if (job.status === 'cancelled') await this.settleCleanup(job);
       }
       if (wakeReason && job.closed_at === null) {
         this.addReason(job, wakeReason);
@@ -1320,6 +1794,8 @@ export class Engine {
       }
       await this.saveJob(job);
     }
+    const late = await this.lateInput(ev, senderKind, !!rec.private_origin, activeOnThread.length);
+    for (const j of late) matched.add(j);
     rec.matched_jobs = [...matched];
     rec.state = 'done';
     await this.put('event', id, rec);
@@ -1346,7 +1822,13 @@ export class Engine {
       for (const id of todo) {
         seen.add(id);
         const job = await this.get<Job>('job', id);
-        if (!job || job.status === 'done' || job.status === 'cancelled') continue;
+        if (!job || job.status === 'done') continue;
+        if (job.status === 'cancelled') {
+          if (job.cleanup_pending.length === 0) continue;
+          summary.jobs_checked += 1;
+          await this.processCleanup(job, summary);
+          continue;
+        }
         summary.jobs_checked += 1;
         await this.processJob(job, summary);
         if (job.status === 'queued') seen.delete(id); // may be promoted by a later job in this sweep: look again
@@ -1354,6 +1836,28 @@ export class Engine {
     }
     await this.put('sweep_cursor', 'main', { bucket: nowB });
     return ans(true, 'swept', `Sweep checked ${summary.jobs_checked} job(s): woke ${summary.woke.length}, ${summary.operations_unknown} operation(s) turned unknown, ${summary.promises_due} promise(s) due, ${summary.claims_reconciled} claim(s) reconciled.`, summary);
+  }
+
+  /** R22: a cancelled job whose unknown operations are not read back yet keeps a wake, then escalates after 4x the unknown window. */
+  private async processCleanup(job: Job, sum: { woke: string[]; wakes_skipped: string[] }): Promise<void> {
+    const now = this.now();
+    const spec = this.spec(job);
+    await this.settleCleanup(job);
+    if (job.cleanup_pending.length === 0) { await this.saveJob(job); return; }
+    const escalateAt = (job.closed_at ?? now) + this.unknownMs(spec) * 4;
+    if (!job.cleanup_escalated && now >= escalateAt) {
+      job.cleanup_escalated = true;
+      await this.addFlag(job, 'escalate', `cleanup after the cancel is still pending (${job.cleanup_pending.join(', ')}); tell ${job.requester ?? 'the job owner'}`, 'sweep');
+      this.addReason(job, `escalate: cleanup still pending after ${fmtAge(now - (job.closed_at ?? now))}; tell ${job.requester ?? 'the job owner'} that ${job.cleanup_pending.map((k) => k.slice(job.id.length + 1)).join(', ')} is unresolved`);
+      job.next_wake_at = now;
+    }
+    const due = job.next_wake_at !== null && job.next_wake_at <= now;
+    await this.saveJob(job);
+    if (due) {
+      const r = await this.wakeInner(job.id, uniq(job.wake_reasons).join('; ') || 'cleanup pending after the cancel');
+      if (r.woke) sum.woke.push(job.id); else sum.wakes_skipped.push(job.id);
+    } else if (job.next_wake_at !== null) await this.schedule(job.id, job.next_wake_at);
+    if (!job.cleanup_escalated) await this.schedule(job.id, escalateAt);
   }
 
   private async processJob(job: Job, sum: { woke: string[]; operations_unknown: number; promises_due: number; claims_reconciled: number; claims_not_seen: number; closed: string[]; wakes_skipped: string[] }): Promise<void> {
@@ -1430,6 +1934,17 @@ export class Engine {
     }
     if (await this.maybeClose(job)) { sum.closed.push(job.id); return; }
 
+    // A2 and A4 escalations: unconfirmed identity, or input nobody in the home has acted on.
+    await this.escalateIdentity(job);
+    if (!job.inbox_escalated) {
+      const old = this.unprocessed(await this.inboxItems(job)).filter((i) => i.kind !== 'late' && now - i.received_at >= this.config.identityEscalateMinutes * MIN);
+      if (old.length) {
+        job.inbox_escalated = true;
+        await this.addFlag(job, 'escalate', `${old.length} inbox item(s) have waited ${fmtAge(now - old[0].received_at)} with no owner action`, 'sweep');
+        this.addReason(job, `escalate: ${old.length} inbox item(s) unprocessed for ${fmtAge(now - old[0].received_at)}; tell ${job.requester ?? 'the job owner'}`);
+        job.next_wake_at = now;
+      }
+    }
     for (const r of reasons) this.addReason(job, r);
     if (reasons.length) job.next_wake_at = Math.min(job.next_wake_at ?? now, now);
     const wakeDue = job.next_wake_at !== null && job.next_wake_at <= now;
@@ -1443,6 +1958,8 @@ export class Engine {
         if (c && c.state === 'open' && c.job === job.id && now - c.touched >= this.staleMs(spec)) extra.push(`claim for ${d.milestone} in ${d.thread} was never seen: read the thread; if it is posted call say with posted_link, if not post it`);
       }
       for (const o of await this.manyPresent<Operation>('operation', job.op_keys)) if (o.outcome === 'unknown') extra.push(`operation ${o.action} ${o.ref} is unknown: verify it and report done or failed`);
+      const waiting = this.unprocessed((await this.inboxItems(job)).filter((i) => i.kind !== 'late')).length;
+      if (waiting) extra.push(`${waiting} inbox item(s) waiting: read job_view`);
     }
     await this.saveJob(job);
     if (wakeDue) {
@@ -1459,12 +1976,12 @@ export class Engine {
     return this.wakeInner(jobId, reason);
   }
 
-  private async wakeInner(jobId: string, reason: string): Promise<Answer & { woke: boolean }> {
+  private async wakeInner(jobId: string, reason: string, afterReplace = false): Promise<Answer & { woke: boolean }> {
     const now = this.now();
     const job = await this.get<Job>('job', jobId);
     const no = (status: string, say: string): Answer & { woke: boolean } => ({ ...ans(true, status, say, { job: jobId }), woke: false });
     if (!job) return { ...ans(false, 'no_such_job', `wake: no job "${jobId}".`), woke: false };
-    if (job.status === 'done' || job.status === 'cancelled') return no('job_ended', `${jobId} has ended; no wake.`);
+    if (job.status === 'done' || (job.status === 'cancelled' && job.cleanup_pending.length === 0)) return no('job_ended', `${jobId} has ended; no wake.`);
     const cr = job.current_run ? await this.get<Run>('run', `${job.id}:${job.current_run}`) : null;
     if (this.runActive(cr)) {
       // A run is working: do not steer twice; recover if that run is lost. Pending reasons stay.
@@ -1474,7 +1991,7 @@ export class Engine {
       return no('run_active', `A run is already active for ${jobId}; no new wake.`);
     }
     const n = job.run_seq + 1;
-    const run: Run = { id: `${job.id}:${n}`, job: job.id, n, session_id: null, origin: 'wake', started_at: now, last_activity_at: now, state: 'active' };
+    const run: Run = { id: `${job.id}:${n}`, job: job.id, n, generation: job.generation, session_id: null, origin: 'wake', started_at: now, last_activity_at: now, state: 'active' };
     const r = await this.create('run', run.id, run);
     if (!r.created) return no('twin_wake', `Another wake already created run ${run.id}; this one does nothing.`);
     if (cr && cr.state === 'active') { cr.state = 'superseded'; await this.save('run', cr.id, cr); }
@@ -1484,9 +2001,10 @@ export class Engine {
     job.next_wake_at = now + this.nextWakeMs(this.spec(job));
     await this.saveJob(job);
     await this.schedule(job.id, job.next_wake_at);
-    const text = `Work engine wake for job ${job.id}: ${reason}. Call job_view first, then carry on. If you do nothing, the engine wakes you again at ${new Date(job.next_wake_at).toISOString()}.`;
+    const text = `Work engine wake for job ${job.id}${job.generation > 1 ? ` (home generation ${job.generation})` : ''}: ${reason}. Call job_view first, then carry on. If you do nothing, the engine wakes you again at ${new Date(job.next_wake_at).toISOString()}.`;
+    let posted: void | { stale_version?: boolean };
     try {
-      await this.waker.postWake(job.dm_id, text);
+      posted = await this.waker.postWake(job.dm_id, text);
     } catch (e) {
       // The reasons were kept, so the retry wake still says why.
       const bad = await this.get<Run>('run', run.id);
@@ -1497,6 +2015,11 @@ export class Engine {
     }
     // A pending reason is cleared only after a wake was posted that carried it (M3).
     await this.updateJob(job.id, (j) => { j.wake_reasons = j.wake_reasons.filter((x) => !posting.includes(x)); });
+    if (posted && posted.stale_version && !afterReplace) {
+      // A3: the home session is pinned to an old agent version; move the job to a fresh home.
+      const rr = await this.doReplaceHome(job.id, 'the home session is pinned to a stale agent version', false);
+      return { ...ans(true, 'woke', `Woke ${jobId} but its home was stale, so it was replaced: ${rr.say_to_tony}`, { job: jobId, run: run.id, replaced: true }), woke: true };
+    }
     return { ...ans(true, 'woke', `Woke ${jobId} as run ${run.id}: ${reason}.`, { job: jobId, run: run.id }), woke: true };
   }
 
@@ -1525,6 +2048,12 @@ export class Engine {
         if (d.state === 'claimed') claimedByThread.set(d.thread, (claimedByThread.get(d.thread) ?? 0) + 1);
         if (terminal && (d.state === 'owed' || d.state === 'claimed')) bad.push(`${job.id}: ${job.status} job with delivery ${d.key} still ${d.state}`);
       }
+      if (job.cleanup_pending.length && job.status !== 'cancelled') bad.push(`${job.id}: cleanup_pending on a ${job.status} job`);
+      if (job.status === 'cancelled' && job.cleanup_pending.length && job.next_wake_at === null) bad.push(`${job.id}: cancelled job with cleanup pending has no wake`);
+      if (job.homes.filter((h) => h.closed_at === null).length !== 1) bad.push(`${job.id}: ${job.homes.filter((h) => h.closed_at === null).length} open homes`);
+      if (job.homes[job.homes.length - 1].dm !== job.dm_id || job.homes[job.homes.length - 1].generation !== job.generation) bad.push(`${job.id}: dm_id and generation disagree with the home history`);
+      for (const r of runs) if ((r.generation ?? 1) > job.generation) bad.push(`${job.id}: run ${r.id} is from a newer generation than the job`);
+      if (active.some((r) => (r.generation ?? 1) < job.generation)) bad.push(`${job.id}: an active run belongs to an older generation`);
       if (job.status === 'done') for (const p of proms) if (p.state === 'void') bad.push(`${job.id}: done job has a void promise ${p.key}`);
       const ops = await this.manyPresent<Operation>('operation', job.op_keys);
       if (new Set(job.op_keys).size !== job.op_keys.length) bad.push(`${job.id}: duplicate operation keys`);
@@ -1532,7 +2061,8 @@ export class Engine {
         if (o.key !== `${job.id}:${o.action}:${o.ref}`) bad.push(`${job.id}: operation ${o.key} does not match its action and ref`);
         if (terminal && o.outcome === 'in_flight') bad.push(`${job.id}: ${job.status} job with in-flight operation ${o.key}`);
         if (job.status === 'done' && o.outcome === 'unknown') bad.push(`${job.id}: done job with unresolved operation ${o.key}`);
-        if (terminal && o.lease_taken) bad.push(`${job.id}: ${job.status} job still marks a lease taken for ${o.key}`);
+        if (terminal && o.lease_taken && !(job.status === 'cancelled' && o.outcome === 'unknown' && job.cleanup_pending.includes(o.key))) bad.push(`${job.id}: ${job.status} job still marks a lease taken for ${o.key}`);
+        if (job.cleanup_pending.includes(o.key) && o.outcome !== 'unknown') bad.push(`${job.id}: cleanup_pending lists ${o.key} which is ${o.outcome}`);
         if (o.lease_taken && o.outcome !== 'in_flight' && o.outcome !== 'unknown') bad.push(`${job.id}: operation ${o.key} is ${o.outcome} but still marks a lease taken`);
         if (o.lease_taken && o.resource) {
           const lease = await this.get<Lease>('lease', o.resource);

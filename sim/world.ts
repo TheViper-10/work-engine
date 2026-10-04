@@ -6,7 +6,7 @@ import { Engine } from '../src/engine.ts';
 import { MemoryStore, makeKey } from '../src/store.ts';
 import { ManualClock } from '../src/clock.ts';
 import { defineConfig, CHECK_NAMES } from '../src/config.ts';
-import type { Answer, IngestEvent, Spec } from '../src/types.ts';
+import type { Answer, IngestEvent, SessionDirectory, Spec } from '../src/types.ts';
 import { checkAnswer } from './invariants.ts';
 
 export const T0 = Date.UTC(2026, 0, 1, 0, 0, 0);
@@ -24,6 +24,24 @@ export function loadSpec(): Spec {
 
 export class Violation extends Error {}
 
+/** Simulated session directory: mention sessions live in their own DM; home sessions live in the home of the job they first touch. */
+export class SimDirectory implements SessionDirectory {
+  readonly cacheable = false;
+  readonly mention = new Set<string>();
+  readonly failing = new Set<string>();
+  failAll = false;
+  private readonly assigned = new Map<string, string>();
+  async dmOf(sid: string, job?: { id: string; dm: string }): Promise<{ dm: string } | { error: string }> {
+    if (this.failAll || this.failing.has(sid)) return { error: 'lookup failed' };
+    if (this.mention.has(sid)) return { dm: `dm:mention:${sid}` };
+    if (!job) return { error: 'no job' };
+    const k = `${sid}|${job.id}`;
+    if (!this.assigned.has(k)) this.assigned.set(k, job.dm);
+    return { dm: this.assigned.get(k)! };
+  }
+  broken(sid: string): boolean { return this.failAll || this.failing.has(sid); }
+}
+
 export interface Post { thread: string; ts: number; link: string; job: string | null; milestone: string | null; relay?: boolean; round: number }
 export interface Wake { dm: string; text: string; at: number; job: string; handled: boolean }
 export type CallName = 'jobOpen' | 'jobView' | 'intend' | 'say' | 'promiseAdd' | 'checkpoint';
@@ -37,6 +55,10 @@ export class World {
   readonly engines: Engine[] = [];
   private rr = 0;
   builds: Record<string, string | null> = { 'approve-desktop-qa-latest': 'abc', 'approve-desktop-prod-alpha': 'abc', pr_review: 'abc' };
+  readonly dir = new SimDirectory();
+  staleWake = false;
+  /** sessions that have answered clear/go for a job at a generation: job -> session -> generation */
+  readonly acted = new Map<string, Map<string, number>>();
   sourceFail = false;
   slackBlind = false;
   wakerFail = false;
@@ -48,7 +70,7 @@ export class World {
   privateThreadsSeen = new Set<string>([PRIVATE_THREAD]);
   private linkSeq = 0;
 
-  constructor(mode: 'flag' | 'hold', instances = 2) {
+  constructor(mode: 'flag' | 'hold', instances = 2, overrides: { inboxMaxUnprocessed?: number; noticeCoalesceMinutes?: number } = {}) {
     this.mode = mode;
     const checks = Object.fromEntries(CHECK_NAMES.map((n) => [n, mode]));
     for (let k = 0; k < instances; k++) {
@@ -68,15 +90,17 @@ export class World {
             return p ? { link: p.link, ts: p.ts, relay: !!p.relay } : null;
           },
         },
+        sessionDirectory: this.dir,
         waker: {
           postWake: async (dm, text) => {
             if (this.wakerFail) throw new Error('slack down');
-            const job = dm.replace(/^dm:/, '');
+            const job = dm.replace(/^dm:/, '').replace(/:g\d+$/, '');
             this.wakes.push({ dm, text, at: this.clock.now(), job, handled: false });
             this.pendingUnblock.delete(job);
+            if (this.staleWake && !text.includes('notice')) { this.staleWake = false; return { stale_version: true }; }
           },
         },
-        config: defineConfig({ env: 'sim', bot: 'bot', ownBotUserId: BOT, checks }),
+        config: defineConfig({ env: 'sim', bot: 'bot', ownBotUserId: BOT, checks, ...overrides }),
         specs: [this.spec],
       }));
     }
@@ -105,9 +129,39 @@ export class World {
     this.log(`${sid ?? 'nosession'} ${name} ${short(args)} -> ${ans.status}`);
     this.noteUnblocks(ans);
     if (ans.job && typeof ans.job === 'string' && name === 'jobOpen') this.jobs.add(ans.job);
-    const errs = checkAnswer(this, name, args, ans);
+    const errs = checkAnswer(this, name, args, ans, sid ?? null);
+    errs.push(...(await this.checkOwnership(name, args, ans, sid ?? null)));
     if (errs.length) throw new Violation(errs.join('; '));
     return ans;
+  }
+
+  /**
+   * Job-home invariants on an action answer: no clear intend (or go) without confirmed identity, and at most one
+   * action-owning session per job generation at a time: the acting session must hold the active run of the current generation.
+   */
+  private async checkOwnership(name: CallName, args: any, ans: Answer, sid: string | null): Promise<string[]> {
+    const action = (name === 'intend' && ans.status === 'clear') || (name === 'say' && (ans.status === 'go' || ans.status === 'already_claimed'));
+    if (!action) return [];
+    const bad: string[] = [];
+    const jobId: string = args.job;
+    if (!sid) bad.push(`${name}: ${ans.status} for a call with no session id`);
+    else if (this.dir.broken(sid)) bad.push(`${name}: ${ans.status} while the session lookup was failing (no clear without confirmed identity)`);
+    else if (this.dir.mention.has(sid)) bad.push(`${name}: ${ans.status} for mention session ${sid}, which is not in the job home`);
+    const job = await this.peek<any>('job', jobId);
+    if (job && sid) {
+      const run = job.current_run ? await this.peek<any>('run', `${jobId}:${job.current_run}`) : null;
+      if (name === 'intend' && this.mode === 'hold' && (!run || run.session_id !== sid || run.generation !== job.generation)) {
+        bad.push(`${name}: clear for ${sid}, which does not hold the current run of generation ${job.generation} of ${jobId}`);
+      }
+      if (run && run.generation !== job.generation) bad.push(`${jobId}: current run belongs to generation ${run.generation}, job is at ${job.generation}`);
+      const m = this.acted.get(jobId) ?? new Map<string, number>();
+      for (const [other, g] of m) if (other !== sid && g > job.generation) bad.push(`${jobId}: generation went backwards`);
+      const mine = m.get(sid);
+      if (mine !== undefined && mine < job.generation) bad.push(`${name}: fenced session ${sid} (generation ${mine}) got ${ans.status} on ${jobId} at generation ${job.generation}`);
+      m.set(sid, job.generation);
+      this.acted.set(jobId, m);
+    }
+    return bad;
   }
 
   async ingest(ev: IngestEvent, inst?: Engine): Promise<Answer> {
@@ -115,7 +169,7 @@ export class World {
     try { ans = await (inst ?? this.nextEngine()).ingest(ev); } catch (e) { throw new Violation(`engine.ingest threw: ${(e as Error).stack}`); }
     this.log(`ingest ${short(ev)} -> ${ans.status}`);
     this.noteUnblocks(ans);
-    const errs = checkAnswer(this, 'ingest', ev, ans);
+    const errs = checkAnswer(this, 'ingest', ev, ans, null);
     if (errs.length) throw new Violation(errs.join('; '));
     return ans;
   }
@@ -124,7 +178,16 @@ export class World {
     let ans: Answer;
     try { ans = await (inst ?? this.nextEngine()).sweep(); } catch (e) { throw new Violation(`engine.sweep threw: ${(e as Error).stack}`); }
     this.log(`sweep -> ${ans.say_to_tony}`);
-    const errs = checkAnswer(this, 'sweep', {}, ans);
+    const errs = checkAnswer(this, 'sweep', {}, ans, null);
+    if (errs.length) throw new Violation(errs.join('; '));
+    return ans;
+  }
+
+  async replaceHome(job: string, reason: string): Promise<Answer> {
+    let ans: Answer;
+    try { ans = await this.nextEngine().replaceHome(job, reason); } catch (e) { throw new Violation(`engine.replaceHome threw: ${(e as Error).stack}`); }
+    this.log(`replaceHome ${job} -> ${ans.status}`);
+    const errs = checkAnswer(this, 'replaceHome', { job }, ans, null);
     if (errs.length) throw new Violation(errs.join('; '));
     return ans;
   }
@@ -133,7 +196,7 @@ export class World {
     let ans: Answer;
     try { ans = await this.nextEngine().wake(job, reason); } catch (e) { throw new Violation(`engine.wake threw: ${(e as Error).stack}`); }
     this.log(`wake ${job} -> ${ans.status}`);
-    const errs = checkAnswer(this, 'wake', { job }, ans);
+    const errs = checkAnswer(this, 'wake', { job }, ans, null);
     if (errs.length) throw new Violation(errs.join('; '));
     return ans;
   }

@@ -9,7 +9,8 @@ export type CheckName =
 export type CheckMode = 'hold' | 'flag';
 export type FlagKind =
   | CheckName | 'missing_session' | 'unclaimed_post' | 'not_work_run' | 'job_ended'
-  | 'source_unreadable' | 'ambiguous_outcome' | 'unknown_outcome';
+  | 'source_unreadable' | 'ambiguous_outcome' | 'unknown_outcome'
+  | 'identity_unconfirmed' | 'ambiguous_association' | 'escalate';
 
 export interface Clock {
   now(): number; // epoch ms
@@ -50,11 +51,23 @@ export interface SlackReader {
   findOwnPostAfter(thread: string, ts: number): Promise<{ link?: string; ts?: number; relay?: boolean } | null>;
 }
 export interface Waker {
-  postWake(dm: string, text: string): Promise<void>;
+  /** May report `stale_version` when the home session is pinned to an old agent version (A3): the engine then replaces the home. */
+  postWake(dm: string, text: string): Promise<void | { stale_version?: boolean }>;
+}
+
+export type SessionLookup = { dm: string } | { error: string };
+/** A1: which DM a session lives in. Looked up, never passed by the caller. Phase 3: the platform's session record. */
+export interface SessionDirectory {
+  /** `job` is a hint for offline defaults that map a session to a job's home; a real directory ignores it. */
+  dmOf(sessionId: string, job?: { id: string; dm: string; generation: number }): Promise<SessionLookup>;
+  /** false when the answer depends on the job hint, so the engine must not cache it per session. */
+  readonly cacheable?: boolean;
 }
 
 export type JobStatus = 'queued' | 'open' | 'closing' | 'cancel_requested' | 'done' | 'cancelled';
 export type MilestoneSource = 'tony_reported' | 'webhook_verified';
+
+export interface Home { dm: string; generation: number; opened_at: number; closed_at: number | null; reason: string }
 
 export interface Job {
   id: string;
@@ -90,12 +103,55 @@ export interface Job {
   replaced_by: string | null;
   opened_at: number;
   closed_at: number | null;
+  // --- job-home contract (A1 to A4, R22, R24)
+  generation: number;
+  homes: Home[];
+  /** session -> generation of the run it last held; a lower number than the job's generation means fenced (A3). */
+  session_gen: Record<string, number>;
+  /** Keys of inbox items not yet processed (per-job array like op_keys). */
+  inbox_keys: string[];
+  inbox_seq: number;
+  inbox_notice_at: number | null;
+  /** owner session -> inbox keys shown in the view it last read (implicitly processed by its next checkpoint). */
+  inbox_seen: Record<string, string[]>;
+  inbox_escalated: boolean;
+  identity: { since: number; last: number; sessions: string[]; attempts: number; escalated: boolean } | null;
+  /** Operations left unknown when a cancel ended the job (R22); their leases stay held until readback. */
+  cleanup_pending: string[];
+  cleanup_escalated: boolean;
+  guidance_version: string | null;
+}
+
+export type InboxKind = 'message' | 'approval' | 'cancel' | 'request' | 'route' | 'note' | 'late';
+export interface InboxItem {
+  key: string;
+  seq: number;
+  event: string;
+  job: string;
+  sender: string | null;
+  sender_kind: string;
+  thread: string | null;
+  origin_message: string | null;
+  source: string;
+  received_at: number;
+  refs: string[];
+  private: boolean;
+  kind: InboxKind;
+  state: 'received' | 'associated' | 'processed';
+  processed_at: number | null;
+  processed_by_run: string | null;
+  ambiguous?: boolean;
+  text?: string;
+  /** Set on the coalesced overflow item (A4). */
+  overflow?: { count: number };
 }
 
 export interface Run {
   id: string;
   job: string;
   n: number;
+  /** Generation of the job home this run belongs to (A3 fencing). */
+  generation?: number;
   session_id: string | null;
   origin: 'wake' | 'mention' | 'job_open' | 'adopted';
   started_at: number;

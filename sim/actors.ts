@@ -47,6 +47,8 @@ export class Sim {
   }
   spawn(): Session {
     const s: Session = { id: `s${++this.sessSeq}`, alive: true, pendingPost: null, openOps: [], job: null };
+    // About a quarter of the sessions are mention sessions in a non-home DM (A1); the rest are home sessions.
+    if (this.rng.chance(0.25)) this.w.dir.mention.add(s.id);
     this.sessions.push(s);
     return s;
   }
@@ -105,6 +107,9 @@ export class Sim {
       [1.5, () => this.downtime()],
       [3, () => this.changeBuild()],
       [2, () => this.toggle()],
+      [2, () => this.lookupFault()],
+      [1.5, () => this.replace()],
+      [1.5, () => this.staleWakeNext()],
     ]);
     await a();
     const bad = await checkState(this.w, this.afterSweep);
@@ -406,6 +411,22 @@ export class Sim {
     this.w.builds[gate] = this.rng.chance(0.1) ? null : this.rng.pick(BUILDS);
     this.log(`build of ${gate} is now ${this.w.builds[gate]}`);
   }
+  /** Session lookup starts or stops failing, for one session or for all (A2). */
+  async lookupFault(): Promise<void> {
+    const d = this.w.dir;
+    if (this.rng.chance(0.4)) { d.failAll = !d.failAll; this.log(`session lookup failing for all: ${d.failAll}`); return; }
+    const s = this.rng.pick(this.sessions.length ? this.sessions : [this.spawn()]);
+    if (d.failing.has(s.id)) d.failing.delete(s.id); else d.failing.add(s.id);
+    this.log(`session lookup for ${s.id} failing: ${d.failing.has(s.id)}`);
+  }
+  /** Controlled replacement of a job's home (A3); the old sessions are fenced from then on. */
+  async replace(): Promise<void> {
+    const jobs = [...this.w.jobs];
+    if (jobs.length === 0) return;
+    await this.w.replaceHome(this.rng.pick(jobs), 'sim: operator replacement');
+    this.afterSweep = false;
+  }
+  async staleWakeNext(): Promise<void> { this.w.staleWake = true; this.log('next wake reports a stale version'); }
   async toggle(): Promise<void> {
     const w = this.w;
     const which = this.rng.int(3);
