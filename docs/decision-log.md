@@ -108,3 +108,8 @@ All choices pick the option closest to L1 to L4: the engine records and wakes, T
 - Call: after R17 M2, a wake view shows `work_run: none` until the first write; the scripted Tony now continues on `none` and stops only on `other` (133ddd6). Scripted replay: 9 of 9 pass in flag and hold, engine calls median 82, max 95.
 - Evidence: post-merge scripted run went 0 of 9 because every woken session quit after one `job_view`.
 - Alternative: make `job_view` bind a pending wake run again. Rejected; it reopens red-team M2.
+
+## A1-A4. Owner amendment 2026-10-04: job-home execution ownership (controlling)
+- Owner decision: "Yes please, this is the way." One job, one engine-owned execution DM; Slack threads are communication only. No further A/B between old and new approach; the goal-oriented playbook is adopted.
+- Amends D10 (replaced), D1 (extended with session-to-DM lookup; missing or failed identity is a fixed hold for consequential calls), file 28 §2 (sequential home replacement with generation fencing), 27 §3.1 (mention sessions no longer work). Full text and R20-R24: `docs/job-home-contract.md`.
+- The real-model gate run on the pre-amendment engine (flag 6/10, hold 1/10 strict D7) is discarded as a gate; it is not classified further. The gate re-runs on the job-home engine only.
