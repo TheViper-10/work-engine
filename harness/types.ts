@@ -121,4 +121,6 @@ export interface RunResult {
   end_clock: number;
   usage: { input_tokens: number; output_tokens: number; requests: number };
   engine_snapshot?: any;
+  /** Which playbook/reference files built the system prompt (harness extra). */
+  config?: { playbook_path: string; reference_paths: string[]; playbook_sha256: string; prompt_sha256: string };
 }

@@ -164,6 +164,8 @@ export class World {
   /** A human message landed: derive the slack.* world paths scenarios use in `when`. */
   noteHumanMessage(thread: string, senderKey: string, text: string, tMin = 0): void {
     const th = this.data.slack.threads[thread];
+    // Every human/bot message with its virtual time and the build current at that moment (outcome scorecard: go records).
+    this.facts().messages.push({ t: tMin, thread, key: senderKey, user: this.people[senderKey]?.slack ?? senderKey, text, build: Object.values<Json>(this.data.circleci.pipelines).at(-1)?.build ?? null });
     if (senderKey === 'owner' && /^\s*go\b|\bgo ahead\b|have the go|is approved/i.test(text)) {
       th.has_owner_go_for_build = this.currentBuild();
       this.lastGoBuild = this.currentBuild();
@@ -173,7 +175,9 @@ export class World {
   private lastGoBuild: string | null = null;
   /** Scoring facts kept in the world data (harness only; Tony's tools never read this). */
   private facts(): Json {
-    return (this.data.harness ??= { approvals: [], cancel_at: null });
+    const h = (this.data.harness ??= { approvals: [], cancel_at: null });
+    h.messages ??= [];
+    return h;
   }
 
   private classifyPost(thread: string, text: string): string | null {

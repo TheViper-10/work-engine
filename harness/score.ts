@@ -286,7 +286,7 @@ function otherSessionActed(run: RunResult, session: string, t: number): boolean 
   return run.own_calls.some((c) => own(c) && !c.error && c.effects.length > 0);
 }
 
-function gateSlackIds(gate: string): string[] {
+export function gateSlackIds(gate: string): string[] {
   const g = SPEC.gates?.[gate];
   if (!g) return [];
   return [...g.responders.primary, ...(g.responders.stand_ins ?? [])].map((p: string) => SPEC.people?.[p]?.slack).filter(Boolean);

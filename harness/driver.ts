@@ -40,7 +40,7 @@ interface Trigger {
 
 const isoAt = (tMin: number) => new Date(EPOCH_MS + tMin * 60000).toISOString();
 
-function fillPlaceholders(sc: any): any {
+export function fillPlaceholders(sc: any): any {
   const ids = sc.initial_world?.github?.scripted_ids ?? {};
   let s = JSON.stringify(sc);
   if (ids.pr_number != null) s = s.split('<pr>').join(String(ids.pr_number));
@@ -69,7 +69,7 @@ export class Driver {
   private dropped = 0;
   private engineCalls: EngineCall[] = [];
   private nextSweep = SWEEP_EVERY_MIN;
-  private system: string;
+  readonly system: string;
   private log: (l: string) => void;
   private deliverySeq = 0;
 
@@ -348,6 +348,6 @@ export class Driver {
   }
 }
 
-export function loadPlaybook(root: string): string {
-  return readFileSync(`${root}/workflows/desktop-release/playbook.md`, 'utf8');
+export function loadPlaybook(root: string, path = `${root}/workflows/desktop-release/playbook.md`): string {
+  return readFileSync(path, 'utf8');
 }

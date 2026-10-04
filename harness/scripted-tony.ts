@@ -389,10 +389,10 @@ class Play {
     // 5. QA go
     if (pj[QA_GATE] === 'hold') {
       const asks = F.msgsA.map((m: any, idx: number) => ({ m, idx, b: ASK_RE.exec(String(m.text))?.[1] })).filter((x: any) => x.m.user === this.tony && x.b);
-      const goMsgs = F.msgsA.map((m: any, idx: number) => ({ m, idx })).filter((x: any) => x.m.user === this.owner && /\bgo\b/i.test(x.m.text) && !/go ahead/i.test(x.m.text));
+      const goMsgs = F.msgsA.map((m: any, idx: number) => ({ m, idx })).filter((x: any) => x.m.user === this.owner && /\bgo\b/i.test(x.m.text) && !/sentinel|alpha/i.test(x.m.text));
       const asksB = asks.filter((a: any) => a.b === B);
       let valid: boolean;
-      if (asksB.length) valid = asksB.some((a: any) => /I have your go/i.test(a.m.text)) || goMsgs.some((g: any) => g.idx > asksB[0].idx);
+      if (asksB.length) valid = asksB.some((a: any) => /I have your go, so I am publishing/i.test(a.m.text)) || goMsgs.some((g: any) => g.idx > asksB[0].idx || !asks.some((a: any) => a.b !== B)); // a go before the ask counts unless an ask for another build exists (stale go)
       else if (asks.length) valid = false;
       else valid = goMsgs.length > 0 && B === pr.merge_sha;
       if (!asksB.length) {
