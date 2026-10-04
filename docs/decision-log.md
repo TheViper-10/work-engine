@@ -55,3 +55,8 @@ live in handoff file 28 §3 and are not repeated here. Each entry: the call, the
 - `wake` on a job whose run is already active returns `run_active` and posts nothing (no twin wake). Faithful to "one work run per job" (L1).
 - An `intend` in flag mode on an ended job moves it back to `cancel_requested` until the outcome is reported, so no job is closed with an operation in flight. A flag records; it does not stop Tony, so the engine must keep the record honest.
 - `open_jobs` record lists open job ids for the "no job here" answer. Parked for phase 3: cap or bucket it, since it grows without bound.
+
+## R12. A late checkpoint never reopens an ended job
+- Call: `checkpoint` on a done or cancelled job records Tony's report and changes nothing else (simulator fix 5). Tony reopens work with `job_open`.
+- Evidence: the simulator found a late `working` checkpoint on a cancelled job reopening it and clearing its wake, which broke "every open job has a next wake". Cancel is the owner's authority (spec `cancel` gate); a stale session must not undo it.
+- Alternative: let a late checkpoint revive the job. Rejected: a session that missed the cancel would silently resume a release the owner stopped.

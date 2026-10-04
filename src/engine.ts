@@ -269,11 +269,19 @@ export class Engine {
       opened = true;
       job.requester = a.requester ?? null;
       if (primary && intent === 'replace') {
+        // Make the new job the primary first, so ending the old one cannot promote a queued job over it.
+        idx.primary = job.id;
+        await this.put('job_index', idxId, idx);
         await this.requestCancel(primary, `replaced by ${job.id}`);
+        const fresh = await this.get<JobIndex>('job_index', idxId);
+        if (fresh) { idx.queued = fresh.queued; idx.winding = fresh.winding; }
+        for (const qid of idx.queued) {
+          const q = await this.get<Job>('job', qid);
+          if (q && q.status === 'queued') { q.blocked_by_jobs = [job.id]; await this.saveJob(q); }
+        }
         primary.replaced_by = job.id;
         await this.saveJob(primary);
         notes.push(`The earlier job ${primary.id} is ${(primary.status as JobStatus) === 'cancelled' ? 'cancelled' : 'cancel requested (operations still in flight)'}.`);
-        idx.primary = job.id;
       } else if (primary && intent === 'queue') {
         job.status = 'queued';
         job.blocked_by_jobs = [primary.id];
@@ -517,7 +525,8 @@ export class Engine {
         if (ev) {
           const ok = ask ? ask.responder_slack : this.gateSlack(spec, act.gate);
           if (!ev.sender_id || !ok.includes(ev.sender_id)) {
-            findings.push({ check: 'sender_not_listed', detail: `event ${a.because} came from ${ev.sender_id ?? 'an unknown sender'}, who is not on the ${act.gate} responder list`, next: `Ask someone on the ${act.gate} list (${ok.join(', ') || 'none listed'}), then call intend again.` });
+            const priv = ev.private_origin || (!!ev.thread && job.private_threads.includes(ev.thread));
+            findings.push({ check: 'sender_not_listed', detail: priv ? `the evidence named in because (held: evidence from another thread) came from someone who is not on the ${act.gate} responder list` : `event ${a.because} came from ${ev.sender_id ?? 'an unknown sender'}, who is not on the ${act.gate} responder list`, next: `Ask someone on the ${act.gate} list (${ok.join(', ') || 'none listed'}), then call intend again.` });
           }
         }
       }
@@ -666,6 +675,9 @@ export class Engine {
     if (!a.thread || !a.about) {
       return ans(false, 'bad_input', `promise_add: ${!a.thread ? 'thread' : 'about (a milestone id)'} is missing, so no promise was recorded.`, { job: job.id });
     }
+    if (job.status === 'done' || job.status === 'cancelled') {
+      return ans(false, 'job_ended', `promise_add: ${job.id} is ${job.status}, so no promise was recorded. Tell the person yourself if they still need an answer.`, { job: job.id });
+    }
     const spec = this.spec(job);
     const now = this.now();
     const rel = await this.touchRun(job, ctx, 'adopted', true);
@@ -725,6 +737,10 @@ export class Engine {
           notes.push(`Outcome "${o.outcome}" for ${o.ref} is not done, failed or unknown; skipped.`);
           continue;
         }
+        if (o.outcome === 'unknown' && (job.status === 'done' || job.status === 'cancelled')) {
+          notes.push(`The job has ended, so an "unknown" outcome for ${o.ref} was not recorded (it would leave an ended job with an unresolved operation).`);
+          continue;
+        }
         let matches = ops.filter((x) => x.ref === o.ref && (!o.action || x.action === o.action));
         if (matches.length === 0) {
           const act = o.action ?? 'unspecified';
@@ -747,7 +763,9 @@ export class Engine {
         }
       }
     }
-    for (const m of a.reached ?? []) {
+    const ended = job.status === 'done' || job.status === 'cancelled';
+    if (ended && a.reached?.length) notes.push('The job has ended, so the reached milestones were not recorded (nothing can be owed on an ended job).');
+    for (const m of ended ? [] : a.reached ?? []) {
       if (await this.markReached(job, spec, m)) notes.push(`Milestone ${m} marked reached (reported by you).`);
     }
 
@@ -761,6 +779,12 @@ export class Engine {
     if (a.status === 'cancelled') {
       await this.requestCancel(job, 'cancelled by checkpoint');
       statusText = (job.status as JobStatus) === 'cancelled' ? 'The job is cancelled.' : 'Cancel requested: operations are still in flight, so the job stays cancel_requested until they have outcomes.';
+    } else if (job.status === 'done' || job.status === 'cancelled') {
+      // An ended job stays ended: a late checkpoint records what it reports and changes nothing else.
+      statusText = `The job is already ${job.status}; your report was recorded and nothing else changed.`;
+    } else if (job.status === 'queued') {
+      // A queued job has not started: it cannot close or reopen itself; it opens when its turn comes.
+      statusText = 'The job is queued behind another job; your report was recorded, and it opens when that job ends.';
     } else if (a.status === 'done') {
       if (job.status === 'cancel_requested') {
         statusText = 'The job is cancel_requested; it ends when its in-flight operations have outcomes.';
@@ -878,7 +902,7 @@ export class Engine {
       return { action: o.action, ref: o.ref, outcome: eff, age: fmtAge(now - o.intent_at), source: o.source, note: o.note };
     });
     const evView = evs.map((e) => {
-      const held = !!e.thread && job.private_threads.includes(e.thread) && e.thread !== viewerThread;
+      const held = !!e.thread && (e.private_origin || job.private_threads.includes(e.thread)) && e.thread !== viewerThread;
       return held
         ? { held: true, age: fmtAge(now - e.received_at), summary: 'held: evidence from another thread' }
         : { held: false, id: e.id, source: e.source, kind: e.kind, thread: e.thread, sender: e.sender_id, sender_kind: e.sender_kind, ref: e.ref, age: fmtAge(now - e.received_at) };
@@ -942,6 +966,8 @@ export class Engine {
     const jobs = await this.manyPresent<Job>('job', jobIds);
     const woken: string[] = [];
     const actions: string[] = [];
+    // An event from a private link stays private in every job it reaches (also by ref), not only the job that linked it.
+    if (ev.thread && jobs.some((j) => j.private_threads.includes(ev.thread!))) rec.private_origin = true;
     for (const job of jobs) {
       if (job.status === 'done' || job.status === 'cancelled') continue;
       const spec = this.spec(job);
@@ -954,7 +980,11 @@ export class Engine {
         const claim = ti?.claim && ti.claim.job === job.id ? ti.claim : null;
         const dKey = claim ? `${job.id}:${ev.thread}:${claim.milestone}` : null;
         const d = dKey ? await this.get<Delivery>('delivery', dKey) : null;
-        if (claim && d && d.state === 'claimed') {
+        // A late delivery of a post made before the claim belongs to an earlier post, not to this claim.
+        const postedAt = typeof ev.attrs?.ts === 'number' ? ev.attrs.ts : null;
+        if (claim && postedAt !== null && postedAt < claim.at) {
+          actions.push(`own post in ${ev.thread} predates the open ${claim.milestone} claim of ${job.id}; not matched to it`);
+        } else if (claim && d && d.state === 'claimed') {
           await this.markSent(job, d, ev.attrs?.relay ? 'relay' : 'connector', typeof ev.attrs?.link === 'string' ? ev.attrs.link : null);
           actions.push(`own post in ${ev.thread} matched the ${claim.milestone} claim of ${job.id}`);
           await this.maybeClose(job);
@@ -1024,22 +1054,22 @@ export class Engine {
     const now = this.now();
     const spec = this.spec(job);
     const reasons: string[] = [];
+    let stillQueued = false;
 
     if (job.status === 'queued') {
       const blockers = await this.manyPresent<Job>('job', job.blocked_by_jobs);
-      if (blockers.every((b) => b.status === 'done' || b.status === 'cancelled') || blockers.length === 0) {
+      const idxId = `${job.workflow}:${job.target}`;
+      const idx = await this.get<JobIndex>('job_index', idxId);
+      const taken = !!idx?.primary && idx.primary !== job.id;
+      if ((blockers.every((b) => b.status === 'done' || b.status === 'cancelled') || blockers.length === 0) && !taken) {
         job.status = 'open';
         job.blocked_by_jobs = [];
         job.next_wake_at = now;
         reasons.push('the job it was queued behind has ended');
-        const idxId = `${job.workflow}:${job.target}`;
-        const idx = await this.get<JobIndex>('job_index', idxId);
-        if (idx) { idx.queued = idx.queued.filter((x) => x !== job.id); if (!idx.primary) idx.primary = job.id; await this.put('job_index', idxId, idx); }
+        if (idx) { idx.queued = idx.queued.filter((x) => x !== job.id); idx.primary = job.id; await this.put('job_index', idxId, idx); }
       } else {
-        job.next_wake_at = now + this.nextWakeMs(spec);
-        await this.saveJob(job);
-        await this.schedule(job.id, job.next_wake_at);
-        return;
+        if (taken) job.blocked_by_jobs = [idx!.primary!];
+        stillQueued = true;
       }
     }
 
@@ -1082,6 +1112,13 @@ export class Engine {
         await this.schedule(job.id, d.next_check_at);
         sum.claims_not_seen += 1;
       }
+    }
+    if (stillQueued) {
+      // A queued job is not woken, but anything already recorded on it (a stray intend) still times out.
+      job.next_wake_at = now + this.nextWakeMs(spec);
+      await this.saveJob(job);
+      await this.schedule(job.id, job.next_wake_at);
+      return;
     }
     if (await this.maybeClose(job)) { sum.closed.push(job.id); return; }
 

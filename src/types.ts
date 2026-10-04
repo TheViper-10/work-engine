@@ -186,6 +186,8 @@ export interface EventRecord {
   attrs: Record<string, unknown>;
   received_at: number;
   matched_jobs: string[];
+  /** Set when the event came from a private link of any job; views then show it only as held. */
+  private_origin?: boolean;
 }
 
 export interface IngestEvent {
