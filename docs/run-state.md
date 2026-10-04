@@ -30,3 +30,11 @@ Goal-oriented playbook adopted. No A/B with the old approach.
 ## Done condition and authorization (owner, 2026-10-04)
 Done when the job-home work engine is fully deployed to QA and a live Slack mock-release run completes in channel `playwright-agent-test`. Read as authorization for phase 3 QA writes (custom types, snap-in, skills, scheduling, connector, Tony `ai_agent/2` republish) and the phase 4 live mock run in that channel. Protected resources unchanged.
 - Owner approved QA deletions: empty packages owner-v3, onefunc, coord-v1; inactive terminal-v4 install 462070f3 with its version and package (records saved first).
+
+## Phase 3 deployed (2026-10-05)
+- Snap-in `work-engine-qa-v5`: install `snap_in/1a4de02e-8179-48d1-87ae-0fe10333fce4` (svcacc/121), package 71561124, version 3e588625, tarball sha256 7495bc50...84a0 (d748e54).
+- Tony skill workflows: job_view 59, checkpoint 60, job_open 61, intend 62, say 63, promise_add 64. Wake workflow 58.
+- Plan `ai_agent_plan/26` work-engine-desktop-release (playbook + references + mock overlay).
+- Tony `ai_agent/2` v2.39 published, default, 14 skills; v8 workflows 55/56 and plans 24/25 detached. Rollback: republish `rollback-work-engine-s6-2026-10-05/tony-versions-create-body-v2.38-rollback.json`.
+- Proofs: live adapter probe (home DM, one wake, Tony reply, session-to-DM identity, route vs hold, admin close); hidden-DM smoke (Tony called work_engine_job_view, answer no_job_here).
+- Next: phase 4 live mock release 5.2.11 in playwright-agent-test (`pilot/RUNBOOK.md`).
