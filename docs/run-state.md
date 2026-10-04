@@ -14,13 +14,15 @@ Resume: read this file, then docs/decision-log.md, then handoff file 28.
 | P1-core | engine core + memory store + six calls + lint | running (sonnet), contract docs/engine-design.md |
 | P1-sim | simulator: 1,000 random orders + named cases | pending |
 | P1-red | Opus red-team, fix confirmed | pending |
-| P2-harness | replay harness, real model via gateway | pending |
+| P2-harness | replay harness, real model via gateway | running (sonnet): world, driver, model loop, scorer; engine binding later |
 | P2-runs | replays under flag and hold, scored vs D7 | pending |
 | Report | 29-work-engine-run-report.md + /tmp copy | pending |
 
 ## Facts
 - AI gateway reachable: POST /v1/messages with model anthropic.claude-sonnet-5-5 returns 200 (auth: keychain arcus-token as Bearer + x-api-key). D14 real-model replay feasible.
 - Contract for all slices: docs/engine-design.md.
+
+| P0-gapfill | fde-agent read-only: scenario fact gaps into scenarios/gap-fill.md | running |
 
 ## Parked
 (none yet)
