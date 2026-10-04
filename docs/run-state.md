@@ -26,3 +26,7 @@ Goal-oriented playbook adopted. No A/B with the old approach.
 - Compare-and-set on the platform store: phase 3 proof.
 - Phase 3 QA writes (schema, snap-in, skills, Tony publish, connector): need owner authorization.
 - Run 6 pipeline id for number 395883 (needs CircleCI token; not needed for replay).
+
+## Done condition and authorization (owner, 2026-10-04)
+Done when the job-home work engine is fully deployed to QA and a live Slack mock-release run completes in channel `playwright-agent-test`. Read as authorization for phase 3 QA writes (custom types, snap-in, skills, scheduling, connector, Tony `ai_agent/2` republish) and the phase 4 live mock run in that channel. Protected resources unchanged.
+- Owner approved QA deletions: empty packages owner-v3, onefunc, coord-v1; inactive terminal-v4 install 462070f3 with its version and package (records saved first).
