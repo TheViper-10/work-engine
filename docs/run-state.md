@@ -13,7 +13,7 @@ Resume: read this file, then docs/decision-log.md, then handoff file 28.
 | P0-review | docs/phase-0-review.md | done |
 | P1-core | engine core + memory store + six calls + lint | done: lint ok, 33 unit tests pass |
 | P1-sim | simulator: 1,000 random orders + named cases | done: flag 1000 + hold 1000 orders, 16 named cases, 0 violations; 7 engine bugs fixed |
-| P1-red | Opus red-team, fix confirmed | running (opus), report docs/red-team-1.md |
+| P1-red | Opus red-team, fix confirmed | review done: 21 findings (8 high, 9 med, 4 low; 20 confirmed), repros in test/redteam; fix design R17; fixes running (sonnet) |
 | P2-harness | replay harness, real model via gateway | done: engine binding wired; trials flag: run6 PASS, v2-18 and stale-go FAIL (playbook gaps, fixed R13-R15) |
 | P2-score | scoring R16, scripted Tony, hold trials | running (sonnet) |
 | P2-runs | replays under flag and hold, scored vs D7 | pending |
@@ -26,5 +26,7 @@ Resume: read this file, then docs/decision-log.md, then handoff file 28.
 | P0-gapfill | fde-agent read-only: scenario fact gaps into scenarios/gap-fill.md | done (no API calls) |
 
 ## Parked
+- Red-team L1 (due-index gap after 14-day outage; clock skew): phase 3 bounded catch-up scan and store clock.
+- Compare-and-set on the platform store (R17): phase 3 proof.
 - open_jobs record grows unbounded; cap or bucket in phase 3 (R11).
 - Run 6 pipeline id for number 395883 (needs CircleCI token; not needed for replay).
