@@ -198,9 +198,10 @@ export class World {
     );
     if (pw && /\bgo\b|\bQA\b|approve/i.test(text)) th.tony_asked_qa_go = true;
 
-    const milestone = via === 'tool' ? (this.classifyPost(thread, text) ?? this.heuristicMilestone(text)) : null;
+    // The connector matches any own post (tool or relayed final answer) to the thread's open claim, as the engine does.
+    const milestone = via === 'tool' ? (this.classifyPost(thread, text) ?? this.heuristicMilestone(text)) : this.classifyPost(thread, text);
     const dropped = this.dropFault(thread, milestone);
-    this.posts.push({ thread, ts, text, via, session: ctx.session, t: ctx.t, milestone, dropped });
+    this.posts.push({ thread, ts, text, via, session: ctx.session, t: ctx.t, milestone, text_milestone: this.heuristicMilestone(text), dropped });
     const event: EngineEvent | null = dropped
       ? null
       : {

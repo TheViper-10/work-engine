@@ -81,6 +81,7 @@ export class Driver {
       .filter((e) => e.raw.type !== 'timer' || e.raw.kind !== 'sweep');
     this.system = buildSystemPrompt(o.playbook, this.sc, 'the job DM');
     this.log = o.log ?? (() => {});
+    o.binding.attach?.(this.world, this.sc);
     o.binding.setMode?.(o.mode);
     o.binding.onWake((w) => this.onWake(w));
   }
@@ -342,7 +343,7 @@ export class Driver {
       final_world: this.world.data,
       end_clock: this.now,
       usage: { ...this.o.tony.usage },
-      engine_snapshot: this.o.binding.snapshot?.(),
+      engine_snapshot: await this.o.binding.snapshot?.(),
     };
   }
 }

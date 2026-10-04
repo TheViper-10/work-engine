@@ -2,8 +2,6 @@
 
 import type { EngineCall, Mode, OwnCall, RunResult } from './types.ts';
 
-const REFUSAL_TEXT = /must call|out of order|invalid (state|order)/i;
-
 export interface CheckHit {
   seq: number;
   t: number;
@@ -28,13 +26,17 @@ export interface Score {
   engine_calls_by_name: Record<string, number>;
   live_posts_per_thread: Record<string, number>;
   posts_per_thread: Record<string, number>;
-  deliveries: { milestone: string; expected: string[]; got: Record<string, number>; ok: boolean }[];
+  deliveries: { milestone: string; expected: string[]; got: Record<string, number>; pairs: any[]; scenario_gap: string[]; doubles: string[]; bad: string[]; ok: boolean }[];
+  still_owed: string[];
   milestones: { expected: string[]; reached: string[]; missing: string[]; source: string };
   job_status: { expected: string | null; got: string | null; ok: boolean | null };
   checks: Record<string, boolean | null>;
   sessions: number;
   sessions_truncated: number;
   session_errors: string[];
+  invariant_violations: string[];
+  session_flags: { check: string; call: string; detail: string }[];
+  world_reached: string[];
   timeline_reached: boolean;
   usage: RunResult['usage'];
 }
@@ -47,36 +49,36 @@ const ACTION_TOOLS: Record<string, (c: OwnCall, ref: string) => boolean> = {
   complete_release_issue: (c) => c.name === 'devrev_issue_complete',
 };
 
-function checkName(x: any): string | null {
-  if (typeof x === 'string') return x;
-  return x?.check ?? x?.name ?? x?.kind ?? null;
+const INTEND_CHECKS = new Set(['superseded_run', 'job_cancelled', 'lease_held', 'build_changed', 'sender_not_listed']);
+/** Engine flags that are not intend checks: counted from the engine's final flag records, not from an intend answer. */
+const SESSION_FLAGS = new Set(['missing_session', 'unclaimed_post', 'not_work_run']);
+
+/** Engine findings come as strings "<check>: <detail>" in answer.holds and answer.flags. */
+function parseFinding(x: unknown): string {
+  if (typeof x === 'object' && x) return String((x as any).check ?? 'unknown');
+  const m = /^(\w+):/.exec(String(x));
+  if (m && (INTEND_CHECKS.has(m[1]!) || SESSION_FLAGS.has(m[1]!))) return m[1]!;
+  return /not in the workflow spec/.test(String(x)) ? 'action_not_in_spec' : 'unknown';
 }
 
-/** Pull hold and flag findings out of an intend answer. Tolerant of the engine's final field names. */
+/** Pull hold and flag findings out of an intend answer (status hold|clear, holds[], flags[]). */
 export function findingsOf(c: EngineCall): CheckHit[] {
   if (c.name !== 'intend' || !c.output || typeof c.output !== 'object') return [];
   const o = c.output;
   const base = { seq: c.seq, t: c.t, action: String(c.input?.action ?? ''), ref: String(c.input?.ref ?? ''), session: c.session };
   const hits: CheckHit[] = [];
-  const isHold = o.status === 'hold' || o.kind === 'hold' || o.decision === 'hold';
-  if (isHold) {
-    const list = o.checks ?? o.holds ?? (o.check ? [o.check] : []);
-    for (const x of list) hits.push({ ...base, check: checkName(x) ?? 'unknown', kind: 'hold' });
-    if (!list.length) hits.push({ ...base, check: 'unknown', kind: 'hold' });
-  }
-  for (const x of o.flags ?? []) {
-    const n = checkName(x);
-    if (n && !['missing_session', 'unclaimed_post', 'not_work_run'].includes(n)) hits.push({ ...base, check: n, kind: 'flag' });
-  }
+  for (const x of Array.isArray(o.holds) ? o.holds : []) hits.push({ ...base, check: parseFinding(x), kind: 'hold' });
+  if (o.status === 'hold' && !hits.length) hits.push({ ...base, check: 'unknown', kind: 'hold' });
+  for (const x of Array.isArray(o.flags) ? o.flags : []) hits.push({ ...base, check: parseFinding(x), kind: 'flag' });
   return hits;
 }
 
+/** The engine never refuses for protocol reasons: ok:false (nothing recorded) or a thrown error counts. */
 export function isProtocolRefusal(c: EngineCall): string | null {
+  if (c.error) return `call failed: ${c.error}`;
   const o = c.output;
-  if (!o || typeof o !== 'object') return c.error ? `call failed: ${c.error}` : null;
-  if (o.kind === 'refused') return 'kind refused';
-  const say = typeof o.say_to_tony === 'string' ? o.say_to_tony : '';
-  if (REFUSAL_TEXT.test(say)) return say.slice(0, 120);
+  if (!o || typeof o !== 'object') return null;
+  if (o.ok === false) return `${o.status ?? 'ok:false'}: ${String(o.say_to_tony ?? '').slice(0, 100)}`;
   return null;
 }
 
@@ -89,7 +91,16 @@ export function score(run: RunResult, sc: any): Score {
   const firesKey = new Set(engineChecks.filter((x) => x.expected === 'fires').map((x) => `${x.at_action}|${x.check}`));
   const conditional = new Set(engineChecks.filter((x) => x.expected === 'fires' && x.condition).map((x) => `${x.at_action}|${x.check}`));
 
-  const false_findings = findings.filter((f) => !firesKey.has(`${f.action}|${f.check}`));
+  const snap = run.engine_snapshot;
+  // Session-level flags (missing_session, unclaimed_post, not_work_run) come from the engine's final flag records.
+  const expectedAnywhere = new Set(engineChecks.filter((x) => x.expected === 'fires').map((x) => x.check));
+  const snapFlags: any[] = (snap?.jobs ?? []).flatMap((j: any) => j.flags ?? []);
+  const session_flags = snapFlags.filter((f) => SESSION_FLAGS.has(f.check));
+  const false_session_flags = session_flags.filter((f) => !expectedAnywhere.has(f.check));
+  const false_findings: CheckHit[] = [
+    ...findings.filter((f) => !firesKey.has(`${f.action}|${f.check}`)),
+    ...false_session_flags.map((f) => ({ seq: 0, t: 0, action: String(f.call ?? ''), ref: '', check: String(f.check), kind: 'flag' as const, session: '' })),
+  ];
   const seen = new Set(findings.map((f) => `${f.action}|${f.check}`));
   const missed_findings = [...firesKey]
     .filter((k) => !seen.has(k) && !conditional.has(k))
@@ -121,16 +132,31 @@ export function score(run: RunResult, sc: any): Score {
   const msPosts: Record<string, Record<string, number>> = {};
   for (const p of run.posts) {
     posts_per_thread[p.thread] = (posts_per_thread[p.thread] ?? 0) + 1;
-    if (p.milestone === 'live') live_posts_per_thread[p.thread] = (live_posts_per_thread[p.thread] ?? 0) + 1;
+    const effMilestone = p.milestone; // claimed milestone (or the tool-post heuristic); relay replies to a mention are answers, not announcements
+    if (effMilestone === 'live') live_posts_per_thread[p.thread] = (live_posts_per_thread[p.thread] ?? 0) + 1;
     if (p.milestone) (msPosts[p.milestone] ??= {})[p.thread] = ((msPosts[p.milestone] ??= {})[p.thread] ?? 0) + 1;
   }
 
   const expEnd = sc.expected_end ?? {};
+  // Delivery. Double-post bar: the world's actual slack_post calls per thread per claimed milestone must be at most 1.
+  // Expected pairs: each (milestone, thread) the engine owed (any delivery record) must be sent exactly once. A pair
+  // in expected_end that the engine never owed is a scenario_gap (the scenario text never created the audience, e.g. no
+  // "tell me when" promise), reported but not failed.
+  const engineDel = new Map<string, string>();
+  for (const j of snap?.jobs ?? []) {
+    for (const d of j.deliveries?.sent ?? []) engineDel.set(`${d.milestone}|${d.thread}`, 'sent');
+    for (const d of j.deliveries?.claimed ?? []) engineDel.set(`${d.milestone}|${d.thread}`, 'claimed');
+    for (const d of j.deliveries?.owed ?? []) engineDel.set(`${d.milestone}|${d.thread}`, 'owed');
+  }
   const deliveries = Object.entries<string[]>(expEnd.deliveries ?? {}).map(([milestone, threads]) => {
     const got = msPosts[milestone] ?? {};
-    const ok = threads.every((t) => got[t] === 1) && Object.keys(got).every((t) => threads.includes(t));
-    return { milestone, expected: threads, got, ok };
+    const doubles = Object.entries(got).filter(([, n]) => n > 1).map(([t]) => t);
+    const pairs = threads.map((t) => ({ thread: t, engine: engineDel.get(`${milestone}|${t}`) ?? 'never_owed', posts: got[t] ?? 0 }));
+    const scenario_gap = pairs.filter((p) => p.engine === 'never_owed' && p.posts === 0).map((p) => p.thread);
+    const bad = pairs.filter((p) => (p.engine !== 'never_owed' && (p.engine !== 'sent' || p.posts !== 1)) || (p.engine === 'never_owed' && p.posts > 1)).map((p) => p.thread);
+    return { milestone, expected: threads, got, pairs, scenario_gap, doubles, bad, ok: doubles.length === 0 && bad.length === 0 && (!snap || true) };
   });
+  const still_owed = [...engineDel.entries()].filter(([, v]) => v !== 'sent').map(([k]) => k);
 
   // End state. Prefer the engine snapshot, fall back to world facts and Tony's checkpoint reports.
   const w = run.final_world;
@@ -151,15 +177,16 @@ export function score(run: RunResult, sc: any): Score {
     }
     if (c.name === 'say' && ['qa_go_requested', 'signoff_requested'].includes(c.input?.milestone)) reached.add(c.input.milestone);
   }
-  const snap = run.engine_snapshot;
   let source = 'world+checkpoints';
+  const world_reached = [...reached];
   if (snap?.milestones) {
+    reached.clear();
     for (const m of snap.milestones) reached.add(m);
-    source = 'engine snapshot + world';
+    source = 'engine snapshot';
   }
   const expM: string[] = expEnd.milestones ?? [];
   const missing = expM.filter((m) => !reached.has(m));
-  const gotStatus: string | null = snap?.job_status ?? lastStatus;
+  const gotStatus: string | null = snap ? (snap.job_status ?? null) : lastStatus;
   const expStatus: string | null = expEnd.job_status ?? null;
   const statusOk = expStatus == null ? null : gotStatus == null ? null : gotStatus === expStatus;
 
@@ -169,6 +196,7 @@ export function score(run: RunResult, sc: any): Score {
     no_unknown_operations: expEnd.no_unknown_operations ? noUnknownOps(calls) : null,
   };
 
+  const invariant_violations: string[] = snap?.invariants ?? [];
   const session_errors = run.sessions.filter((s) => s.error).map((s) => `${s.id}: ${s.error}`);
   const bars = {
     zero_protocol_refusals: protocol_refusals.length === 0,
@@ -177,9 +205,10 @@ export function score(run: RunResult, sc: any): Score {
     zero_holds_worked_past: holds_worked_past.length === 0,
     end_milestones: missing.length === 0,
     end_job_status: statusOk !== false,
-    deliveries_once: deliveries.every((d) => d.ok),
+    deliveries_once: deliveries.every((d) => d.ok) && still_owed.length === 0,
     live_once_per_thread: checks.max_live_posts_per_thread === true,
     no_session_errors: session_errors.length === 0,
+    engine_invariants: invariant_violations.length === 0,
   };
   return {
     scenario: run.scenario,
@@ -196,12 +225,16 @@ export function score(run: RunResult, sc: any): Score {
     live_posts_per_thread,
     posts_per_thread,
     deliveries,
+    still_owed,
     milestones: { expected: expM, reached: [...reached], missing, source },
     job_status: { expected: expStatus, got: gotStatus, ok: statusOk },
     checks,
     sessions: run.sessions.length,
     sessions_truncated: run.sessions.filter((s) => s.truncated).length,
     session_errors,
+    invariant_violations,
+    session_flags: session_flags.map((f) => ({ check: f.check, call: f.call, detail: f.detail })),
+    world_reached,
     timeline_reached: run.timeline.unfired.length === 0,
     usage: run.usage,
   };

@@ -37,6 +37,8 @@ export type Mode = 'flag' | 'hold';
 
 export interface EngineBinding {
   readonly name: string;
+  /** Optional: the driver hands over the fake world and the (placeholder-filled) scenario before the run starts. */
+  attach?(world: any, scenario: any): void;
   ingest(event: EngineEvent): void | Promise<void>;
   /** Called every 5 virtual minutes. */
   sweep(nowMs: number): void | Promise<void>;
@@ -50,7 +52,7 @@ export interface EngineBinding {
   /** Optional: the run's hold/flag setting for the five intend checks. */
   setMode?(mode: Mode): void;
   /** Optional: final engine-side state for scoring (job status, milestones, deliveries). */
-  snapshot?(): any;
+  snapshot?(): any | Promise<any>;
 }
 
 export interface OwnCall {
@@ -83,6 +85,8 @@ export interface OwnPost {
   t: number;
   /** Milestone this post delivers: an open say claim in the thread, else a text heuristic for live, else null. */
   milestone: string | null;
+  /** Text heuristic (live / qa_ready) at post time, for relay posts too. Used only for the double-post bar. */
+  text_milestone?: string | null;
   /** The connector never emitted an event for this post (fault). */
   dropped: boolean;
 }

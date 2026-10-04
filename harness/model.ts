@@ -131,6 +131,7 @@ ${threads}
 - People (Slack ids):
 ${people}
 - Tony's own Slack id is ${sc.initial_world?.slack?.tony_user ?? 'U0C4FFYJGE6'}.
+- The release tracking issue is ${sc.initial_world?.github?.scripted_ids?.release_issue ?? 'unknown'}${sc.initial_world?.github?.scripted_ids?.parent_issue ? ` (child of ${sc.initial_world.github.scripted_ids.parent_issue})` : ''}; completing it is your last step.
 - The release base branch is ${sc.initial_world?.github?.base_branch ?? 'main'} on ${sc.initial_world?.github?.repo ?? 'the repo'}.
 - Your job direct message is ${dmId}. A session starts either when someone mentions you in a thread (your final message is relayed to that thread by the connector) or when the work engine wakes you in that direct message (your final message there goes to the direct message, not to a thread).
 - Each session is a fresh conversation. You have no memory of earlier sessions except what the engine briefing and the live sources show.

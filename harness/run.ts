@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { Driver, loadPlaybook } from './driver.ts';
 import { GatewayTony, ScriptedTony, type TonyModel } from './model.ts';
 import { aggregate, score, summaryLine, type Score } from './score.ts';
+import { RealEngineBinding } from './engine-binding.ts';
 import { StubEngineBinding } from './stub-binding.ts';
 import type { EngineBinding, Mode } from './types.ts';
 
@@ -19,7 +20,7 @@ function args(): Record<string, string> {
 
 function makeBinding(kind: string): EngineBinding {
   if (kind === 'stub') return new StubEngineBinding();
-  if (kind === 'engine') throw new Error('engine binding: not wired yet');
+  if (kind === 'engine') return new RealEngineBinding(ROOT);
   throw new Error(`unknown --binding ${kind}`);
 }
 
