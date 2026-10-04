@@ -65,3 +65,8 @@ live in handoff file 28 §3 and are not repeated here. Each entry: the call, the
 - Calls: (1) claim `qa_go_requested` with `say` before asking for the QA go, even inside a mention reply; (2) a conversation session may `promise_add` but does not `say` or `checkpoint`; (3) never post a milestone without a claim, and do not repost what a mention reply already told.
 - Evidence: trial replays (`harness/out/trial-1` to `trial-final`): stale-go missed `build_changed` because no ask existed; v2-18 drew `not_work_run` and `unclaimed_post` flags and two "live" posts to A.
 - Alternative: have the engine open asks without a claim. Rejected: the engine would have to guess from text that Tony asked for a go (L1, no reading text for meaning).
+
+## R14. A mention reply that tells a milestone is claimed first
+- Call: when Tony's reply to a mention tells that thread a milestone, he calls `say` first; the connector's relay of the reply then matches the open claim and marks the delivery sent.
+- Evidence: trial v2-18 run 1: milestones told by mention replies stayed owed, and a later wake re-posted four stale messages to A. File 27 §3.5 says mention replies need no `say`; file 28 is silent. The relay already counts as a delivery (27 §3.5), but the engine cannot know which milestone a reply told without reading text (L1).
+- Alternative: a `told` list on `checkpoint`. Rejected for now: one more field Tony must remember, while `say` is already the claim path.

@@ -30,7 +30,7 @@ If the thread shows "no job here" and someone asks for a release, look at the op
 | "Tell me when X" | `promise_add` with a fallback time, then answer |
 | About to merge, approve a CircleCI hold, or publish | `intend`, then act with your own tool |
 | Posting anything except the reply to a mention | `say`, then post with `slack_post` |
-| Replying to the mention you were started by | Just answer. The connector relays your final message. No `say`. |
+| Replying to the mention you were started by | Just answer. The connector relays your final message. If the reply tells that thread a milestone, call `say` for it first; the relayed reply then counts as that post. |
 | You learned a fact or finished an action | `checkpoint` |
 | Stopping for now | `checkpoint` with a next wake |
 
