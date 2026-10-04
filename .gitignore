@@ -3,3 +3,4 @@ dist/
 harness/out/
 *.log
 .env
+__pycache__/
