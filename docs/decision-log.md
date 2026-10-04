@@ -122,3 +122,8 @@ All choices pick the option closest to L1 to L4: the engine records and wakes, T
 - R29: sim invariants: clear/go needs confirmed identity; in hold mode the acting session holds the current run of the current generation; exactly one open home per job; no active run from an older generation.
 - R30: a non-home `checkpoint` that reports operation outcomes is recorded as an inbox note and does not apply the outcomes (the home reads back and reports). `job_open(join)` from a mention session links the thread and records the lookup; it never confirms ownership. Both follow A1.
 - Evidence: lint ok; 46 unit tests; sim 1,000 + 1,000 orders and 42 named cases; 28 repros clear; scripted harness 9/9 in flag and hold with the transition default `homeForAllSessions` (does not yet exercise non-home sessions).
+
+## Superseded by A1-A4
+- R15 (a mention session joins before acting) and D10 adoption: superseded by A1; mention sessions never act.
+- R17 H5 lease release on cancel with unknowns: superseded by R22.
+- R20-R24 are recorded in full in `docs/job-home-contract.md` ("Implementation judgments locked with this direction").

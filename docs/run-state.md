@@ -15,11 +15,11 @@ Goal-oriented playbook adopted. No A/B with the old approach.
 ## Slices (job-home build)
 | Slice | Goal | Status |
 |---|---|---|
-| JH-engine | A1-A4, R20-R24 in src; unit tests; sim invariants and ib-* named cases | pending |
-| JH-knowledge | knowledge/desktop-release/{playbook,references,lessons}.md, job-home wording | pending |
-| JH-harness | home vs mention sessions, notice/resume, interruption-boundary scenarios, new playbook path | after JH-engine |
+| JH-engine | A1-A4, R20-R24 in src; unit tests; sim invariants and ib-* named cases | done a1b560d: lint, 46 unit, sim 2x1000 + 42 named, 28 repros |
+| JH-knowledge | knowledge/desktop-release/{playbook,references,lessons}.md, job-home wording | done 93487a3 |
+| JH-harness | home vs mention sessions, notice/resume, interruption-boundary scenarios, new playbook path | running |
 | P2-gate | scripted all, then real model 10/mode flag and hold on the job-home engine | after JH-harness |
-| Report | 29-work-engine-run-report.md + /tmp/tony-shared-state copy | after P2-gate |
+| Report | 29-work-engine-run-report.md + /tmp/tony-shared-state copy | draft /tmp/we-longrun/29-draft.md; gate results pending |
 
 ## Parked
 - Red-team L1 (due-index gap after long outage; clock skew): phase 3 bounded catch-up scan and store clock.
