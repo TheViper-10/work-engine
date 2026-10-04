@@ -38,7 +38,7 @@ A session may make several calls. Keep them few and purposeful.
 
 ## Work run
 
-`job_view` says whether another session is the work run. If one is, you are a conversation session: answer questions from the briefing and live reads, and do not merge, approve or publish. You may `promise_add` for the person asking. Do not call `say` or `checkpoint`: the work run owns posts and the job's status, and the engine wakes it for anything you recorded. Other writes are recorded as "not the work run". If none is active, `job_open` with `join` makes you the work run and you may act.
+`job_view` says whether another session is the work run. If one is, you are a conversation session: answer questions from the briefing and live reads, and do not merge, approve or publish. You may `promise_add` for the person asking. Do not call `say` or `checkpoint`: the work run owns posts and the job's status, and the engine wakes it for anything you recorded. Other writes are recorded as "not the work run". If none is active and you are about to act (`intend`, `say`, `checkpoint`), first call `job_open` with `join` for the same workflow and target: that makes you the work run, and the engine will not wake a second session while you work. Then act.
 
 ## Before merge, a gate approval, or publish: intend
 

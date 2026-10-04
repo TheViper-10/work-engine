@@ -70,3 +70,13 @@ live in handoff file 28 §3 and are not repeated here. Each entry: the call, the
 - Call: when Tony's reply to a mention tells that thread a milestone, he calls `say` first; the connector's relay of the reply then matches the open claim and marks the delivery sent.
 - Evidence: trial v2-18 run 1: milestones told by mention replies stayed owed, and a later wake re-posted four stale messages to A. File 27 §3.5 says mention replies need no `say`; file 28 is silent. The relay already counts as a delivery (27 §3.5), but the engine cannot know which milestone a reply told without reading text (L1).
 - Alternative: a `told` list on `checkpoint`. Rejected for now: one more field Tony must remember, while `say` is already the claim path.
+
+## R15. A mention session that will act joins first
+- Call: playbook tells a mention session to `job_open(join)` before acting when no work run is active (D10).
+- Evidence: trial stale-go: a mention session (s5) acted without joining, the sweep woke a second session (s6) for the same job, and both called `intend(approve_qa_gate)`. The engine handled it (one operation, idempotent; `superseded_run` flagged), but it cost a twin session.
+- Alternative: let `job_view` from a mention session adopt the run. Rejected: D10 says a mention session reads freely and becomes the work run only through `job_open(join)`.
+
+## R16. Scoring separates false flags from true-but-unexpected flags
+- Call: D7 "0 false holds or flags" counts a flag as false only when its stated fact is wrong per the engine's records and the world. A flag whose fact is true but which the scenario did not predict (for example `superseded_run` when Tony really did act from a second session) is reported as "unexpected, true" and counted separately; it fails the run only in hold mode, where it would have stopped Tony.
+- Evidence: trial stale-go `superseded_run` was a true fact (two sessions acted).
+- Alternative: count every unpredicted flag as false. Rejected because it scores the engine on Tony's behaviour; both counts are reported so the owner can apply the stricter reading.
