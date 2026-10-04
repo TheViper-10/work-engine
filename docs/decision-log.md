@@ -40,3 +40,8 @@ live in handoff file 28 §3 and are not repeated here. Each entry: the call, the
 - Call: reuse v2.38 voice rules (plain, four sentences, no ids); drop receipts, `report_effect` and `execution_key`.
 - Evidence: `21-work/run-data/live/tony-version-2.38.json` guidance and slack skills; v3 replaces those protocols.
 - Alternative: keep worktree notes for PR authoring. Dropped; PR authoring is unchanged Tony skill text outside this playbook.
+
+## R9. Scenario gaps filled with stated assumptions
+- Call: where the sources lack a fact (update-server start versions for run 4 and v2.18, run 6 pipeline id, v2.18 approval and CI timings, Harry's v2.18 replies), the scenario uses a stated assumption recorded in its `notes`. Run 4's real ending (a cancel) is kept as a cancel case elsewhere and its scenario gets a marked synthetic tail to done.
+- Evidence: the sources were read in full by the scenario worker; these facts were not exported.
+- Alternative: a read-only DevRev re-pull through fde-agent. Rejected: the missing facts are Slack replies and CircleCI timings, which DevRev does not hold, and the replay scores engine behaviour, which these values do not change.
