@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
-const R = '/Users/priyadharshanravichandran/DevRev/Github_Repos/work-engine';
+import { fileURLToPath } from 'node:url';
+const R = fileURLToPath(new URL('../..', import.meta.url)).replace(/\/$/, '');
 const { Engine } = await import(R + '/src/engine.ts');
 const { MemoryStore, makeKey } = await import(R + '/src/store.ts');
 const { ManualClock } = await import(R + '/src/clock.ts');

@@ -13,11 +13,17 @@ const t2 = await w.engine.intend({ job: 'desktop-release:T2', action: 'publish_p
 check('cancel with unknown outcome (as the playbook says): 48h later job cancel_requested, alpha leased, queued job never opens, other release held',
   j.status === 'cancel_requested' && lease.holder_job === J && qj.status === 'queued' && t2.status === 'hold',
   `job=${j.status} lease=${lease.holder_job} queued=${qj.status} T2 intend=${t2.status} wakes to cancelled job=${w.wakes.filter((x: any) => x.dm === 'dm:' + J).length}`);
-// variant: Tony never reports; sweep turns it unknown; lease still held
+// variant: Tony never reports; sweep turns it unknown and WAKES the job to verify; once Tony reports, alpha is free
 const w2 = world('hold');
 await w2.engine.jobOpen({ workflow: WF, target: 'T1', thread: 'A' }, { session_id: 's1' });
 await w2.engine.intend({ job: J, action: 'publish_prod_alpha', ref: 'b1' }, { session_id: 's1' });
 w2.clock.advance(40 * MIN); await w2.engine.sweep();
+const woke = w2.wakes.some((x: any) => x.dm === 'dm:' + J && /unknown/.test(x.text) && /verify/i.test(x.text));
 await w2.engine.jobOpen({ workflow: WF, target: 'T2', thread: 'D' }, { session_id: 's3' });
 const h = await w2.engine.intend({ job: 'desktop-release:T2', action: 'publish_prod_alpha', ref: 'b9' }, { session_id: 's3' });
-check('timeout to unknown keeps lease; lease_held hold with no re-read (D7) and no expiry', h.status === 'hold', h.say_to_tony.slice(0, 160));
+await w2.engine.checkpoint({ job: 'desktop-release:T2', status: 'waiting', waiting_for: 'alpha', next_wake_in: '4h' }, { session_id: 's3' }); // playbook: checkpoint after a hold
+await w2.engine.checkpoint({ job: J, status: 'working', operations: [{ ref: 'b1', action: 'publish_prod_alpha', outcome: 'failed' }] }, { session_id: 's1' });
+w2.clock.advance(6 * MIN); await w2.engine.sweep();
+const h2 = await w2.engine.intend({ job: 'desktop-release:T2', action: 'publish_prod_alpha', ref: 'b9' }, { session_id: 's3' });
+const woke2 = w2.wakes.some((x: any) => x.dm === 'dm:desktop-release:T2' && /free/.test(x.text));
+check('timeout to unknown: no wake to verify, or the lease stays held after the outcome is reported, or the held job is not woken', !woke || h.status !== 'hold' || h2.status !== 'clear' || !woke2, `woke=${woke} first=${h.status} after report=${h2.status} T2 woken=${woke2}`);

@@ -1,7 +1,7 @@
 // Cross-process: two engine instances (two snap-in invocations) share one store. No CAS anywhere.
 import { world, J, WF, check, MIN } from './h.ts';
-const { MemoryStore } = await import('/Users/priyadharshanravichandran/DevRev/Github_Repos/work-engine/src/store.ts');
-const { ManualClock } = await import('/Users/priyadharshanravichandran/DevRev/Github_Repos/work-engine/src/clock.ts');
+const { MemoryStore } = await import(new URL('../../src/store.ts', import.meta.url).href);
+const { ManualClock } = await import(new URL('../../src/clock.ts', import.meta.url).href);
 const store = new MemoryStore(); const clock = new ManualClock(Date.UTC(2026, 0, 1));
 const e1 = world('flag', { store, clock }), e2 = world('flag', { store, clock });
 await e1.engine.jobOpen({ workflow: WF, target: 'T1', thread: 'A' }, { session_id: 's1' });

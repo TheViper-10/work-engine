@@ -14,7 +14,7 @@ interface Session {
   id: string;
   alive: boolean;
   /** claimed (got go) but has not posted yet */
-  pendingPost: { job: string; thread: string; milestone: string } | null;
+  pendingPost: { job: string; thread: string; milestone: string; at: number; round: number } | null;
   /** intended but no checkpoint yet */
   openOps: Array<{ job: string; action: string; ref: string }>;
   /** last job this session has looked at or acted on */
@@ -26,6 +26,8 @@ export class Sim {
   readonly rng: Rng;
   sessions: Session[] = [];
   pending: IngestEvent[] = [];
+  /** operations a session reported failed: candidates for a retry with the same ref (playbook: same ref on retry) */
+  failedOps: Array<{ job: string; action: string; ref: string }> = [];
   seenEventIds: string[] = [];
   evSeq = 0;
   sessSeq = 0;
@@ -146,19 +148,40 @@ export class Sim {
     const milestone = this.milestone();
     const a = await this.w.api('say', { job, thread, milestone }, this.sid(s));
     s.job = job || s.job;
+    await this.actOnSay(s, job, thread, milestone, a);
+  }
+  /**
+   * Tony follows the playbook literally.
+   *  go: post now.  busy: do not post.  already_sent: nothing.
+   *  already_claimed: read the thread; post only if the message is absent, else confirm with posted_link.
+   */
+  async actOnSay(s: Session, job: string, thread: string, milestone: string, a: { status: string; round?: unknown; repeat?: unknown }, relay = false): Promise<void> {
+    const round = typeof a.round === 'number' ? a.round : 1;
     const post = async (): Promise<void> => {
-      const p = this.w.post(job, thread, milestone);
+      // one post intent per claim: posting now cancels any older pending post of this session for the same message
+      for (const o of this.sessions) if (o.pendingPost && o.pendingPost.job === job && o.pendingPost.thread === thread && o.pendingPost.milestone === milestone) o.pendingPost = null;
+      const p = this.w.post(job, thread, milestone, relay, round);
       await this.afterPost(s, p);
     };
-    if (a.status === 'go') {
+    if (a.status === 'go' && a.repeat === true) {
+      // the answer says: you already hold this claim; post unless it is already there (then confirm with posted_link)
+      const found = this.w.findPost(job, thread, milestone, round);
+      if (found) await this.w.api('say', { job, thread, milestone, posted_link: found.link }, s.id);
+      else await post();
+    } else if (a.status === 'go') {
       const r = this.rng.next();
-      if (r < 0.55) await post();
+      if (relay || r < 0.55) await post();
       else if (r < 0.7) this.crashSession(s, 'after claim, before post');
-      else s.pendingPost = { job, thread, milestone };
+      else s.pendingPost = { job, thread, milestone, at: this.w.now(), round };
     } else if (a.status === 'already_claimed') {
-      // Tony reads the thread; posts only if his post is absent.
-      if (!this.w.hasPost(job, thread, milestone) && this.rng.chance(0.8)) await post();
+      const found = this.w.findPost(job, thread, milestone, round);
+      if (found) {
+        if (this.rng.chance(0.7)) await this.w.api('say', { job, thread, milestone, posted_link: found.link }, s.id);
+      } else if (this.rng.chance(0.85)) {
+        await post();
+      }
     }
+    // busy, already_sent, job_ended, confirmed: nothing to post
   }
   async promise(): Promise<void> {
     const s = this.liveSession();
@@ -171,7 +194,13 @@ export class Sim {
     const job = this.pickJob(s);
     const status = this.rng.weighted<string>([[10, 'working'], [3, 'waiting'], [3, 'done'], [1.2, 'cancelled']]);
     const operations: any[] = [];
-    for (const o of s.openOps.splice(0, this.rng.int(3))) operations.push({ ref: o.ref, action: this.rng.chance(0.8) ? o.action : undefined, outcome: this.rng.pick(['done', 'done', 'failed', 'unknown']), note: 'n' });
+    const takeN = status === 'cancelled' ? s.openOps.length : this.rng.int(3);
+    for (const o of s.openOps.splice(0, takeN)) {
+      // playbook: on cancel, an operation still in flight is reported unknown when Tony cannot tell
+      const outcome = status === 'cancelled' && this.rng.chance(0.7) ? 'unknown' : this.rng.pick(['done', 'done', 'failed', 'unknown']);
+      if (outcome === 'failed') this.failedOps.push(o);
+      operations.push({ ref: o.ref, action: this.rng.chance(0.8) ? o.action : undefined, outcome, note: 'n' });
+    }
     if (this.rng.chance(0.08)) operations.push({ ref: this.rng.pick(REFS), outcome: this.rng.pick(['done', 'failed', 'bogus']) });
     const reached = this.rng.chance(0.15) ? [this.milestone()] : undefined;
     const nwi = this.rng.weighted<number | string | undefined>([[4, undefined], [3, this.rng.range(1, 90)], [1, '2h'], [1, 'soon']]);
@@ -180,18 +209,26 @@ export class Sim {
   async postPending(): Promise<void> {
     const s = this.sessions.find((x) => x.alive && x.pendingPost);
     if (!s) return;
-    const { job, thread, milestone } = s.pendingPost!;
+    const { job, thread, milestone, at, round } = s.pendingPost!;
     s.pendingPost = null;
-    // A resumed session does not trust its old go: it asks again. Only a fresh go, or
-    // already_claimed plus a thread read that shows absence, lets it post.
-    const a = await this.w.api('say', { job, thread, milestone }, s.id);
-    if (a.status === 'go' || (a.status === 'already_claimed' && !this.w.hasPost(job, thread, milestone))) {
-      await this.afterPost(s, this.w.post(job, thread, milestone));
+    // Playbook: a go is for a job. If that job was ended or replaced since, the go is void (say would now answer job_ended); do not post.
+    const pj = await this.w.peek<any>('job', job);
+    if (!pj || pj.status === 'done' || pj.status === 'cancelled') return;
+    // Playbook: a go is good for the stale window (10 minutes); after that, say again before posting.
+    if (this.w.now() - at < 10 * MIN) {
+      await this.afterPost(s, this.w.post(job, thread, milestone, false, round));
+      return;
     }
+    const a = await this.w.api('say', { job, thread, milestone }, s.id);
+    await this.actOnSay(s, job, thread, milestone, a);
   }
   async afterPost(s: Session, p: Post): Promise<void> {
     const r = this.rng.next();
-    const ev = this.w.ownPostEvent(p, { ts: p.ts });
+    const ev = this.w.ownPostEvent(p, { ts: p.ts, ...(p.relay ? { relay: true, session: s.id } : {}) });
+    if (!p.relay && p.milestone && p.job && this.rng.chance(0.15)) {
+      // Tony tells the engine where he posted (covers a connector that filters bot posts)
+      await this.w.api('say', { job: p.job, thread: p.thread, milestone: p.milestone, posted_link: p.link }, s.id);
+    }
     if (r < 0.5) await this.w.ingest(ev);
     else if (r < 0.65) { this.crashSession(s, 'after post, before ingest'); this.queue(ev); }
     else if (r < 0.85) this.queue(ev);
@@ -217,12 +254,90 @@ export class Sim {
     this.seenEventIds.push(`slack:${ev.delivery_id}`);
     this.queue(ev);
   }
-  /** Own-bot post with no claim. Only sent when the thread has no open claim (else it would be a real post). */
+  /**
+   * A late or unrelated own-bot event: no timestamp (or one older than the claim). It must never satisfy a claim,
+   * also when a claim is open in that thread (H3).
+   */
   async ownStray(): Promise<void> {
     const thread = this.rng.pick(['A', 'B', 'D', 'Q', 'Z']);
-    const ti = await this.w.peek<any>('thread_index', thread);
-    if (ti?.claim) return;
-    await this.w.ingest(this.mkEvent({ kind: 'message', thread, sender_id: 'UBOT' }));
+    const claim = await this.w.peek<any>('claim', thread);
+    const attrs = claim?.state === 'open' && this.rng.chance(0.5) ? { ts: claim.at - 1000 } : undefined;
+    await this.w.ingest(this.mkEvent({ kind: 'message', thread, sender_id: 'UBOT', attrs }));
+  }
+  /** A reply to a mention, relayed by the connector. It tells a milestone only after a say; otherwise it is a plain answer. */
+  async mentionReply(): Promise<void> {
+    const s = this.liveSession();
+    const job = this.pickJob(s);
+    if (!job || !this.w.jobs.has(job)) return;
+    const thread = this.threadFor(job);
+    if (!thread) return;
+    if (this.rng.chance(0.5)) {
+      const p = this.w.post(null, thread, null, true);
+      const ev = this.w.ownPostEvent(p, { ts: p.ts, relay: true, session: s.id });
+      if (this.rng.chance(0.5)) await this.w.ingest(ev); else this.queue(ev);
+      return;
+    }
+    const milestone = this.milestone();
+    const a = await this.w.api('say', { job, thread, milestone }, s.id);
+    await this.actOnSay(s, job, thread, milestone, a, true);
+  }
+  /** Playbook: retry a failed action with the same ref. */
+  async retryIntend(): Promise<void> {
+    if (this.failedOps.length === 0) return;
+    const o = this.rng.pick(this.failedOps);
+    const s = this.liveSession();
+    const a = await this.w.api('intend', { job: o.job, action: o.action, ref: o.ref }, s.id);
+    if (a.status === 'clear') s.openOps.push(o);
+  }
+  /**
+   * Two engine instances on one store, calls interleaved. Each case has a property that must survive the race.
+   */
+  async race(): Promise<void> {
+    const jobs = [...this.w.jobs];
+    if (jobs.length === 0) return;
+    const [e0, e1] = this.w.engines;
+    const kind = this.rng.int(4);
+    const job = this.rng.pick(jobs);
+    if (kind === 0) {
+      const thread = this.threadFor(job) || 'A';
+      const milestone = this.rng.pick(Object.keys(this.w.spec.milestones!));
+      const s1 = this.liveSession();
+      const s2 = this.spawn();
+      const [a1, a2] = await Promise.all([
+        this.w.api('say', { job, thread, milestone }, s1.id, e0),
+        this.w.api('say', { job, thread, milestone }, s2.id, e1),
+      ]);
+      if (a1.status === 'go' && a2.status === 'go') throw new (await import('./world.ts')).Violation(`two sessions both got go for ${milestone} in ${thread} on ${job}`);
+      await this.actOnSay(s1, job, thread, milestone, a1);
+      await this.actOnSay(s2, job, thread, milestone, a2);
+    } else if (kind === 1) {
+      const s = this.liveSession();
+      const thread = this.rng.pick(['A', 'B', 'D', 'Q']);
+      const ev = this.mkEvent({ kind: 'message', thread, sender_id: 'UOTHERBOT', sender_kind: 'other_bot' });
+      await Promise.all([
+        this.w.api('checkpoint', { job, status: 'waiting', waiting_for: 'raced', next_wake_in: 240 }, s.id, e0),
+        this.w.ingest(ev, e1),
+      ]);
+    } else if (kind === 2) {
+      const [j1, j2] = [`${WF}:T1`, `${WF}:T2`];
+      if (!this.w.jobs.has(j1) || !this.w.jobs.has(j2)) return;
+      const s1 = this.liveSession();
+      const s2 = this.spawn();
+      const [a1, a2] = await Promise.all([
+        this.w.api('intend', { job: j1, action: 'publish_prod_alpha', ref: 'race-1' }, s1.id, e0),
+        this.w.api('intend', { job: j2, action: 'publish_prod_alpha', ref: 'race-2' }, s2.id, e1),
+      ]);
+      if (a1.status === 'clear') s1.openOps.push({ job: j1, action: 'publish_prod_alpha', ref: 'race-1' });
+      if (a2.status === 'clear') s2.openOps.push({ job: j2, action: 'publish_prod_alpha', ref: 'race-2' });
+    } else {
+      const other = this.rng.pick(jobs);
+      const s1 = this.liveSession();
+      const s2 = this.spawn();
+      await Promise.all([
+        this.w.api('checkpoint', { job, status: 'waiting', next_wake_in: 7 }, s1.id, e0),
+        this.w.api('checkpoint', { job: other, status: 'waiting', next_wake_in: 7 }, s2.id, e1),
+      ]);
+    }
   }
   async privateEvidence(): Promise<void> {
     // Only evidence that arrives while the private link exists is private; before that it is a plain unlinked event.

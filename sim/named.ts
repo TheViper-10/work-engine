@@ -29,8 +29,10 @@ const cases: Array<[string, (mode: Mode) => Promise<void>]> = [
     assert.equal(a.status, 'woke');
     assert.equal(b.status, 'run_active', 'second wake must not start a second run');
     assert.equal(w.wakes.length, 1);
-    // the mention starts a session that binds the pending run; a third session is then a second active worker
+    // the mention starts a session; reads never bind (R17 M2), so its first write binds the pending run.
+    // A third session is then a second active worker.
     await w.api('jobView', { job: J }, 's2');
+    await w.api('intend', { job: J, action: 'open_bump_pr', ref: 'pr0' }, 's2');
     const r = await w.api('intend', { job: J, action: 'open_bump_pr', ref: 'pr1' }, 's3');
     if (mode === 'hold') {
       assert.equal(r.status, 'hold');
@@ -118,8 +120,15 @@ const cases: Array<[string, (mode: Mode) => Promise<void>]> = [
     const g = await w.api('say', { job: J, thread: 'A', milestone: 'merged' }, 's1');
     assert.equal(g.status, 'go');
     const p = w.post(J, 'A', 'merged'); // s1 posts, then dies before checkpoint and before the connector delivers
+    // R17: a claim younger than claim_stale_minutes belongs to its session: another session is told busy.
+    const soon = await w.api('say', { job: J, thread: 'A', milestone: 'merged' }, 's2');
+    assert.equal(soon.status, 'busy', 'claim is young and owned by s1');
+    // Once it is stale and the reader cannot see the post, the claim is handed over with a read-first warning.
+    w.slackBlind = true;
+    w.clock.advanceMinutes(11);
     const again = await w.api('say', { job: J, thread: 'A', milestone: 'merged' }, 's2');
-    assert.equal(again.status, 'already_claimed', 'post not seen yet: claim still open');
+    assert.equal(again.status, 'already_claimed', 'post not seen yet: stale claim is handed over');
+    w.slackBlind = false;
     await w.ingest(w.ownPostEvent(p, { ts: p.ts }));
     const d = await w.peek<any>('delivery', `${J}:A:merged`);
     assert.equal(d.state, 'sent');
@@ -152,6 +161,9 @@ const cases: Array<[string, (mode: Mode) => Promise<void>]> = [
     assert.ok(v.claims.some((c: any) => c.milestone === 'pr_approved' && c.thread === 'B'));
     const va = await w.api('jobView', { job: J }, 's2');
     assert.match(va.say_to_tony, /claimed, not seen yet/);
+    // R17: still inside claim_stale_minutes (10) the claim is s2's: busy, not a hand-over.
+    assert.equal((await w.api('say', { job: J, thread: 'B', milestone: 'pr_approved' }, 's3')).status, 'busy');
+    w.clock.advanceMinutes(6);
     const re = await w.api('say', { job: J, thread: 'B', milestone: 'pr_approved' }, 's3');
     assert.equal(re.status, 'already_claimed');
     assert.notEqual(re.status, 'go');

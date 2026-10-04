@@ -7,7 +7,9 @@ export type CheckName =
   | 'build_changed'
   | 'sender_not_listed';
 export type CheckMode = 'hold' | 'flag';
-export type FlagKind = CheckName | 'missing_session' | 'unclaimed_post' | 'not_work_run';
+export type FlagKind =
+  | CheckName | 'missing_session' | 'unclaimed_post' | 'not_work_run' | 'job_ended'
+  | 'source_unreadable' | 'ambiguous_outcome' | 'unknown_outcome';
 
 export interface Clock {
   now(): number; // epoch ms
@@ -35,6 +37,7 @@ export interface Spec {
     next_wake_minutes?: number;
     promise_fallback_minutes?: number;
     operation_unknown_minutes?: number;
+    claim_stale_minutes?: number;
   };
 }
 
@@ -43,7 +46,8 @@ export interface SourceReader {
   currentBuild(job: { id: string; workflow: string; target: string }, gate: string): Promise<string | null>;
 }
 export interface SlackReader {
-  findOwnPostAfter(thread: string, ts: number): Promise<{ link?: string; ts?: number } | null>;
+  /** `relay` marks a reply to a mention; it never satisfies a claim. */
+  findOwnPostAfter(thread: string, ts: number): Promise<{ link?: string; ts?: number; relay?: boolean } | null>;
 }
 export interface Waker {
   postWake(dm: string, text: string): Promise<void>;
@@ -80,6 +84,7 @@ export interface Job {
   flag_seq: number;
   wake_reasons: string[];
   claims: Record<string, string>; // thread -> milestone with an open claim
+  notes: Array<{ at: number; session: string | null; status: string; waiting_for: string }>;
   sched_bucket: number;
   blocked_by_jobs: string[];
   replaced_by: string | null;
@@ -153,7 +158,23 @@ export interface Delivery {
   sent_at: number | null;
   sent_count: number;
   message_link: string | null;
-  seen_via: 'connector' | 'sweep' | 'relay' | null;
+  seen_via: 'connector' | 'sweep' | 'relay' | 'agent' | null;
+  /** Starts at 1; a re-ask for a new build starts another round. */
+  round: number;
+  /** Set when a claim for this message went stale unseen: the post may exist, so the next say must say read first. */
+  prior_claim_at?: number | null;
+}
+
+/** One per thread (key claim:<thread>), create-if-absent, owned by the session that claimed. */
+export interface Claim {
+  thread: string;
+  job: string;
+  milestone: string;
+  session: string | null;
+  at: number; // when first claimed: a post must be at or after this
+  touched: number; // last say by the owner, or hand-over time: staleness is measured from here
+  state: 'open' | 'closed';
+  round: number;
 }
 
 export interface Lease {
@@ -161,6 +182,7 @@ export interface Lease {
   holder_job: string | null;
   ops: string[];
   since: number | null;
+  waiters?: string[];
 }
 
 export interface FlagRecord {
@@ -186,6 +208,7 @@ export interface EventRecord {
   attrs: Record<string, unknown>;
   received_at: number;
   matched_jobs: string[];
+  state?: 'received' | 'done';
   /** Set when the event came from a private link of any job; views then show it only as held. */
   private_origin?: boolean;
 }

@@ -4,7 +4,7 @@
 import { CHECK_NAMES, type EngineConfig } from './config.ts';
 import { makeKey, MAX_BATCH, type Store } from './store.ts';
 import type {
-  Answer, Ask, CheckName, Clock, Ctx, Delivery, EventRecord, FlagKind, FlagRecord, IngestEvent,
+  Answer, Ask, CheckName, Claim, Clock, Ctx, Delivery, EventRecord, FlagKind, FlagRecord, IngestEvent,
   Job, JobStatus, Lease, Operation, Promise_, Run, SlackReader, SourceReader, Spec, Waker,
 } from './types.ts';
 import { chunk, fmtAge, MIN, parseDuration, parseTime, uniq } from './util.ts';
@@ -20,12 +20,20 @@ export interface EngineDeps {
 }
 
 interface JobIndex { seq: number; primary: string | null; queued: string[]; winding: string[] }
-interface ThreadIndex { jobs: string[]; claim: { job: string; milestone: string; at: number } | null }
+interface ThreadIndex { jobs: string[] }
 interface IdList { ids: string[] }
 type Loaded = { job: Job } | { answer: Answer };
 
 const MAX_BUCKETS_PER_SWEEP = 4032;
 const MAX_EVENTS_KEPT = 200;
+const MAX_REASONS = 20;
+const MAX_NOTES = 20;
+const MAX_TRIES = 8;
+
+/** Thrown when a compare-and-set write lost a race. The whole call is then re-run from a fresh read. */
+class Conflict extends Error {}
+/** Version of each record object as last read or written, so save() can compare-and-set. */
+const versions = new WeakMap<object, number>();
 
 function ans(ok: boolean, status: string, say_to_tony: string, extra: Record<string, unknown> = {}): Answer {
   return { ok, status, say_to_tony, ...extra };
@@ -68,7 +76,7 @@ export class Engine {
   intend(args: { job: string; action: string; ref: string; because?: string }, ctx: Ctx = {}): Promise<Answer> {
     return this.serial(() => this.doIntend(args, ctx));
   }
-  say(args: { job: string; thread: string; milestone: string }, ctx: Ctx = {}): Promise<Answer> {
+  say(args: { job: string; thread: string; milestone: string; posted_link?: string }, ctx: Ctx = {}): Promise<Answer> {
     return this.serial(() => this.doSay(args, ctx));
   }
   promiseAdd(
@@ -95,7 +103,7 @@ export class Engine {
     return this.serial(() => this.doSweep());
   }
   wake(job: string, reason: string): Promise<Answer> {
-    // Serialised in-process; across processes a twin wake is a no-op by create-if-absent on the run key.
+    // Serialised in-process; across processes a twin wake loses the compare-and-set on the job.
     return this.serial(() => this.doWake(job, reason));
   }
 
@@ -107,29 +115,84 @@ export class Engine {
   // ---------------------------------------------------------------- plumbing
 
   private serial<T>(fn: () => Promise<T>): Promise<T> {
-    const next = this.chain.then(fn, fn);
+    const attempt = async (): Promise<T> => {
+      for (let i = 0; i < MAX_TRIES; i++) {
+        try { return await fn(); } catch (e) { if (!(e instanceof Conflict)) throw e; }
+      }
+      throw new Error('work-engine: too many write conflicts on the store');
+    };
+    const next = this.chain.then(attempt, attempt);
     this.chain = next.catch(() => undefined);
     return next;
   }
   private now(): number { return this.clock.now(); }
   private k(kind: string, id: string): string { return makeKey(this.config.env, this.config.bot, kind, id); }
-  private async get<T>(kind: string, id: string): Promise<T | null> { return this.store.get<T>(this.k(kind, id)); }
+  /** Reads a record and remembers its version, so save() can compare-and-set. */
+  private async get<T>(kind: string, id: string): Promise<T | null> {
+    const r = await this.store.getVersioned<T>(this.k(kind, id));
+    if (r.value !== null && typeof r.value === 'object') versions.set(r.value as object, r.version);
+    return r.value;
+  }
+  /** Plain write, for records only one writer ever touches (flags, events, links, cursor). */
   private async put<T>(kind: string, id: string, v: T): Promise<void> { await this.store.put(this.k(kind, id), v); }
+  /** Compare-and-set write: fails with Conflict when the record changed since it was read (absent = version 0). */
+  private async save<T extends object>(kind: string, id: string, v: T): Promise<void> {
+    const r = await this.store.putIfVersion(this.k(kind, id), v, versions.get(v) ?? 0);
+    if (!r.ok) throw new Conflict(`${kind}:${id}`);
+    versions.set(v, r.version);
+  }
+  /** Create-if-absent; the returned value is versioned so it can be saved later. */
+  private async create<T extends object>(kind: string, id: string, v: T): Promise<{ created: boolean; value: T }> {
+    const r = await this.store.putIfAbsent(this.k(kind, id), v);
+    if (r.created) { versions.set(v, 1); return { created: true, value: v }; }
+    const cur = await this.get<T>(kind, id);
+    return { created: false, value: cur ?? r.value };
+  }
+  /** Read-modify-write one record with its own bounded retry. fn returns false to skip the write. */
+  private async update<T extends object>(kind: string, id: string, init: (() => T) | null, fn: (x: T) => boolean | void): Promise<T> {
+    for (let i = 0; i < MAX_TRIES; i++) {
+      const got = await this.get<T>(kind, id);
+      if (got === null && init === null) return null as unknown as T;
+      const x = got ?? init!();
+      if (fn(x) === false) return x;
+      try { await this.save(kind, id, x); return x; } catch (e) { if (!(e instanceof Conflict)) throw e; }
+    }
+    throw new Conflict(`${kind}:${id}`);
+  }
+  private async updateJob(id: string, fn: (j: Job) => boolean | void): Promise<Job | null> {
+    for (let i = 0; i < MAX_TRIES; i++) {
+      const j = await this.get<Job>('job', id);
+      if (!j) return null;
+      if (fn(j) === false) return j;
+      try { await this.save('job', id, j); return j; } catch (e) { if (!(e instanceof Conflict)) throw e; }
+    }
+    throw new Conflict(`job:${id}`);
+  }
   private async many<T>(kind: string, ids: string[]): Promise<Array<T | null>> {
     const out: Array<T | null> = [];
-    for (const c of chunk(ids, MAX_BATCH)) out.push(...(await this.store.getMany<T>(c.map((i) => this.k(kind, i)))));
+    for (const c of chunk(ids, MAX_BATCH)) {
+      for (const r of await this.store.getManyVersioned<T>(c.map((i) => this.k(kind, i)))) {
+        if (r.value !== null && typeof r.value === 'object') versions.set(r.value as object, r.version);
+        out.push(r.value);
+      }
+    }
     return out;
   }
   private async manyPresent<T>(kind: string, ids: string[]): Promise<T[]> {
     return (await this.many<T>(kind, ids)).filter((x): x is T => x !== null);
   }
-  private saveJob(job: Job): Promise<void> { return this.put('job', job.id, job); }
+  private saveJob(job: Job): Promise<void> { return this.save('job', job.id, job); }
   private spec(job: Job): Spec | undefined { return this.specs[job.workflow]; }
   private unknownMs(spec: Spec | undefined): number { return (spec?.defaults?.operation_unknown_minutes ?? 30) * MIN; }
   private nextWakeMs(spec: Spec | undefined): number { return (spec?.defaults?.next_wake_minutes ?? 30) * MIN; }
+  private staleMs(spec: Spec | undefined): number { return (spec?.defaults?.claim_stale_minutes ?? 10) * MIN; }
   private bucketOf(t: number): number { return Math.floor(t / (this.config.sweepMinutes * MIN)); }
   private runActive(run: Run | null): boolean {
     return !!run && run.state === 'active' && this.now() - run.last_activity_at < this.config.runTimeoutMinutes * MIN;
+  }
+  private addReason(job: Job, reason: string): void {
+    if (!job.wake_reasons.includes(reason)) job.wake_reasons.push(reason);
+    if (job.wake_reasons.length > MAX_REASONS) job.wake_reasons.splice(0, job.wake_reasons.length - MAX_REASONS);
   }
 
   private async loadJob(id: string | undefined, call: string): Promise<Loaded> {
@@ -147,11 +210,10 @@ export class Engine {
     const now = this.now();
     const b = at <= now ? this.bucketOf(now) : this.bucketOf(at);
     await this.store.putIfAbsent(this.k('sweep_cursor', 'main'), { bucket: this.bucketOf(now) });
-    const cur = (await this.get<IdList>('due_index', String(b))) ?? { ids: [] };
-    if (!cur.ids.includes(jobId)) {
+    await this.update<IdList>('due_index', String(b), () => ({ ids: [] }), (cur) => {
+      if (cur.ids.includes(jobId)) return false;
       cur.ids.push(jobId);
-      await this.put('due_index', String(b), cur);
-    }
+    });
   }
 
   private async addFlag(job: Job, check: FlagKind, detail: string, call: string, mode: FlagRecord['mode'] = 'flag_only'): Promise<void> {
@@ -167,8 +229,9 @@ export class Engine {
   /**
    * Work out the caller's relation to the job's work run and record activity.
    * mayAdopt: a write call may become the work run when none is active.
+   * bindPending: a pending wake run binds to this caller (writes do; reads never do, M2).
    */
-  private async touchRun(job: Job, ctx: Ctx, origin: Run['origin'], mayAdopt: boolean): Promise<'you' | 'other' | 'none' | 'unknown'> {
+  private async touchRun(job: Job, ctx: Ctx, origin: Run['origin'], mayAdopt: boolean, bindPending = true): Promise<'you' | 'other' | 'none' | 'unknown'> {
     const sid = ctx.session_id;
     const now = this.now();
     const cr = job.current_run ? await this.get<Run>('run', `${job.id}:${job.current_run}`) : null;
@@ -176,24 +239,25 @@ export class Engine {
     if (cr && cr.session_id === sid) {
       cr.state = 'active';
       cr.last_activity_at = now;
-      await this.put('run', cr.id, cr);
+      await this.save('run', cr.id, cr);
       return 'you';
     }
     if (cr && cr.session_id === null && cr.state === 'active') {
+      if (!bindPending) return 'none';
       cr.session_id = sid;
       cr.last_activity_at = now;
-      await this.put('run', cr.id, cr);
+      await this.save('run', cr.id, cr);
       return 'you';
     }
     if (cr && this.runActive(cr)) return 'other';
     if (!mayAdopt) return 'none';
-    if (cr && cr.state === 'active') { cr.state = 'superseded'; await this.put('run', cr.id, cr); }
+    if (cr && cr.state === 'active') { cr.state = 'superseded'; await this.save('run', cr.id, cr); }
     const n = job.run_seq + 1;
     const run: Run = { id: `${job.id}:${n}`, job: job.id, n, session_id: sid, origin, started_at: now, last_activity_at: now, state: 'active' };
-    const r = await this.store.putIfAbsent(this.k('run', run.id), run);
+    const r = await this.create('run', run.id, run);
     job.run_seq = n;
     job.current_run = n;
-    return r.created ? 'you' : 'other';
+    return r.created || r.value.session_id === sid ? 'you' : 'other';
   }
 
   private async sessionFlags(job: Job, ctx: Ctx, call: string, rel: 'you' | 'other' | 'none' | 'unknown', flagOther: boolean): Promise<void> {
@@ -207,20 +271,26 @@ export class Engine {
   // ---------------------------------------------------------------- indexes
 
   private async linkThread(job: Job, thread: string, role: string, priv: boolean): Promise<boolean> {
-    if (job.threads.includes(thread)) return false;
+    if (job.threads.includes(thread)) {
+      if (priv && !job.private_threads.includes(thread)) {
+        job.private_threads.push(thread);
+        await this.put('link', `${job.id}:${thread}`, { job: job.id, thread, role: job.roles[thread], private: true, created_at: this.now() });
+      }
+      return false;
+    }
     job.threads.push(thread);
     job.roles[thread] = role;
     if (priv) job.private_threads.push(thread);
     await this.store.putIfAbsent(this.k('link', `${job.id}:${thread}`), { job: job.id, thread, role, private: priv, created_at: this.now() });
-    const ti = (await this.get<ThreadIndex>('thread_index', thread)) ?? { jobs: [], claim: null };
-    if (!ti.jobs.includes(job.id)) ti.jobs.push(job.id);
-    await this.put('thread_index', thread, ti);
+    await this.update<ThreadIndex>('thread_index', thread, () => ({ jobs: [] }), (ti) => {
+      if (ti.jobs.includes(job.id)) return false;
+      ti.jobs.push(job.id);
+    });
     return true;
   }
 
   private async openJobsIndex(fn: (ids: string[]) => string[]): Promise<void> {
-    const cur = (await this.get<IdList>('open_jobs', 'all')) ?? { ids: [] };
-    await this.put('open_jobs', 'all', { ids: fn(cur.ids) });
+    await this.update<IdList>('open_jobs', 'all', () => ({ ids: [] }), (cur) => { cur.ids = fn(cur.ids); });
   }
 
   private emptyJob(spec: Spec, target: string, seq: number, now: number): Job {
@@ -230,7 +300,7 @@ export class Engine {
       waiting_for: '', next_wake_at: now + this.nextWakeMs(spec), requester: null, cancel_reason: null,
       milestones: {}, run_seq: 0, current_run: null, dm_id: `dm:${id}`, threads: [], private_threads: [], roles: {},
       op_keys: [], ask_keys: [], latest_ask: {}, delivery_keys: [], promise_keys: [], flag_keys: [], event_ids: [],
-      flag_seq: 0, wake_reasons: [], claims: {}, sched_bucket: 0, blocked_by_jobs: [], replaced_by: null,
+      flag_seq: 0, wake_reasons: [], claims: {}, notes: [], sched_bucket: 0, blocked_by_jobs: [], replaced_by: null,
       opened_at: now, closed_at: null,
     };
   }
@@ -254,7 +324,7 @@ export class Engine {
     const notes: string[] = [];
     if (!spec.link_roles.includes(role)) notes.push(`Role "${role}" is not in the workflow's link roles (${spec.link_roles.join(', ')}); recorded anyway.`);
     const idxId = `${a.workflow}:${a.target}`;
-    const idx = (await this.get<JobIndex>('job_index', idxId)) ?? { seq: 0, primary: null, queued: [], winding: [] };
+    let idx = (await this.get<JobIndex>('job_index', idxId)) ?? { seq: 0, primary: null, queued: [], winding: [] };
     const primary = idx.primary ? await this.get<Job>('job', idx.primary) : null;
 
     let job: Job;
@@ -271,10 +341,9 @@ export class Engine {
       if (primary && intent === 'replace') {
         // Make the new job the primary first, so ending the old one cannot promote a queued job over it.
         idx.primary = job.id;
-        await this.put('job_index', idxId, idx);
+        await this.save('job_index', idxId, idx);
         await this.requestCancel(primary, `replaced by ${job.id}`);
-        const fresh = await this.get<JobIndex>('job_index', idxId);
-        if (fresh) { idx.queued = fresh.queued; idx.winding = fresh.winding; }
+        idx = (await this.get<JobIndex>('job_index', idxId)) ?? idx;
         for (const qid of idx.queued) {
           const q = await this.get<Job>('job', qid);
           if (q && q.status === 'queued') { q.blocked_by_jobs = [job.id]; await this.saveJob(q); }
@@ -297,7 +366,7 @@ export class Engine {
     const rel = await this.touchRun(job, ctx, 'job_open', job.status !== 'queued');
     await this.sessionFlags(job, ctx, 'job_open', rel, false);
     await this.saveJob(job);
-    await this.put('job_index', idxId, idx);
+    await this.save('job_index', idxId, idx);
     if (opened) await this.schedule(job.id, job.next_wake_at ?? now);
 
     const workRun = rel === 'you' ? 'you' : rel === 'other' ? 'other' : 'none';
@@ -315,20 +384,25 @@ export class Engine {
 
   // ---------------------------------------------------------------- cancel / finish
 
-  private async unresolvedOps(job: Job): Promise<Operation[]> {
+  /** Operations whose outcome is not known. Unknown ones count only when `withUnknown` (a job that wants to close as done). */
+  private async unresolvedOps(job: Job, withUnknown = true): Promise<Operation[]> {
     const ops = await this.manyPresent<Operation>('operation', job.op_keys);
-    return ops.filter((o) => o.outcome === 'in_flight' || o.outcome === 'unknown');
+    return ops.filter((o) => o.outcome === 'in_flight' || (withUnknown && o.outcome === 'unknown'));
   }
   private async owedDeliveries(job: Job): Promise<Delivery[]> {
     const ds = await this.manyPresent<Delivery>('delivery', job.delivery_keys);
     return ds.filter((d) => d.state === 'owed' || d.state === 'claimed');
   }
+  private async openPromises(job: Job): Promise<Promise_[]> {
+    const ps = await this.manyPresent<Promise_>('promise', job.promise_keys);
+    return ps.filter((p) => p.state === 'open' || p.state === 'due');
+  }
 
   private async requestCancel(job: Job, reason: string): Promise<void> {
     if (job.status === 'done' || job.status === 'cancelled') return;
     job.cancel_reason = reason;
-    const unresolved = await this.unresolvedOps(job);
-    if (unresolved.length > 0) {
+    // An unknown outcome cannot be waited on forever: a cancel finishes with it kept on the record (H5).
+    if ((await this.unresolvedOps(job, false)).length > 0) {
       job.status = 'cancel_requested';
       await this.moveToWinding(job);
     } else {
@@ -338,12 +412,18 @@ export class Engine {
 
   private async moveToWinding(job: Job): Promise<void> {
     const idxId = `${job.workflow}:${job.target}`;
-    const idx = await this.get<JobIndex>('job_index', idxId);
-    if (!idx) return;
-    if (idx.primary === job.id) idx.primary = null;
-    idx.queued = idx.queued.filter((x) => x !== job.id);
-    if (!idx.winding.includes(job.id)) idx.winding.push(job.id);
-    await this.put('job_index', idxId, idx);
+    await this.update<JobIndex>('job_index', idxId, null, (idx) => {
+      if (idx.primary === job.id) idx.primary = null;
+      idx.queued = idx.queued.filter((x) => x !== job.id);
+      if (!idx.winding.includes(job.id)) idx.winding.push(job.id);
+    });
+  }
+
+  private async closeClaim(thread: string, jobId: string, milestone: string): Promise<void> {
+    await this.update<Claim>('claim', thread, null, (c) => {
+      if (c.state !== 'open' || c.job !== jobId || c.milestone !== milestone) return false;
+      c.state = 'closed';
+    });
   }
 
   private async finishJob(job: Job, terminal: 'done' | 'cancelled'): Promise<void> {
@@ -352,21 +432,24 @@ export class Engine {
     job.closed_at = now;
     job.next_wake_at = null;
     job.wake_reasons = [];
-    const promises = await this.manyPresent<Promise_>('promise', job.promise_keys);
-    for (const p of promises) if (p.state === 'open' || p.state === 'due') { p.state = 'void'; await this.put('promise', p.key, p); }
     if (terminal === 'cancelled') {
+      const promises = await this.manyPresent<Promise_>('promise', job.promise_keys);
+      for (const p of promises) if (p.state === 'open' || p.state === 'due') { p.state = 'void'; await this.save('promise', p.key, p); }
       const ds = await this.manyPresent<Delivery>('delivery', job.delivery_keys);
-      for (const d of ds) if (d.state === 'owed' || d.state === 'claimed') { d.state = 'void'; await this.put('delivery', d.key, d); }
-      for (const [thread, m] of Object.entries(job.claims)) {
-        const ti = await this.get<ThreadIndex>('thread_index', thread);
-        if (ti?.claim && ti.claim.job === job.id && ti.claim.milestone === m) { ti.claim = null; await this.put('thread_index', thread, ti); }
-      }
+      for (const d of ds) if (d.state === 'owed' || d.state === 'claimed') { d.state = 'void'; await this.save('delivery', d.key, d); }
+      for (const [thread, m] of Object.entries(job.claims)) await this.closeClaim(thread, job.id, m);
       job.claims = {};
+      for (const o of await this.manyPresent<Operation>('operation', job.op_keys)) {
+        if (o.outcome !== 'unknown') continue;
+        await this.releaseLease(o);
+        await this.save('operation', o.key, o);
+        await this.addFlag(job, 'unknown_outcome', `${o.action} on ${o.ref} ended the job with an unknown outcome; its lease was released and the operation stays on the record`, 'cancel');
+      }
     }
     const idxId = `${job.workflow}:${job.target}`;
-    const idx = await this.get<JobIndex>('job_index', idxId);
     let promote: string[] = [];
-    if (idx) {
+    await this.update<JobIndex>('job_index', idxId, null, (idx) => {
+      promote = [];
       if (idx.primary === job.id) idx.primary = null;
       idx.winding = idx.winding.filter((x) => x !== job.id);
       idx.queued = idx.queued.filter((x) => x !== job.id);
@@ -375,32 +458,37 @@ export class Engine {
         idx.primary = nextId;
         promote = [nextId];
       }
-      await this.put('job_index', idxId, idx);
-    }
+    });
     await this.openJobsIndex((ids) => ids.filter((x) => x !== job.id));
+    // ended jobs leave the thread index, so hot paths stay bounded (M9)
+    for (const t of job.threads) {
+      await this.update<ThreadIndex>('thread_index', t, null, (ti) => {
+        if (!ti.jobs.includes(job.id)) return false;
+        ti.jobs = ti.jobs.filter((x) => x !== job.id);
+      });
+    }
     await this.saveJob(job);
     for (const id of promote) {
-      const q = await this.get<Job>('job', id);
-      if (q && q.status === 'queued') {
+      await this.updateJob(id, (q) => {
+        if (q.status !== 'queued') return false;
         q.status = 'open';
         q.blocked_by_jobs = [];
         q.next_wake_at = now;
-        q.wake_reasons.push(`${job.id} ended; this queued job is now open`);
-        await this.saveJob(q);
-        await this.schedule(q.id, now);
-      }
+        this.addReason(q, `${job.id} ended; this queued job is now open`);
+      });
+      await this.schedule(id, now);
     }
   }
 
   /** Close a closing job once nothing is owed; finish a cancel_requested job once ops are resolved. */
   private async maybeClose(job: Job): Promise<boolean> {
     if (job.status === 'closing') {
-      if ((await this.owedDeliveries(job)).length === 0 && (await this.unresolvedOps(job)).length === 0) {
+      if ((await this.owedDeliveries(job)).length === 0 && (await this.openPromises(job)).length === 0 && (await this.unresolvedOps(job)).length === 0) {
         await this.finishJob(job, 'done');
         return true;
       }
     } else if (job.status === 'cancel_requested') {
-      if ((await this.unresolvedOps(job)).length === 0) {
+      if ((await this.unresolvedOps(job, false)).length === 0) {
         await this.finishJob(job, 'cancelled');
         return true;
       }
@@ -426,14 +514,15 @@ export class Engine {
     const id = `${job.id}:${thread}:${milestone}`;
     const d: Delivery = {
       key: id, job: job.id, thread, milestone, state, owed_at: this.now(), claimed_at: null, next_check_at: null,
-      sent_at: null, sent_count: 0, message_link: null, seen_via: null,
+      sent_at: null, sent_count: 0, message_link: null, seen_via: null, round: 1,
     };
-    const r = await this.store.putIfAbsent(this.k('delivery', id), d);
-    if (r.created) job.delivery_keys.push(id);
+    const r = await this.create('delivery', id, d);
+    if (r.created && !job.delivery_keys.includes(id)) job.delivery_keys.push(id);
+    if (!r.created && !job.delivery_keys.includes(id)) job.delivery_keys.push(id);
     return r.value;
   }
 
-  private async markSent(job: Job, d: Delivery, via: 'connector' | 'sweep' | 'relay', link: string | null): Promise<void> {
+  private async markSent(job: Job, d: Delivery, via: NonNullable<Delivery['seen_via']>, link: string | null): Promise<void> {
     if (d.state !== 'sent') {
       d.state = 'sent';
       d.sent_count += 1;
@@ -441,20 +530,26 @@ export class Engine {
       d.message_link = link;
       d.seen_via = via;
       d.next_check_at = null;
-      await this.put('delivery', d.key, d);
+      d.prior_claim_at = null;
+      await this.save('delivery', d.key, d);
     }
     const p = await this.get<Promise_>('promise', d.key);
-    if (p && (p.state === 'open' || p.state === 'due')) { p.state = 'fulfilled'; await this.put('promise', p.key, p); }
+    if (p && (p.state === 'open' || p.state === 'due')) { p.state = 'fulfilled'; await this.save('promise', p.key, p); }
     if (job.claims[d.thread] === d.milestone) delete job.claims[d.thread];
-    const ti = await this.get<ThreadIndex>('thread_index', d.thread);
-    if (ti?.claim && ti.claim.job === job.id && ti.claim.milestone === d.milestone) { ti.claim = null; await this.put('thread_index', d.thread, ti); }
+    await this.closeClaim(d.thread, job.id, d.milestone);
   }
 
+  private async readBuild(job: Job, gate: string): Promise<string | null> {
+    try { return (await this.sourceReader.currentBuild({ id: job.id, workflow: job.workflow, target: job.target }, gate)) ?? null; } catch { return null; }
+  }
+
+  /** Opens the ask for the gate on the job's current build. A failed source read never records a build (H7). */
   private async openAsk(job: Job, spec: Spec, gate: string, thread: string): Promise<Ask | null> {
     const g = spec.gates?.[gate];
     if (!g) return null;
-    let build = 'unknown';
-    try { build = (await this.sourceReader.currentBuild({ id: job.id, workflow: job.workflow, target: job.target }, gate)) ?? 'unknown'; } catch { /* unknown build */ }
+    const fresh = await this.readBuild(job, gate);
+    if (fresh === null) await this.addFlag(job, 'source_unreadable', `could not read the current build for ${gate}; the ask names no build and no build_changed check can fire for it`, 'say');
+    const build = fresh ?? 'unknown';
     const responders = uniq([...g.responders.primary, ...(g.responders.stand_ins ?? [])]);
     const id = `${job.id}:${gate}:${build}`;
     const ask: Ask = {
@@ -462,20 +557,46 @@ export class Engine {
       responder_slack: responders.map((p) => spec.people?.[p]?.slack).filter((x): x is string => !!x),
       thread, state: 'open', opened_at: this.now(), answered_at: null, answered_by: null,
     };
-    const r = await this.store.putIfAbsent(this.k('ask', id), ask);
-    if (r.created) {
-      job.ask_keys.push(id);
-      const prevKey = job.latest_ask[gate];
-      if (prevKey && prevKey !== id) {
-        const prev = await this.get<Ask>('ask', prevKey);
-        if (prev && prev.state === 'open') { prev.state = 'stale'; await this.put('ask', prev.key, prev); }
-      }
+    const r = await this.create('ask', id, ask);
+    let cur = r.value;
+    if (!r.created && cur.state !== 'open' && job.latest_ask[gate] !== id) {
+      cur.state = 'open'; cur.opened_at = this.now(); cur.answered_at = null; cur.answered_by = null; cur.thread = thread;
+      await this.save('ask', cur.key, cur);
+    }
+    if (!job.ask_keys.includes(id)) job.ask_keys.push(id);
+    const prevKey = job.latest_ask[gate];
+    if (prevKey && prevKey !== id) {
+      const prev = await this.get<Ask>('ask', prevKey);
+      if (prev && prev.state !== 'stale') { prev.state = 'stale'; await this.save('ask', prev.key, prev); }
     }
     job.latest_ask[gate] = id;
-    return r.value;
+    cur = r.value;
+    return cur;
   }
 
   // ---------------------------------------------------------------- 3. intend
+
+  private async takeLease(job: Job, resource: string, opId: string): Promise<boolean> {
+    let taken = false;
+    await this.update<Lease>('lease', resource, () => ({ resource, holder_job: null, ops: [], since: null }), (lease) => {
+      if (lease.holder_job && lease.holder_job !== job.id) { taken = false; return false; }
+      taken = true;
+      lease.holder_job = job.id;
+      if (!lease.ops.includes(opId)) lease.ops.push(opId);
+      lease.since = lease.since ?? this.now();
+      if (lease.waiters) lease.waiters = lease.waiters.filter((w) => w !== job.id);
+    });
+    return taken;
+  }
+
+  private async addWaiter(resource: string, jobId: string): Promise<void> {
+    await this.update<Lease>('lease', resource, () => ({ resource, holder_job: null, ops: [], since: null }), (lease) => {
+      lease.waiters = lease.waiters ?? [];
+      if (lease.waiters.includes(jobId)) return false;
+      lease.waiters.push(jobId);
+      if (lease.waiters.length > 20) lease.waiters.shift();
+    });
+  }
 
   private async doIntend(a: { job: string; action: string; ref: string; because?: string }, ctx: Ctx): Promise<Answer> {
     const L = await this.loadJob(a.job, 'intend');
@@ -488,12 +609,9 @@ export class Engine {
     const act = spec?.actions?.[a.action];
     const opId = `${job.id}:${a.action}:${a.ref}`;
     const existing = await this.get<Operation>('operation', opId);
-    if (existing && existing.outcome !== 'held') {
-      return ans(true, 'already_recorded',
-        `Already recorded: ${a.action} on ${a.ref} is ${existing.outcome} (intent ${fmtAge(this.now() - existing.intent_at)} ago). Nothing new was started; this is the same operation.`,
-        { job: job.id, operation: existing });
-    }
+    const sameOp = !!existing && existing.outcome !== 'held' && existing.outcome !== 'failed';
 
+    // The session checks always run, also on a retry of the same ref (H4).
     const rel = await this.touchRun(job, ctx, 'adopted', true);
     await this.sessionFlags(job, ctx, 'intend', rel, false);
 
@@ -507,17 +625,19 @@ export class Engine {
     if (act?.resource) {
       const lease = await this.get<Lease>('lease', act.resource);
       if (lease?.holder_job && lease.holder_job !== job.id) {
-        findings.push({ check: 'lease_held', detail: `${act.resource} is leased by ${lease.holder_job}`, next: `Wait for ${lease.holder_job} to report its outcome, or open this job with intent queue.` });
+        findings.push({ check: 'lease_held', detail: `${act.resource} is leased by ${lease.holder_job}`, next: `Wait for ${lease.holder_job} to report its outcome (you will be woken when ${act.resource} is free), or open this job with intent queue.` });
+        await this.addWaiter(act.resource, job.id);
       }
     }
     if (act?.gate) {
       const askKey = job.latest_ask[act.gate];
       const ask = askKey ? await this.get<Ask>('ask', askKey) : null;
-      if (ask && ask.state !== 'stale') {
-        let fresh: string | null = null;
-        try { fresh = await this.sourceReader.currentBuild({ id: job.id, workflow: job.workflow, target: job.target }, act.gate); } catch { fresh = null; }
-        if (fresh && fresh !== ask.build) {
-          findings.push({ check: 'build_changed', detail: `the ask for ${act.gate} was about build ${ask.build}, the source now shows ${fresh}`, next: `Ask the responders again for build ${fresh}, then call intend again.` });
+      if (ask && ask.state !== 'stale' && ask.build !== 'unknown') {
+        const fresh = await this.readBuild(job, act.gate);
+        if (fresh === null) {
+          await this.addFlag(job, 'source_unreadable', `could not read the current build for ${act.gate} at intend time; build_changed was not checked`, 'intend');
+        } else if (fresh !== ask.build) {
+          findings.push({ check: 'build_changed', detail: `the ask for ${act.gate} was about build ${ask.build}, the source now shows ${fresh}`, next: `Ask the responders again for build ${fresh} (call say for the milestone that asks), then call intend again.` });
         }
       }
       if (a.because) {
@@ -541,48 +661,74 @@ export class Engine {
       if (mode === 'hold') { holds.push(text); nexts.push(f.next); } else { flags.push(text); }
       await this.addFlag(job, f.check, f.detail, 'intend', mode);
     }
+    if (!act && spec) flags.push(`action "${a.action}" is not in the workflow spec: no lease and no gate checks`);
+
+    if (existing && sameOp) {
+      // Same job, action and ref: the same operation back. Nothing new starts.
+      await this.saveJob(job);
+      if (holds.length > 0) {
+        return ans(true, 'hold', `Hold on ${a.action} ${a.ref}. ${holds.join('; ')}. Next: ${nexts.join(' ')} The earlier operation (${existing.outcome}) was left as it was.${flags.length ? ` Also flagged: ${flags.join('; ')}.` : ''}`, { job: job.id, operation: existing, holds, flags, existing: true });
+      }
+      return ans(true, 'already_recorded',
+        `Already recorded: ${a.action} on ${a.ref} is ${existing.outcome} (intent ${fmtAge(this.now() - existing.intent_at)} ago). Nothing new was started; this is the same operation.${flags.length ? ` Flagged: ${flags.join('; ')}.` : ''}`,
+        { job: job.id, operation: existing, flags, holds: [] });
+    }
 
     const op: Operation = existing ?? {
       key: opId, job: job.id, action: a.action, ref: a.ref, because: a.because ?? null, intent_at: this.now(),
       session: ctx.session_id ?? null, outcome: 'held', source: 'tony_reported', flags: [], holds: [], note: '',
       resource: act?.resource ?? null, lease_taken: false, outcome_at: null,
     };
+    if (existing?.outcome === 'failed') { op.note = ''; op.outcome_at = null; op.source = 'tony_reported'; } // a retry after failed is a new attempt
     op.because = a.because ?? op.because;
+    op.resource = act?.resource ?? op.resource; // an operation first seen through a checkpoint has no resource yet
     op.session = ctx.session_id ?? op.session;
+    if (!existing && !job.op_keys.includes(opId)) job.op_keys.push(opId);
+
+    // A lost lease race turns into a lease_held finding.
+    let leaseTaken = false;
+    if (holds.length === 0 && act?.resource && job.status !== 'done') {
+      leaseTaken = await this.takeLease(job, act.resource, opId);
+      if (!leaseTaken) {
+        const detail = `${act.resource} was taken by another job while this intend ran`;
+        await this.addFlag(job, 'lease_held', detail, 'intend', this.config.checks.lease_held);
+        if (this.config.checks.lease_held === 'hold') { holds.push(`lease_held: ${detail}`); nexts.push(`Wait until ${act.resource} is free (you will be woken).`); } else flags.push(`lease_held: ${detail}`);
+      }
+    }
     op.flags = flags;
     op.holds = holds;
-    if (!existing) job.op_keys.push(opId);
-    if (!act && spec) flags.push(`action "${a.action}" is not in the workflow spec: no lease and no gate checks`);
 
     if (holds.length > 0) {
       op.outcome = 'held';
-      await this.put('operation', opId, op);
+      await this.save('operation', opId, op);
       await this.saveJob(job);
       return ans(true, 'hold',
         `Hold on ${a.action} ${a.ref}. ${holds.join('; ')}. Next: ${nexts.join(' ')} No lease was taken and nothing is in flight.${flags.length ? ` Also flagged: ${flags.join('; ')}.` : ''}`,
         { job: job.id, operation: op, holds, flags });
     }
 
+    if (job.status === 'done') {
+      // L2: an ended job stays ended. The call is recorded and flagged, and nothing is tracked.
+      op.outcome = 'held';
+      op.note = 'recorded after the job was done; not tracked';
+      await this.addFlag(job, 'job_ended', `${a.action} on ${a.ref} was announced after the job was done; recorded, no lease, nothing in flight`, 'intend');
+      await this.save('operation', opId, op);
+      await this.saveJob(job);
+      return ans(true, 'recorded', `Recorded: ${job.id} is already done, so ${a.action} on ${a.ref} is noted and flagged (job_ended) but not tracked: no lease, nothing in flight. Reopen the work with job_open (replace) if more work is needed.`, { job: job.id, operation: op, flags, holds: [] });
+    }
+
     op.outcome = 'in_flight';
     op.intent_at = this.now();
-    if (job.status === 'cancelled' || job.status === 'done') {
-      // flagged work went ahead on an ended job: keep the job visible until the outcome is reported
+    op.lease_taken = leaseTaken;
+    if (job.status === 'cancelled') {
+      // flagged work went ahead on a cancelled job: keep the job visible until the outcome is reported
       job.status = 'cancel_requested';
       job.closed_at = null;
       job.next_wake_at = this.now() + this.nextWakeMs(spec);
       await this.openJobsIndex((ids) => uniq([...ids, job.id]));
+      for (const t of job.threads) await this.update<ThreadIndex>('thread_index', t, () => ({ jobs: [] }), (ti) => { if (ti.jobs.includes(job.id)) return false; ti.jobs.push(job.id); });
       await this.moveToWinding(job);
       await this.schedule(job.id, job.next_wake_at);
-    }
-    if (act?.resource) {
-      const lease = (await this.get<Lease>('lease', act.resource)) ?? { resource: act.resource, holder_job: null, ops: [], since: null };
-      if (!lease.holder_job || lease.holder_job === job.id) {
-        lease.holder_job = job.id;
-        if (!lease.ops.includes(opId)) lease.ops.push(opId);
-        lease.since = lease.since ?? this.now();
-        op.lease_taken = true;
-        await this.put('lease', act.resource, lease);
-      }
     }
     if (act?.gate) {
       const askKey = job.latest_ask[act.gate];
@@ -592,12 +738,11 @@ export class Engine {
         ask.answered_at = this.now();
         const ev = a.because ? await this.get<EventRecord>('event', a.because) : null;
         ask.answered_by = ev?.sender_id ?? null;
-        await this.put('ask', ask.key, ask);
+        await this.save('ask', ask.key, ask);
       }
     }
-    await this.put('operation', opId, op);
-    const refIdx = (await this.get<IdList>('ref_index', a.ref)) ?? { ids: [] };
-    if (!refIdx.ids.includes(job.id)) { refIdx.ids.push(job.id); await this.put('ref_index', a.ref, refIdx); }
+    await this.save('operation', opId, op);
+    await this.update<IdList>('ref_index', a.ref, () => ({ ids: [] }), (r) => { if (r.ids.includes(job.id)) return false; r.ids.push(job.id); });
     await this.saveJob(job);
     await this.schedule(job.id, op.intent_at + this.unknownMs(spec));
     return ans(true, 'clear',
@@ -613,7 +758,20 @@ export class Engine {
 
   // ---------------------------------------------------------------- 4. say
 
-  private async doSay(a: { job: string; thread: string; milestone: string }, ctx: Ctx): Promise<Answer> {
+  /** Match an open claim to a post the Slack reader can see. Returns true when the claim was closed as sent. */
+  private async reconcileClaim(c: Claim, cur: Job | null): Promise<boolean> {
+    let found: { link?: string; relay?: boolean } | null = null;
+    try { found = await this.slackReader.findOwnPostAfter(c.thread, c.at); } catch { found = null; }
+    if (!found || found.relay) return false;
+    const job = cur && cur.id === c.job ? cur : await this.get<Job>('job', c.job);
+    const d = await this.get<Delivery>('delivery', `${c.job}:${c.thread}:${c.milestone}`);
+    if (!job || !d || d.state !== 'claimed') { await this.closeClaim(c.thread, c.job, c.milestone); return false; }
+    await this.markSent(job, d, 'sweep', found.link ?? null);
+    if (!cur || cur.id !== job.id) await this.saveJob(job);
+    return true;
+  }
+
+  private async doSay(a: { job: string; thread: string; milestone: string; posted_link?: string }, ctx: Ctx): Promise<Answer> {
     const L = await this.loadJob(a.job, 'say');
     if ('answer' in L) return L.answer;
     const job = L.job;
@@ -621,49 +779,125 @@ export class Engine {
       return ans(false, 'bad_input', `say: ${!a.thread ? 'thread' : 'milestone'} is missing, so no claim was recorded.`, { job: job.id });
     }
     if (job.status === 'done' || job.status === 'cancelled') {
-      return ans(false, 'job_ended', `say: ${job.id} is ${job.status}, so no claim was recorded. Post only if a person asked you to.`, { job: job.id });
+      await this.addFlag(job, 'job_ended', `say ${a.milestone} in ${a.thread} arrived after the job was ${job.status}; recorded, no claim`, 'say');
+      await this.saveJob(job);
+      return ans(true, 'job_ended', `Recorded: ${job.id} is ${job.status}, so no claim was made and nothing is owed. Post only if a person asked you to.`, { job: job.id });
     }
     const spec = this.spec(job);
+    const sid = ctx.session_id ?? null;
     const rel = await this.touchRun(job, ctx, 'adopted', true);
     await this.sessionFlags(job, ctx, 'say', rel, true);
+    const now = this.now();
     const dKey = `${job.id}:${a.thread}:${a.milestone}`;
-    const d = await this.get<Delivery>('delivery', dKey);
-    if (d?.state === 'sent') {
-      await this.saveJob(job);
-      return ans(true, 'already_sent', `Already sent: ${a.milestone} was delivered to ${a.thread}${d.message_link ? ` (${d.message_link})` : ''}. Do not post it again.`, { job: job.id, delivery: d, link: d.message_link });
-    }
-    const ti = (await this.get<ThreadIndex>('thread_index', a.thread)) ?? { jobs: [], claim: null };
-    if (ti.claim) {
-      const c = ti.claim;
-      if (c.job === job.id && c.milestone === a.milestone) {
-        await this.saveJob(job);
-        return ans(true, 'already_claimed', `Already claimed: you claimed ${a.milestone} for ${a.thread} ${fmtAge(this.now() - c.at)} ago (at ${new Date(c.at).toISOString()}). Not seen yet: check the thread; if your post is absent, post now.`, { job: job.id, claimed_at: c.at });
-      }
-      await this.saveJob(job);
-      return ans(true, 'busy', `busy: claim for ${c.milestone} still open in ${a.thread}${c.job !== job.id ? ` (job ${c.job})` : ''}. Wait until that post is seen, then say again.`, { job: job.id, open_claim: c });
-    }
+    const gate = spec?.milestones?.[a.milestone]?.opens_ask;
     const notes: string[] = [];
     if (!job.threads.includes(a.thread)) notes.push(`Note: ${a.thread} is not linked to this job; the claim is recorded, but link it with job_open if events from it should reach the job.`);
     if (spec && !spec.milestones?.[a.milestone]) notes.push(`Note: "${a.milestone}" is not a milestone in the workflow spec; claim recorded as given.`);
-    const now = this.now();
+
+    // Confirm route: the agent posted and tells the engine where. Reported by the agent (L3); clears the claim.
+    if (a.posted_link) {
+      await this.markReached(job, spec, a.milestone);
+      const d = await this.ensureDelivery(job, a.thread, a.milestone, 'claimed');
+      if (d.state === 'sent') {
+        await this.saveJob(job);
+        return ans(true, 'already_sent', `Already sent: ${a.milestone} was delivered to ${a.thread}${d.message_link ? ` (${d.message_link})` : ''}. Nothing more to do.`, { job: job.id, delivery: d, link: d.message_link });
+      }
+      d.claimed_at = d.claimed_at ?? now;
+      await this.markSent(job, d, 'agent', a.posted_link);
+      if (gate && spec && !job.latest_ask[gate]) await this.openAsk(job, spec, gate, a.thread);
+      const closed = await this.maybeClose(job);
+      if (!closed) await this.saveJob(job);
+      return ans(true, 'confirmed', `Recorded: ${a.milestone} was posted in ${a.thread} (${a.posted_link}), reported by you. The claim is cleared.${closed ? ' Nothing else is owed, so the job is closed.' : ''}`, { job: job.id, link: a.posted_link, round: d.round });
+    }
+
+    let d = await this.get<Delivery>('delivery', dKey);
+    let reask = false;
+    if (d?.state === 'sent') {
+      // A new build needs a new ask and a new post, even if the milestone went out for the old build (H7).
+      if (gate && spec) {
+        const latest = job.latest_ask[gate] ? await this.get<Ask>('ask', job.latest_ask[gate]) : null;
+        const fresh = latest && latest.build !== 'unknown' ? await this.readBuild(job, gate) : null;
+        if (latest && fresh !== null && fresh !== latest.build) reask = true;
+      }
+      if (!reask) {
+        await this.saveJob(job);
+        return ans(true, 'already_sent', `Already sent: ${a.milestone} was delivered to ${a.thread}${d.message_link ? ` (${d.message_link})` : ''}. Do not post it again.`, { job: job.id, delivery: d, link: d.message_link });
+      }
+    }
+
+    // A stale claim that the reader can now see is simply sent.
+    const c0 = await this.get<Claim>('claim', a.thread);
+    if (c0 && c0.state === 'open' && now - c0.touched >= this.staleMs(spec) && !(c0.job === job.id && c0.milestone === a.milestone && c0.session === sid)) {
+      if (await this.reconcileClaim(c0, job)) {
+        d = await this.get<Delivery>('delivery', dKey);
+        if (d?.state === 'sent' && !reask) {
+          await this.saveJob(job);
+          return ans(true, 'already_sent', `Already sent: ${a.milestone} was delivered to ${a.thread}${d.message_link ? ` (${d.message_link})` : ''}. Do not post it again.`, { job: job.id, delivery: d, link: d.message_link });
+        }
+      }
+    }
+    const round = reask && d ? d.round + 1 : d?.round ?? 1;
+    let kind = 'go' as 'go' | 'own' | 'busy' | 'handoff';
+    let released: Claim | null = null;
+    let seen: Claim | null = null;
+    const claim = await this.update<Claim>('claim', a.thread, () => ({ thread: a.thread, job: '', milestone: '', session: null, at: 0, touched: 0, state: 'closed', round: 0 }), (c) => {
+      released = null;
+      seen = c.state === 'open' ? { ...c } : null;
+      const mine = c.job === job.id && c.milestone === a.milestone;
+      if (c.state === 'open' && mine && c.session === sid) { kind = 'own'; c.touched = now; return; }
+      if (c.state === 'open') {
+        if (now - c.touched < this.staleMs(spec)) { kind = 'busy'; return false; }
+        if (mine) { kind = 'handoff'; c.session = sid; c.touched = now; return; }
+        released = { ...c };
+      }
+      kind = 'go';
+      Object.assign(c, { job: job.id, milestone: a.milestone, session: sid, at: now, touched: now, state: 'open', round });
+    });
+    if (kind === 'busy') {
+      await this.saveJob(job);
+      const other = seen as Claim | null;
+      const sameMs = other && other.job === job.id && other.milestone === a.milestone;
+      const ago = other ? fmtAge(now - other.touched) : '';
+      return ans(true, 'busy', sameMs
+        ? `busy: another session is posting ${a.milestone} in ${a.thread} (claimed ${ago} ago). Do not post. Check again after ${Math.round(this.staleMs(spec) / MIN)} minutes; if it is still not there, say again.`
+        : `busy: a claim for ${other?.milestone} is open in ${a.thread}${other && other.job !== job.id ? ` (job ${other.job})` : ''} (${ago} ago). Do not post ${a.milestone} now. Wait for it to be seen, or until it goes stale after ${Math.round(this.staleMs(spec) / MIN)} minutes, then say again.`,
+      { job: job.id, open_claim: other });
+    }
+    if (released) {
+      const rc = released as Claim;
+      const od = await this.get<Delivery>('delivery', `${rc.job}:${rc.thread}:${rc.milestone}`);
+      if (od && od.state === 'claimed') { od.state = 'owed'; od.prior_claim_at = rc.at; od.claimed_at = null; od.next_check_at = null; await this.save('delivery', od.key, od); }
+      if (rc.job === job.id) delete job.claims[rc.thread];
+      else await this.updateJob(rc.job, (oj) => { delete oj.claims[rc.thread]; });
+      notes.push(`The earlier claim for ${rc.milestone} in this thread was never seen and went stale; it is owed again. Read the thread: if that message is missing, post it (say for it first).`);
+    }
     await this.markReached(job, spec, a.milestone);
-    const cur = await this.ensureDelivery(job, a.thread, a.milestone, 'claimed');
+    const cur = d && d.state !== 'sent' ? d : await this.ensureDelivery(job, a.thread, a.milestone, 'claimed');
+    if (cur.state === 'sent') { cur.state = 'claimed'; cur.sent_count = 0; cur.sent_at = null; cur.message_link = null; cur.seen_via = null; cur.round = round; }
+    // A delivery voided by a cancel while it was claimed may have been posted: treat it like a stale unseen claim (read first).
+    if (cur.state === 'void' && cur.claimed_at !== null) { cur.prior_claim_at = cur.claimed_at; cur.claimed_at = null; }
+    const priorUnseen = kind === 'go' && typeof cur.prior_claim_at === 'number';
+    if (priorUnseen) kind = 'handoff'; // the earlier post may exist: the agent reads the thread first; the sweep still matches only from this claim
+    if (kind !== 'handoff' || cur.claimed_at === null) cur.claimed_at = claim.at;
     cur.state = 'claimed';
-    cur.claimed_at = now;
     cur.next_check_at = now + this.config.sweepMinutes * MIN;
-    await this.put('delivery', cur.key, cur);
-    ti.claim = { job: job.id, milestone: a.milestone, at: now };
-    await this.put('thread_index', a.thread, ti);
+    await this.save('delivery', cur.key, cur);
     job.claims[a.thread] = a.milestone;
-    const gate = spec?.milestones?.[a.milestone]?.opens_ask;
     let askText = '';
-    if (gate && spec) {
+    if (gate && spec && (kind === 'go' || !job.latest_ask[gate] || priorUnseen)) {
       const ask = await this.openAsk(job, spec, gate, a.thread);
       if (ask) askText = ` An ask for ${gate} on build ${ask.build} is open with ${ask.responders.join(', ')}.`;
     }
     await this.saveJob(job);
     await this.schedule(job.id, cur.next_check_at);
-    return ans(true, 'go', `Go: post ${a.milestone} in ${a.thread} yourself now. The engine will match your post to this claim.${askText}${notes.length ? ' ' + notes.join(' ') : ''}`, { job: job.id, claimed_at: now });
+    const tail = `${askText}${notes.length ? ' ' + notes.join(' ') : ''}`;
+    const extra = { job: job.id, claimed_at: claim.at, round: cur.round, repeat: kind === 'own' };
+    if (kind === 'handoff') {
+      return ans(true, 'already_claimed', `Already claimed: another session claimed ${a.milestone} for ${a.thread} ${fmtAge(now - claim.at)} ago and the post was never seen. The claim is yours now. Read the thread with slack_read_thread; post only if the message is absent. If it is there, call say again with posted_link.${tail}`, extra);
+    }
+    return ans(true, 'go', kind === 'own'
+      ? `Go: you already hold this claim. Post ${a.milestone} in ${a.thread} yourself now unless it is already there (if it is, call say again with posted_link). The engine will match your post to this claim.${tail}`
+      : `Go: post ${a.milestone} in ${a.thread} yourself now. The engine will match your post to this claim. This go is good for ${Math.round(this.staleMs(spec) / MIN)} minutes; after that, say again before posting.${tail}`, extra);
   }
 
   // ---------------------------------------------------------------- 5. promise_add
@@ -676,12 +910,14 @@ export class Engine {
       return ans(false, 'bad_input', `promise_add: ${!a.thread ? 'thread' : 'about (a milestone id)'} is missing, so no promise was recorded.`, { job: job.id });
     }
     if (job.status === 'done' || job.status === 'cancelled') {
-      return ans(false, 'job_ended', `promise_add: ${job.id} is ${job.status}, so no promise was recorded. Tell the person yourself if they still need an answer.`, { job: job.id });
+      await this.addFlag(job, 'job_ended', `promise_add for ${a.about} in ${a.thread} arrived after the job was ${job.status}; recorded, no promise`, 'promise_add');
+      await this.saveJob(job);
+      return ans(true, 'job_ended', `Recorded: ${job.id} is ${job.status}, so no promise was made. Tell the person yourself if they still need an answer.`, { job: job.id });
     }
     const spec = this.spec(job);
     const now = this.now();
     const rel = await this.touchRun(job, ctx, 'adopted', true);
-    await this.sessionFlags(job, ctx, 'promise_add', rel, true);
+    await this.sessionFlags(job, ctx, 'promise_add', rel, false); // a promise from any session is a valid record (D10)
     const notes: string[] = [];
     let fallback: number | null = null;
     if (typeof a.fallback_time === 'number' && a.fallback_time > 1e11) fallback = a.fallback_time;
@@ -696,7 +932,7 @@ export class Engine {
     if (!job.threads.includes(a.thread)) notes.push(`Note: ${a.thread} is not linked to this job; link it with job_open (join) so its events reach the job.`);
     const id = `${job.id}:${a.thread}:${a.about}`;
     const p: Promise_ = { key: id, job: job.id, thread: a.thread, milestone: a.about, fallback_at: fallback, state: 'open', created_at: now };
-    const r = await this.store.putIfAbsent(this.k('promise', id), p);
+    const r = await this.create('promise', id, p);
     if (!r.created) {
       await this.saveJob(job);
       return ans(true, 'already_promised', `Already promised: ${a.thread} is waiting for ${a.about} (state ${r.value.state}, fallback ${new Date(r.value.fallback_at).toISOString()}).`, { job: job.id, promise: r.value });
@@ -705,7 +941,7 @@ export class Engine {
     const entry = spec?.milestones?.[a.about];
     if (job.milestones[a.about] && entry?.audience.promise_holders) {
       const d = await this.ensureDelivery(job, a.thread, a.about, 'owed');
-      if (d.state === 'sent') { p.state = 'fulfilled'; await this.put('promise', id, p); }
+      if (d.state === 'sent') { p.state = 'fulfilled'; await this.save('promise', id, p); }
       else notes.push(`${a.about} was already reached, so it is owed to ${a.thread} now.`);
     }
     await this.saveJob(job);
@@ -726,8 +962,11 @@ export class Engine {
     const spec = this.spec(job);
     const now = this.now();
     const notes: string[] = [];
-    const rel = await this.touchRun(job, ctx, 'adopted', true);
-    await this.sessionFlags(job, ctx, 'checkpoint', rel, true);
+    // A checkpoint never takes over a run; only a session that is the work run (or arrives with no run yet) commits (H8).
+    const rel = await this.touchRun(job, ctx, 'adopted', !job.current_run);
+    await this.sessionFlags(job, ctx, 'checkpoint', rel, false);
+    const convo = !!ctx.session_id && rel !== 'you';
+    if (convo) await this.addFlag(job, 'not_work_run', `checkpoint came from session ${ctx.session_id}, which is not the work run; recorded as a note, status and wake unchanged`, 'checkpoint');
 
     // operation outcomes (D5)
     if (a.operations?.length) {
@@ -741,26 +980,31 @@ export class Engine {
           notes.push(`The job has ended, so an "unknown" outcome for ${o.ref} was not recorded (it would leave an ended job with an unresolved operation).`);
           continue;
         }
-        let matches = ops.filter((x) => x.ref === o.ref && (!o.action || x.action === o.action));
+        const matches = ops.filter((x) => x.ref === o.ref && (!o.action || x.action === o.action));
         if (matches.length === 0) {
           const act = o.action ?? 'unspecified';
           const op: Operation = {
             key: `${job.id}:${act}:${o.ref}`, job: job.id, action: act, ref: o.ref, because: null, intent_at: now,
-            session: ctx.session_id ?? null, outcome: o.outcome, source: 'tony_reported', flags: [], holds: [],
-            note: o.note ?? '', resource: null, lease_taken: false, outcome_at: now,
+            session: ctx.session_id ?? null, outcome: o.outcome, source: 'tony_reported', flags: [], holds: [], note: o.note ?? '',
+            resource: null, lease_taken: false, outcome_at: now,
           };
-          const r = await this.store.putIfAbsent(this.k('operation', op.key), op);
-          if (r.created) job.op_keys.push(op.key);
+          const r = await this.create('operation', op.key, op);
+          if (r.created && !job.op_keys.includes(op.key)) job.op_keys.push(op.key);
           notes.push(`No intend was recorded for ${o.ref}; recorded your reported outcome (${o.outcome}) anyway.`);
           continue;
         }
-        for (const m of matches) {
-          m.outcome = o.outcome;
-          m.note = o.note ?? m.note;
-          m.outcome_at = now;
-          if (o.outcome !== 'unknown') await this.releaseLease(m);
-          await this.put('operation', m.key, m);
+        if (matches.length > 1) {
+          // Several operations share this ref and no action was named: do not guess which one it was (M5).
+          await this.addFlag(job, 'ambiguous_outcome', `outcome ${o.outcome} for ref ${o.ref} named no action and ${matches.length} operations use that ref (${matches.map((m) => m.action).join(', ')}); none was changed`, 'checkpoint');
+          notes.push(`Outcome for ${o.ref} named no action and ${matches.length} operations use that ref; none was changed. Report it again with the action.`);
+          continue;
         }
+        const m = matches[0];
+        m.outcome = o.outcome;
+        m.note = o.note ?? m.note;
+        m.outcome_at = now;
+        if (o.outcome !== 'unknown') await this.releaseLease(m);
+        await this.save('operation', m.key, m);
       }
     }
     const ended = job.status === 'done' || job.status === 'cancelled';
@@ -769,66 +1013,80 @@ export class Engine {
       if (await this.markReached(job, spec, m)) notes.push(`Milestone ${m} marked reached (reported by you).`);
     }
 
-    job.reported_status = a.status;
-    if (a.waiting_for !== undefined) job.waiting_for = a.waiting_for;
     const wantNext = a.next_wake_in !== undefined ? parseDuration(a.next_wake_in) : null;
     if (a.next_wake_in !== undefined && wantNext === null) notes.push(`next_wake_in "${a.next_wake_in}" could not be read; the default of ${(spec?.defaults?.next_wake_minutes ?? 30)} minutes is used.`);
     let wakeAt = now + (wantNext ?? this.nextWakeMs(spec));
 
     let statusText: string;
-    if (a.status === 'cancelled') {
-      await this.requestCancel(job, 'cancelled by checkpoint');
-      statusText = (job.status as JobStatus) === 'cancelled' ? 'The job is cancelled.' : 'Cancel requested: operations are still in flight, so the job stays cancel_requested until they have outcomes.';
-    } else if (job.status === 'done' || job.status === 'cancelled') {
-      // An ended job stays ended: a late checkpoint records what it reports and changes nothing else.
-      statusText = `The job is already ${job.status}; your report was recorded and nothing else changed.`;
-    } else if (job.status === 'queued') {
-      // A queued job has not started: it cannot close or reopen itself; it opens when its turn comes.
-      statusText = 'The job is queued behind another job; your report was recorded, and it opens when that job ends.';
-    } else if (a.status === 'done') {
-      if (job.status === 'cancel_requested') {
-        statusText = 'The job is cancel_requested; it ends when its in-flight operations have outcomes.';
-      } else {
-        const owed = await this.owedDeliveries(job);
-        const unresolved = await this.unresolvedOps(job);
-        if (owed.length === 0 && unresolved.length === 0) {
-          await this.finishJob(job, 'done');
-          statusText = 'The job is done and closed.';
+    if (convo) {
+      job.notes.push({ at: now, session: ctx.session_id ?? null, status: a.status, waiting_for: a.waiting_for ?? '' });
+      if (job.notes.length > MAX_NOTES) job.notes.splice(0, job.notes.length - MAX_NOTES);
+      statusText = 'Recorded as a note: you are not the work run, so the job\'s status and wake are unchanged.';
+      if (a.status === 'cancelled' && !ended) {
+        this.addReason(job, `cancel asked (session ${ctx.session_id} noted a cancel${a.waiting_for ? `: ${a.waiting_for}` : ''}); the work run decides`);
+        wakeAt = now;
+        statusText += ' The work run is woken with "cancel asked"; a conversation session cannot cancel.';
+      } else if (!ended && a.next_wake_in !== undefined && wantNext !== null && job.next_wake_at !== null) {
+        wakeAt = Math.min(job.next_wake_at, wakeAt);
+      } else wakeAt = job.next_wake_at ?? wakeAt;
+    } else {
+      job.reported_status = a.status;
+      if (a.waiting_for !== undefined) job.waiting_for = a.waiting_for;
+      if (a.status === 'cancelled') {
+        await this.requestCancel(job, 'cancelled by checkpoint');
+        statusText = (job.status as JobStatus) === 'cancelled' ? 'The job is cancelled.' : 'Cancel requested: operations are still in flight, so the job stays cancel_requested until they have outcomes.';
+      } else if (job.status === 'done' || job.status === 'cancelled') {
+        // An ended job stays ended: a late checkpoint records what it reports and changes nothing else.
+        statusText = `The job is already ${job.status}; your report was recorded and nothing else changed.`;
+      } else if (job.status === 'queued') {
+        statusText = 'The job is queued behind another job; your report was recorded, and it opens when that job ends.';
+      } else if (a.status === 'done') {
+        if (job.status === 'cancel_requested') {
+          statusText = 'The job is cancel_requested; it ends when its in-flight operations have outcomes.';
         } else {
-          job.status = 'closing';
-          const parts = [
-            ...owed.map((d) => `still owed: ${d.milestone} to ${d.thread}`),
-            ...unresolved.map((o) => `still in flight: ${o.action} on ${o.ref}`),
-          ];
-          statusText = `Not closed yet, status is closing: ${parts.join('; ')}. You will be woken; the job closes when nothing is owed.`;
+          const owed = await this.owedDeliveries(job);
+          const proms = await this.openPromises(job);
+          const unresolved = await this.unresolvedOps(job);
+          if (owed.length === 0 && proms.length === 0 && unresolved.length === 0) {
+            await this.finishJob(job, 'done');
+            statusText = 'The job is done and closed.';
+          } else {
+            job.status = 'closing';
+            const parts = uniq([
+              ...owed.map((d) => `still owed: ${d.milestone} to ${d.thread}`),
+              ...proms.map((p) => `still owed: ${p.milestone} to ${p.thread}`),
+              ...unresolved.map((o) => `still in flight: ${o.action} on ${o.ref}${o.outcome === 'unknown' ? ' (unknown: verify it and report done or failed)' : ''}`),
+            ]);
+            statusText = `Not closed yet, status is closing: ${parts.join('; ')}. You will be woken; the job closes when nothing is owed.`;
+          }
+        }
+      } else {
+        if (job.status === 'closing') job.status = 'open';
+        if (job.status === 'cancel_requested') {
+          await this.maybeClose(job);
+          statusText = (job.status as JobStatus) === 'cancelled' ? 'The job is cancelled.' : 'The job is still cancel_requested.';
+        } else {
+          statusText = `Status committed: ${a.status}${a.waiting_for ? `, waiting for ${a.waiting_for}` : ''}.`;
         }
       }
-    } else {
-      if (job.status === 'closing') job.status = 'open';
-      if (job.status === 'cancel_requested') {
-        await this.maybeClose(job);
-        statusText = (job.status as JobStatus) === 'cancelled' ? 'The job is cancelled.' : 'The job is still cancel_requested.';
-      } else {
-        statusText = `Status committed: ${a.status}${a.waiting_for ? `, waiting for ${a.waiting_for}` : ''}.`;
-      }
+      if (job.status === 'cancel_requested') await this.maybeClose(job);
     }
-    if (job.status === 'cancel_requested') await this.maybeClose(job);
 
+    // Outcomes reported by any session can be what a cancel was waiting for.
+    if (convo && job.status === 'cancel_requested') await this.maybeClose(job);
     if (job.closed_at === null) {
+      // A pending unblock reason survives: a checkpoint can only bring the wake earlier (H8, M3).
       if (job.wake_reasons.length > 0) {
-        wakeAt = now;
+        wakeAt = Math.min(wakeAt, now);
         notes.push(`New events arrived since you last looked (${job.wake_reasons.join('; ')}); the engine will wake you right away.`);
       }
-      job.next_wake_at = wakeAt;
-      await this.schedule(job.id, wakeAt);
-      // mark the caller's run idle
-      if (ctx.session_id && job.current_run) {
-        const run = await this.get<Run>('run', `${job.id}:${job.current_run}`);
-        if (run && run.session_id === ctx.session_id && run.state === 'active') { run.state = 'idle'; run.last_activity_at = now; await this.put('run', run.id, run); }
-      }
-    } else if (ctx.session_id && job.current_run) {
+      if (!convo) job.next_wake_at = wakeAt;
+      else job.next_wake_at = Math.min(job.next_wake_at ?? wakeAt, wakeAt);
+      await this.schedule(job.id, job.next_wake_at);
+    }
+    if (!convo && ctx.session_id && job.current_run) {
       const run = await this.get<Run>('run', `${job.id}:${job.current_run}`);
-      if (run && run.session_id === ctx.session_id && run.state === 'active') { run.state = 'idle'; await this.put('run', run.id, run); }
+      if (run && run.session_id === ctx.session_id && run.state === 'active') { run.state = 'idle'; run.last_activity_at = now; await this.save('run', run.id, run); }
     }
     await this.saveJob(job);
     return ans(true, job.status === 'closing' ? 'closing' : job.status, `${statusText}${job.next_wake_at ? ` Next wake at ${new Date(job.next_wake_at).toISOString()}.` : ''}${notes.length ? ' ' + notes.join(' ') : ''}`, {
@@ -836,14 +1094,26 @@ export class Engine {
     });
   }
 
+  /** Frees the operation's lease and wakes every job that was held waiting for it (M4). */
   private async releaseLease(op: Operation): Promise<void> {
     if (!op.lease_taken || !op.resource) return;
-    const lease = await this.get<Lease>('lease', op.resource);
-    if (!lease) return;
-    lease.ops = lease.ops.filter((x) => x !== op.key);
-    if (lease.ops.length === 0) { lease.holder_job = null; lease.since = null; }
-    await this.put('lease', op.resource, lease);
+    let waiters: string[] = [];
+    await this.update<Lease>('lease', op.resource, null, (lease) => {
+      waiters = [];
+      lease.ops = lease.ops.filter((x) => x !== op.key);
+      if (lease.ops.length === 0) { lease.holder_job = null; lease.since = null; waiters = lease.waiters ?? []; lease.waiters = []; }
+    });
     op.lease_taken = false;
+    const now = this.now();
+    for (const w of waiters) {
+      if (w === op.job) continue;
+      const j = await this.updateJob(w, (x) => {
+        if (x.status === 'done' || x.status === 'cancelled' || x.status === 'queued') return false;
+        this.addReason(x, `${op.resource} is free now; retry what was held`);
+        x.next_wake_at = Math.min(x.next_wake_at ?? now, now);
+      });
+      if (j && j.closed_at === null) await this.schedule(w, now);
+    }
   }
 
   // ---------------------------------------------------------------- 2. job_view
@@ -871,11 +1141,9 @@ export class Engine {
     const views = [];
     const texts = [];
     for (const job of jobs) {
-      // bind a pending run to the first session that looks (no adoption for a pure read)
-      const rel = await this.touchRun(job, ctx, 'adopted', false);
+      // A pure read never binds a run and never clears anything (M2, M3).
+      const rel = await this.touchRun(job, ctx, 'adopted', false, false);
       const v = await this.buildView(job, viewer, rel === 'other' ? 'other' : rel === 'you' ? 'you' : 'none');
-      job.wake_reasons = [];
-      await this.saveJob(job);
       views.push(v.data);
       texts.push(v.text);
     }
@@ -943,7 +1211,12 @@ export class Engine {
     };
   }
 
+
   // ---------------------------------------------------------------- ingest
+
+  private eventGate(ev: IngestEvent): string[] {
+    return [ev.attrs?.gate, ev.attrs?.job, ev.attrs?.name].filter((x): x is string => typeof x === 'string' && x !== '');
+  }
 
   private async doIngest(ev: IngestEvent): Promise<Answer> {
     if (!ev || !ev.source || !ev.delivery_id || !ev.kind) {
@@ -952,43 +1225,63 @@ export class Engine {
     const now = this.now();
     const id = `${ev.source}:${ev.delivery_id}`;
     const senderKind = ev.sender_id && ev.sender_id === this.config.ownBotUserId ? 'own_bot' : (ev.sender_kind ?? (ev.sender_id ? 'human' : 'system'));
-    const rec: EventRecord = {
+    const fresh: EventRecord = {
       key: id, id, source: ev.source, delivery_id: ev.delivery_id, kind: ev.kind, thread: ev.thread ?? null,
       sender_id: ev.sender_id ?? null, sender_kind: senderKind, ref: ev.ref ?? null, attrs: ev.attrs ?? {},
-      received_at: now, matched_jobs: [],
+      received_at: now, matched_jobs: [], state: 'received',
     };
-    const r = await this.store.putIfAbsent(this.k('event', id), rec);
-    if (!r.created) return ans(true, 'duplicate', `Event ${id} was already recorded; ignored.`, { event: id, duplicate: true });
+    // Written as received, processed, then marked done: a retry of a received-but-not-done event reprocesses it (M8).
+    const r = await this.create('event', id, fresh);
+    const rec = r.value;
+    if (!r.created && rec.state !== 'received') return ans(true, 'duplicate', `Event ${id} was already recorded; ignored.`, { event: id, duplicate: true });
 
     const ti = ev.thread ? await this.get<ThreadIndex>('thread_index', ev.thread) : null;
+    const claim = ev.thread ? await this.get<Claim>('claim', ev.thread) : null;
+    const openClaim = claim && claim.state === 'open' ? claim : null;
     const refIdx = ev.ref ? await this.get<IdList>('ref_index', ev.ref) : null;
-    const jobIds = uniq([...(ti?.jobs ?? []), ...(ti?.claim ? [ti.claim.job] : []), ...(refIdx?.ids ?? [])]);
+    const jobIds = uniq([...(ti?.jobs ?? []), ...(openClaim ? [openClaim.job] : []), ...(refIdx?.ids ?? [])]);
     const jobs = await this.manyPresent<Job>('job', jobIds);
     const woken: string[] = [];
     const actions: string[] = [];
     // An event from a private link stays private in every job it reaches (also by ref), not only the job that linked it.
     if (ev.thread && jobs.some((j) => j.private_threads.includes(ev.thread!))) rec.private_origin = true;
+    const matched = new Set<string>(rec.matched_jobs);
     for (const job of jobs) {
       if (job.status === 'done' || job.status === 'cancelled') continue;
       const spec = this.spec(job);
-      rec.matched_jobs.push(job.id);
-      job.event_ids.push(id);
+      matched.add(job.id);
+      if (!job.event_ids.includes(id)) job.event_ids.push(id);
       if (job.event_ids.length > MAX_EVENTS_KEPT) job.event_ids.splice(0, job.event_ids.length - MAX_EVENTS_KEPT);
       let wakeReason: string | null = null;
 
       if (senderKind === 'own_bot' && ev.thread) {
-        const claim = ti?.claim && ti.claim.job === job.id ? ti.claim : null;
-        const dKey = claim ? `${job.id}:${ev.thread}:${claim.milestone}` : null;
-        const d = dKey ? await this.get<Delivery>('delivery', dKey) : null;
-        // A late delivery of a post made before the claim belongs to an earlier post, not to this claim.
+        const mine = openClaim && openClaim.job === job.id ? openClaim : null;
+        const d = mine ? await this.get<Delivery>('delivery', `${job.id}:${ev.thread}:${mine.milestone}`) : null;
+        const relay = !!ev.attrs?.relay;
         const postedAt = typeof ev.attrs?.ts === 'number' ? ev.attrs.ts : null;
-        if (claim && postedAt !== null && postedAt < claim.at) {
-          actions.push(`own post in ${ev.thread} predates the open ${claim.milestone} claim of ${job.id}; not matched to it`);
-        } else if (claim && d && d.state === 'claimed') {
-          await this.markSent(job, d, ev.attrs?.relay ? 'relay' : 'connector', typeof ev.attrs?.link === 'string' ? ev.attrs.link : null);
-          actions.push(`own post in ${ev.thread} matched the ${claim.milestone} claim of ${job.id}`);
-          await this.maybeClose(job);
-        } else if (job.threads.includes(ev.thread) && !ev.attrs?.relay) {
+        const link = typeof ev.attrs?.link === 'string' ? ev.attrs.link : null;
+        if (mine && d && d.state === 'claimed') {
+          if (relay) {
+            // A mention reply counts only when the connector says which session wrote it and that is the claim owner.
+            const sess = typeof ev.attrs?.session === 'string' ? ev.attrs.session : null;
+            if (sess !== null && mine.session !== null && sess === mine.session) {
+              await this.markSent(job, d, 'relay', link);
+              actions.push(`relayed reply in ${ev.thread} from the claim owner matched the ${mine.milestone} claim of ${job.id}`);
+              await this.maybeClose(job);
+            } else {
+              actions.push(`relayed reply in ${ev.thread} did not come from the owner of the open ${mine.milestone} claim; not matched`);
+            }
+          } else if (postedAt === null) {
+            actions.push(`own post in ${ev.thread} carried no timestamp; not matched to the open ${mine.milestone} claim (the sweep or posted_link will settle it)`);
+          } else if (postedAt < mine.at) {
+            // A late delivery of a post made before the claim belongs to an earlier post, not to this claim.
+            actions.push(`own post in ${ev.thread} predates the open ${mine.milestone} claim of ${job.id}; not matched to it`);
+          } else {
+            await this.markSent(job, d, 'connector', link);
+            actions.push(`own post in ${ev.thread} matched the ${mine.milestone} claim of ${job.id}`);
+            await this.maybeClose(job);
+          }
+        } else if (job.threads.includes(ev.thread) && !relay && !openClaim) {
           await this.addFlag(job, 'unclaimed_post', `your bot posted in ${ev.thread} with no open claim (event ${id})`, 'ingest');
           actions.push(`unclaimed own post in ${ev.thread} flagged on ${job.id}`);
         }
@@ -1004,26 +1297,31 @@ export class Engine {
       }
       if (ev.ref && refIdx?.ids.includes(job.id)) {
         const ops = await this.manyPresent<Operation>('operation', job.op_keys);
+        const evGates = this.eventGate(ev);
         for (const op of ops) {
           if (op.ref !== ev.ref) continue;
           const act = spec?.actions?.[op.action];
-          if (act?.proved_by && act.proved_by === ev.kind) {
+          // Kind, ref and (when the action names a gate) the event's gate must all match (M5).
+          if (act?.proved_by && act.proved_by === ev.kind && (!act.gate || evGates.includes(act.gate))) {
             op.source = 'webhook_verified';
             if (op.outcome === 'in_flight' || op.outcome === 'unknown') { op.outcome = 'done'; op.outcome_at = now; await this.releaseLease(op); }
-            await this.put('operation', op.key, op);
+            await this.save('operation', op.key, op);
             actions.push(`${op.action} ${op.ref} verified by ${ev.kind}`);
           }
         }
         wakeReason = wakeReason ?? `external event ${ev.source}/${ev.kind} for ${ev.ref}`;
+        await this.maybeClose(job); // a verified outcome may be what a cancel or a closing job was waiting for
       }
-      if (wakeReason && !(['done', 'cancelled'] as string[]).includes(job.status)) {
+      if (wakeReason && job.closed_at === null) {
+        this.addReason(job, wakeReason);
         job.next_wake_at = now;
-        job.wake_reasons.push(wakeReason);
         await this.schedule(job.id, now);
         woken.push(job.id);
       }
       await this.saveJob(job);
     }
+    rec.matched_jobs = [...matched];
+    rec.state = 'done';
     await this.put('event', id, rec);
     return ans(true, 'recorded', `Event ${id} recorded; matched ${rec.matched_jobs.length} job(s).${actions.length ? ' ' + actions.join('; ') + '.' : ''}`, { event: id, matched_jobs: rec.matched_jobs, woken, actions });
   }
@@ -1038,13 +1336,21 @@ export class Engine {
     const ids = new Set<string>();
     const buckets: string[] = [];
     for (let b = from; b <= nowB; b++) buckets.push(String(b));
-    for (const r of await this.manyPresent<IdList>('due_index', buckets)) for (const j of r.ids) ids.add(j);
     const summary = { jobs_checked: 0, woke: [] as string[], operations_unknown: 0, promises_due: 0, claims_reconciled: 0, claims_not_seen: 0, closed: [] as string[], wakes_skipped: [] as string[] };
-    for (const id of ids) {
-      const job = await this.get<Job>('job', id);
-      if (!job || job.status === 'done' || job.status === 'cancelled') continue;
-      summary.jobs_checked += 1;
-      await this.processJob(job, summary);
+    // Processing a job can make another one due now (a queued job promoted when its blocker ends), so re-read the due index a bounded number of times.
+    const seen = new Set<string>();
+    for (let pass = 0; pass < 4; pass++) {
+      for (const r of await this.manyPresent<IdList>('due_index', buckets)) for (const j of r.ids) ids.add(j);
+      const todo = [...ids].filter((j) => !seen.has(j));
+      if (todo.length === 0) break;
+      for (const id of todo) {
+        seen.add(id);
+        const job = await this.get<Job>('job', id);
+        if (!job || job.status === 'done' || job.status === 'cancelled') continue;
+        summary.jobs_checked += 1;
+        await this.processJob(job, summary);
+        if (job.status === 'queued') seen.delete(id); // may be promoted by a later job in this sweep: look again
+      }
     }
     await this.put('sweep_cursor', 'main', { bucket: nowB });
     return ans(true, 'swept', `Sweep checked ${summary.jobs_checked} job(s): woke ${summary.woke.length}, ${summary.operations_unknown} operation(s) turned unknown, ${summary.promises_due} promise(s) due, ${summary.claims_reconciled} claim(s) reconciled.`, summary);
@@ -1066,7 +1372,7 @@ export class Engine {
         job.blocked_by_jobs = [];
         job.next_wake_at = now;
         reasons.push('the job it was queued behind has ended');
-        if (idx) { idx.queued = idx.queued.filter((x) => x !== job.id); idx.primary = job.id; await this.put('job_index', idxId, idx); }
+        if (idx) { idx.queued = idx.queued.filter((x) => x !== job.id); idx.primary = job.id; await this.save('job_index', idxId, idx); }
       } else {
         if (taken) job.blocked_by_jobs = [idx!.primary!];
         stillQueued = true;
@@ -1081,8 +1387,8 @@ export class Engine {
       if (due <= now) {
         o.outcome = 'unknown';
         o.note = o.note || 'no outcome reported before the timeout';
-        await this.put('operation', o.key, o);
-        reasons.push(`operation ${o.action} ${o.ref} has no outcome after ${fmtAge(now - o.intent_at)}: unknown`);
+        await this.save('operation', o.key, o);
+        reasons.push(`operation ${o.action} ${o.ref} has no outcome after ${fmtAge(now - o.intent_at)}: unknown. Verify it and report done or failed`);
         sum.operations_unknown += 1;
       } else await this.schedule(job.id, due);
     }
@@ -1091,24 +1397,26 @@ export class Engine {
     for (const p of proms) {
       if (p.state === 'open' && p.fallback_at <= now) {
         p.state = 'due';
-        await this.put('promise', p.key, p);
+        await this.save('promise', p.key, p);
         reasons.push(`promise due: ${p.milestone} to ${p.thread}`);
         sum.promises_due += 1;
       } else if (p.state === 'open') await this.schedule(job.id, p.fallback_at);
     }
-    // claims not yet seen: reconcile through the Slack reader
+    // claims not yet seen: reconcile through the Slack reader; a reply to a mention never counts
     const dels = await this.manyPresent<Delivery>('delivery', job.delivery_keys);
     for (const d of dels) {
       if (d.state !== 'claimed' || d.next_check_at === null) continue;
       if (d.next_check_at > now) { await this.schedule(job.id, d.next_check_at); continue; }
-      let found: { link?: string } | null = null;
-      try { found = await this.slackReader.findOwnPostAfter(d.thread, d.claimed_at ?? d.owed_at); } catch { found = null; }
-      if (found) {
+      const c = await this.get<Claim>('claim', d.thread);
+      const claimAt = c && c.state === 'open' && c.job === job.id && c.milestone === d.milestone ? c.at : (d.claimed_at ?? d.owed_at);
+      let found: { link?: string; ts?: number; relay?: boolean } | null = null;
+      try { found = await this.slackReader.findOwnPostAfter(d.thread, claimAt); } catch { found = null; }
+      if (found && !found.relay && (found.ts === undefined || found.ts >= claimAt)) {
         await this.markSent(job, d, 'sweep', found.link ?? null);
         sum.claims_reconciled += 1;
       } else {
         d.next_check_at = now + this.config.sweepMinutes * MIN;
-        await this.put('delivery', d.key, d);
+        await this.save('delivery', d.key, d);
         await this.schedule(job.id, d.next_check_at);
         sum.claims_not_seen += 1;
       }
@@ -1122,17 +1430,23 @@ export class Engine {
     }
     if (await this.maybeClose(job)) { sum.closed.push(job.id); return; }
 
-    if (reasons.length) {
-      job.wake_reasons.push(...reasons);
-      job.next_wake_at = Math.min(job.next_wake_at ?? now, now);
-    }
-    if (job.status === 'closing') {
-      const owed = await this.owedDeliveries(job);
-      if (owed.length && (job.next_wake_at ?? now + 1) <= now) job.wake_reasons.push(...owed.map((d) => `still owed: ${d.milestone} to ${d.thread}`));
+    for (const r of reasons) this.addReason(job, r);
+    if (reasons.length) job.next_wake_at = Math.min(job.next_wake_at ?? now, now);
+    const wakeDue = job.next_wake_at !== null && job.next_wake_at <= now;
+    // Standing things the agent must look at are added to the wake text when a wake is due, not stored.
+    const extra: string[] = [];
+    if (wakeDue) {
+      if (job.status === 'closing') for (const d of await this.owedDeliveries(job)) extra.push(`still owed: ${d.milestone} to ${d.thread}`);
+      for (const d of dels) {
+        if (d.state !== 'claimed') continue;
+        const c = await this.get<Claim>('claim', d.thread);
+        if (c && c.state === 'open' && c.job === job.id && now - c.touched >= this.staleMs(spec)) extra.push(`claim for ${d.milestone} in ${d.thread} was never seen: read the thread; if it is posted call say with posted_link, if not post it`);
+      }
+      for (const o of await this.manyPresent<Operation>('operation', job.op_keys)) if (o.outcome === 'unknown') extra.push(`operation ${o.action} ${o.ref} is unknown: verify it and report done or failed`);
     }
     await this.saveJob(job);
-    if (job.next_wake_at !== null && job.next_wake_at <= now) {
-      const r = await this.wakeInner(job.id, job.wake_reasons.join('; ') || 'next wake time reached');
+    if (wakeDue) {
+      const r = await this.wakeInner(job.id, uniq([...job.wake_reasons, ...extra]).join('; ') || 'next wake time reached');
       if (r.woke) sum.woke.push(job.id); else sum.wakes_skipped.push(job.id);
     } else if (job.next_wake_at !== null) {
       await this.schedule(job.id, job.next_wake_at);
@@ -1153,7 +1467,7 @@ export class Engine {
     if (job.status === 'done' || job.status === 'cancelled') return no('job_ended', `${jobId} has ended; no wake.`);
     const cr = job.current_run ? await this.get<Run>('run', `${job.id}:${job.current_run}`) : null;
     if (this.runActive(cr)) {
-      // A run is working: do not steer twice; recover if that run is lost.
+      // A run is working: do not steer twice; recover if that run is lost. Pending reasons stay.
       job.next_wake_at = cr!.last_activity_at + this.config.runTimeoutMinutes * MIN;
       await this.saveJob(job);
       await this.schedule(job.id, job.next_wake_at);
@@ -1161,12 +1475,12 @@ export class Engine {
     }
     const n = job.run_seq + 1;
     const run: Run = { id: `${job.id}:${n}`, job: job.id, n, session_id: null, origin: 'wake', started_at: now, last_activity_at: now, state: 'active' };
-    const r = await this.store.putIfAbsent(this.k('run', run.id), run);
+    const r = await this.create('run', run.id, run);
     if (!r.created) return no('twin_wake', `Another wake already created run ${run.id}; this one does nothing.`);
-    if (cr && cr.state === 'active') { cr.state = 'superseded'; await this.put('run', cr.id, cr); }
+    if (cr && cr.state === 'active') { cr.state = 'superseded'; await this.save('run', cr.id, cr); }
+    const posting = [...job.wake_reasons];
     job.run_seq = n;
     job.current_run = n;
-    job.wake_reasons = [];
     job.next_wake_at = now + this.nextWakeMs(this.spec(job));
     await this.saveJob(job);
     await this.schedule(job.id, job.next_wake_at);
@@ -1174,13 +1488,15 @@ export class Engine {
     try {
       await this.waker.postWake(job.dm_id, text);
     } catch (e) {
+      // The reasons were kept, so the retry wake still says why.
       const bad = await this.get<Run>('run', run.id);
-      if (bad && bad.session_id === null) { bad.state = 'idle'; await this.put('run', bad.id, bad); }
-      job.next_wake_at = now + MIN;
-      await this.saveJob(job);
-      await this.schedule(job.id, job.next_wake_at);
+      if (bad && bad.session_id === null) { bad.state = 'idle'; await this.save('run', bad.id, bad); }
+      await this.updateJob(job.id, (j) => { j.next_wake_at = Math.min(j.next_wake_at ?? now + MIN, now + MIN); });
+      await this.schedule(job.id, now + MIN);
       return { ...ans(false, 'wake_failed', `Posting the wake failed (${(e as Error).message}); retrying in 1 minute.`, { job: jobId }), woke: false };
     }
+    // A pending reason is cleared only after a wake was posted that carried it (M3).
+    await this.updateJob(job.id, (j) => { j.wake_reasons = j.wake_reasons.filter((x) => !posting.includes(x)); });
     return { ...ans(true, 'woke', `Woke ${jobId} as run ${run.id}: ${reason}.`, { job: jobId, run: run.id }), woke: true };
   }
 
@@ -1209,11 +1525,14 @@ export class Engine {
         if (d.state === 'claimed') claimedByThread.set(d.thread, (claimedByThread.get(d.thread) ?? 0) + 1);
         if (terminal && (d.state === 'owed' || d.state === 'claimed')) bad.push(`${job.id}: ${job.status} job with delivery ${d.key} still ${d.state}`);
       }
+      if (job.status === 'done') for (const p of proms) if (p.state === 'void') bad.push(`${job.id}: done job has a void promise ${p.key}`);
       const ops = await this.manyPresent<Operation>('operation', job.op_keys);
       if (new Set(job.op_keys).size !== job.op_keys.length) bad.push(`${job.id}: duplicate operation keys`);
       for (const o of ops) {
         if (o.key !== `${job.id}:${o.action}:${o.ref}`) bad.push(`${job.id}: operation ${o.key} does not match its action and ref`);
-        if (terminal && (o.outcome === 'in_flight' || o.outcome === 'unknown')) bad.push(`${job.id}: ${job.status} job with unresolved operation ${o.key}`);
+        if (terminal && o.outcome === 'in_flight') bad.push(`${job.id}: ${job.status} job with in-flight operation ${o.key}`);
+        if (job.status === 'done' && o.outcome === 'unknown') bad.push(`${job.id}: done job with unresolved operation ${o.key}`);
+        if (terminal && o.lease_taken) bad.push(`${job.id}: ${job.status} job still marks a lease taken for ${o.key}`);
         if (o.lease_taken && o.outcome !== 'in_flight' && o.outcome !== 'unknown') bad.push(`${job.id}: operation ${o.key} is ${o.outcome} but still marks a lease taken`);
         if (o.lease_taken && o.resource) {
           const lease = await this.get<Lease>('lease', o.resource);
@@ -1221,8 +1540,8 @@ export class Engine {
         }
       }
       for (const [thread, m] of Object.entries(job.claims)) {
-        const ti = await this.get<ThreadIndex>('thread_index', thread);
-        if (!ti?.claim || ti.claim.job !== job.id || ti.claim.milestone !== m) bad.push(`${job.id}: claim ${m} in ${thread} not reflected in the thread index`);
+        const c = await this.get<Claim>('claim', thread);
+        if (!c || c.state !== 'open' || c.job !== job.id || c.milestone !== m) bad.push(`${job.id}: claim ${m} in ${thread} not reflected in the claim record`);
       }
     }
     for (const [thread, n] of claimedByThread) if (n > 1) bad.push(`thread ${thread}: ${n} open claims`);
