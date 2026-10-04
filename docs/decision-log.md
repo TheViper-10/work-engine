@@ -128,7 +128,7 @@ All choices pick the option closest to L1 to L4: the engine records and wakes, T
 - R17 H5 lease release on cancel with unknowns: superseded by R22.
 - R20-R24 are recorded in full in `docs/job-home-contract.md` ("Implementation judgments locked with this direction").
 
-## R31. Deployment check configuration (owner decision, reversible config)
+## R31. Deployment check configuration (implementation judgment, reversible config)
 - Call: the pilot runs `build_changed`, `job_cancelled`, `superseded_run` as hold and `lease_held`, `sender_not_listed` as flag. The preset is `DEPLOY_CHECKS` in `src/config.ts` (the snap-in imports it); the harness takes `--checks deploy`. `--mode flag|hold` stays for the sim.
 - Evidence: phase-2 gate: the only safety failure that reached a real gate (wrong-build approval) occurred in flag mode and was prevented in hold mode.
 - Alternative: hold on all checks. Rejected for the pilot by the owner; a config edit changes it.
@@ -169,6 +169,24 @@ All choices pick the option closest to L1 to L4: the engine records and wakes, T
 ## R39. Platform store: per-write nonce decides who created a row
 - Call: live QA proof showed 20 concurrent creates of a byte-identical body collapse to one row with up to 19 x 201, so body equality cannot tell the winner. Every created row's body carries a per-write nonce `_w` (stripped on read). A create is "mine" only when the row read back has my nonce. A 500 "conflicted with an ongoing operation" re-reads the key: my nonce = won, another nonce = lost, absent = retry with bounded backoff, at most 3 times. The latest version per key is cached for one invocation (write-through on own writes, dropped after a lost CAS). The fake API mirrors both behaviours and 9 contract tests cover them. Top-level keys `_w` and `_wp` in a stored value are reserved and throw on write.
 - Alternative: compare bodies. Rejected by the evidence above.
+
+## R40. Idle ticks write nothing
+- Call: `sweep_cursor` is written only when it lags more than 12 buckets (1 hour); the per-tick `putIfAbsent` in `schedule()` is removed. Idle ticks write 0 rows (live QA install wrote about 1,440 a day).
+- Evidence: live S3 install e15290e4; offline repros `live defect 1`, `1b`.
+
+## R41. Wake failures back off; missing wake config is a config error
+- Call: failed wakes back off 1, 2, 4, 8, 16, 30 minutes with one `wake_failed` flag and one escalation naming the requester. Empty `wake_user`, `wake_workflow` or `tony_agent` is flagged once and rechecked hourly, never retried per tick. `dmmap: creating` is written only by a real attempt and recovered by the next.
+- Evidence: live install churned about 4.5 rows a minute with empty wake config; offline repros `live defect 2`, `2b`.
+
+## R42. Unchanged records are not rewritten
+- Call: `Engine.save()` skips a record whose content is unchanged; the waker writes `wake_attempt` once after the trigger. Interruption-boundary journey: 77 to 66 rows, asserted in `snap-in/test/e2e-offline.test.ts`.
+
+## R43. Operator close through an install input
+- Call: `Engine.adminClose(jobId, reason)` closes a job as cancelled, releases leases, posts and wakes nothing. Reachable only from the timer through the install input `admin_close_jobs` (`job-id=reason; ...`), which needs install rights. A hidden operation token was rejected: it would be a second credential on a surface Tony's skills can see.
+- Evidence: live scratch job could not be closed (conversation session cannot cancel; home never created).
+
+## R44. Row authorship is not checked
+- Call: rows written through the operation path are authored by the caller user, rows from the timer by the service account; the engine never checks the author, and deletes work for both (live cleanup deleted 79 mixed rows).
 
 ## R45. The home DM belongs to the owner token's user, created with the owner token
 - Call: the wake workflow (workflow/58) adds its comment as the user whose token triggered it, and errors with 403 if that user is not in the DM. So `ensureHome` resolves the owner token's user once through `dev-users.self` (cached per instance) and creates and hides the DM with that same token (`chats.create`, `chats.update`), not with the service account; `users: [<that user>]`. `wake_user` is only a cross-check (full id or short form): a mismatch is a `WakeConfigError` before any DM or `dmmap` row exists. A 401/403 from `dev-users.self`, `chats.*` or `workflows.trigger` is also a `WakeConfigError`. The engine treats `WakeConfigError` like the preflight config error (R41): one `escalate` flag naming the owner, no retry of the post, one recheck row an hour. Nothing is hardcoded: workflow id, user and agent are install inputs; the trigger fields stay `dm_id`, `continuation_note`, `receipt_key`. `WAKE_GRACE_MS` is 5 minutes (was 3): a reply arrived about 102 s after the comment and can take about 3 minutes, so a wake is not resent or called failed before 5. Repros: the four `R45` tests in `snap-in/test/waker.test.ts`; the e2e journey asserts the service account never creates the DM.
