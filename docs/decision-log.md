@@ -50,3 +50,8 @@ live in handoff file 28 §3 and are not repeated here. Each entry: the call, the
 - Call: run 4 start QA version set to 5.2.8; Harry's real v2.18 sign-off reply added to Q at 04:16:22Z. Other gap-fill answers (v2.18 timings, run 6 thread B) confirm what the scenarios already assume.
 - Evidence: `scenarios/gap-fill.md` (local run collector files under `tony-mock/runs/`; no API calls were made).
 - Parked: which run 6 pipeline id is number 395883 needs a CircleCI token, which `~/.zshrc` lacks. The replay does not depend on it.
+
+## R11. Engine core deviations accepted
+- `wake` on a job whose run is already active returns `run_active` and posts nothing (no twin wake). Faithful to "one work run per job" (L1).
+- An `intend` in flag mode on an ended job moves it back to `cancel_requested` until the outcome is reported, so no job is closed with an operation in flight. A flag records; it does not stop Tony, so the engine must keep the record honest.
+- `open_jobs` record lists open job ids for the "no job here" answer. Parked for phase 3: cap or bucket it, since it grows without bound.

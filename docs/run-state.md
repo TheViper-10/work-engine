@@ -11,7 +11,7 @@ Resume: read this file, then docs/decision-log.md, then handoff file 28.
 | P0-scen | scenarios from run 4, run 6, v2.18 (+6 variants) | done |
 | P0-play | playbook.md | done |
 | P0-review | docs/phase-0-review.md | done |
-| P1-core | engine core + memory store + six calls + lint | running (sonnet), contract docs/engine-design.md |
+| P1-core | engine core + memory store + six calls + lint | done: lint ok, 33 unit tests pass |
 | P1-sim | simulator: 1,000 random orders + named cases | pending |
 | P1-red | Opus red-team, fix confirmed | pending |
 | P2-harness | replay harness, real model via gateway | running (sonnet): world, driver, model loop, scorer; engine binding later |
@@ -25,4 +25,5 @@ Resume: read this file, then docs/decision-log.md, then handoff file 28.
 | P0-gapfill | fde-agent read-only: scenario fact gaps into scenarios/gap-fill.md | done (no API calls) |
 
 ## Parked
+- open_jobs record grows unbounded; cap or bucket in phase 3 (R11).
 - Run 6 pipeline id for number 395883 (needs CircleCI token; not needed for replay).
