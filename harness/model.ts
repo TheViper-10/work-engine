@@ -92,26 +92,6 @@ export class GatewayTony implements TonyModel {
   }
 }
 
-/**
- * Trivial scripted Tony for when the gateway is unreachable (D14): reads the briefing for the first
- * thread named in the trigger, then stops. It exercises the driver, not the playbook. The real-model
- * run is then recorded as parked.
- */
-export class ScriptedTony implements TonyModel {
-  readonly name = 'scripted';
-  readonly usage = { input_tokens: 0, output_tokens: 0, requests: 0 };
-  async send(req: TonyRequest): Promise<TonyResponse> {
-    this.usage.requests++;
-    const assistantTurns = req.messages.filter((m) => m.role === 'assistant').length;
-    const first = typeof req.messages[0]?.content === 'string' ? (req.messages[0]!.content as string) : '';
-    const thread = /thread (\w+)/.exec(first)?.[1];
-    if (assistantTurns === 0 && thread && req.tools.some((t) => t.name === 'job_view')) {
-      return { stop_reason: 'tool_use', content: [{ type: 'tool_use', id: 'toolu_scripted_1', name: 'job_view', input: { thread } }] };
-    }
-    return { stop_reason: 'end_turn', content: [{ type: 'text', text: 'Checked the briefing; nothing to do right now.' }] };
-  }
-}
-
 /** System prompt = playbook text + a short replay context. Nothing from expected_end or expected_checks. */
 export function buildSystemPrompt(playbook: string, sc: any, dmId: string): string {
   const threads = Object.entries<any>(sc.threads ?? {})

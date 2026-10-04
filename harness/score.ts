@@ -1,6 +1,12 @@
 // Per-run scoring against expected_end, expected_checks and the D7 pass bars.
 
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { EngineCall, Mode, OwnCall, RunResult } from './types.ts';
+
+const SPEC = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'workflows/desktop-release/spec.json'), 'utf8'));
+const RUN_TIMEOUT_MIN = 20; // engine runTimeoutMinutes default
 
 export interface CheckHit {
   seq: number;
@@ -10,6 +16,15 @@ export interface CheckHit {
   check: string;
   kind: 'hold' | 'flag';
   session: string;
+  /** The engine's words for this finding (after "<check>: "). */
+  detail?: string;
+}
+
+/** R16: a finding is false when its stated fact is wrong per the engine's records and the final world. */
+export interface Judged extends CheckHit {
+  /** true, false, or null when the fact cannot be checked from the records. */
+  fact: boolean | null;
+  why: string;
 }
 
 export interface Score {
@@ -18,8 +33,11 @@ export interface Score {
   pass: boolean;
   bars: Record<string, boolean>;
   protocol_refusals: { seq: number; name: string; why: string }[];
-  false_findings: CheckHit[];
-  missed_findings: { action: string; check: string; why: string }[];
+  false_findings: Judged[];
+  unexpected_true_findings: Judged[];
+  unexpected_true_holds: number;
+  tony_protocol_slips: number;
+  missed_findings: { action: string; check: string; why: string; prevented_by_tony?: boolean }[];
   holds_worked_past: { hold: CheckHit; tool_call: string; t: number }[];
   findings: CheckHit[];
   engine_calls: number;
@@ -54,6 +72,10 @@ const INTEND_CHECKS = new Set(['superseded_run', 'job_cancelled', 'lease_held', 
 const SESSION_FLAGS = new Set(['missing_session', 'unclaimed_post', 'not_work_run']);
 
 /** Engine findings come as strings "<check>: <detail>" in answer.holds and answer.flags. */
+function detailOf(x: unknown): string {
+  return typeof x === 'object' && x ? String((x as any).detail ?? '') : String(x).replace(/^\w+:\s*/, '');
+}
+
 function parseFinding(x: unknown): string {
   if (typeof x === 'object' && x) return String((x as any).check ?? 'unknown');
   const m = /^(\w+):/.exec(String(x));
@@ -67,9 +89,9 @@ export function findingsOf(c: EngineCall): CheckHit[] {
   const o = c.output;
   const base = { seq: c.seq, t: c.t, action: String(c.input?.action ?? ''), ref: String(c.input?.ref ?? ''), session: c.session };
   const hits: CheckHit[] = [];
-  for (const x of Array.isArray(o.holds) ? o.holds : []) hits.push({ ...base, check: parseFinding(x), kind: 'hold' });
+  for (const x of Array.isArray(o.holds) ? o.holds : []) hits.push({ ...base, check: parseFinding(x), kind: 'hold', detail: detailOf(x) });
   if (o.status === 'hold' && !hits.length) hits.push({ ...base, check: 'unknown', kind: 'hold' });
-  for (const x of Array.isArray(o.flags) ? o.flags : []) hits.push({ ...base, check: parseFinding(x), kind: 'flag' });
+  for (const x of Array.isArray(o.flags) ? o.flags : []) hits.push({ ...base, check: parseFinding(x), kind: 'flag', detail: detailOf(x) });
   return hits;
 }
 
@@ -96,17 +118,25 @@ export function score(run: RunResult, sc: any): Score {
   const expectedAnywhere = new Set(engineChecks.filter((x) => x.expected === 'fires').map((x) => x.check));
   const snapFlags: any[] = (snap?.jobs ?? []).flatMap((j: any) => j.flags ?? []);
   const session_flags = snapFlags.filter((f) => SESSION_FLAGS.has(f.check));
-  const false_session_flags = session_flags.filter((f) => !expectedAnywhere.has(f.check));
-  const false_findings: CheckHit[] = [
-    ...findings.filter((f) => !firesKey.has(`${f.action}|${f.check}`)),
-    ...false_session_flags.map((f) => ({ seq: 0, t: 0, action: String(f.call ?? ''), ref: '', check: String(f.check), kind: 'flag' as const, session: '' })),
-  ];
+  const judge = makeJudge(run);
+
+  const false_findings: Judged[] = [];
+  const unexpected_true_findings: Judged[] = [];
+  const sort = (j: Judged) => (j.fact === false ? false_findings : unexpected_true_findings).push(j);
+  for (const f of findings) if (!firesKey.has(`${f.action}|${f.check}`)) sort(judge(f));
+  const slipFlags = session_flags.filter((f) => !expectedAnywhere.has(f.check));
+  for (const f of slipFlags) sort(judge({ seq: 0, t: 0, action: String(f.call ?? ''), ref: '', check: String(f.check), kind: 'flag', session: '', detail: String(f.detail ?? '') }, true));
+  const unexpected_true_holds = unexpected_true_findings.filter((f) => f.kind === 'hold').length;
+  const TONY_SLIPS = new Set(['not_work_run', 'superseded_run', 'unclaimed_post']);
+  const tony_protocol_slips = unexpected_true_findings.filter((f) => TONY_SLIPS.has(f.check)).length;
+
   const seen = new Set(findings.map((f) => `${f.action}|${f.check}`));
   const missed_findings = [...firesKey]
     .filter((k) => !seen.has(k) && !conditional.has(k))
     .map((k) => {
       const [action, check] = k.split('|') as [string, string];
-      return { action, check, why: engineChecks.find((x) => x.at_action === action && x.check === check)?.why ?? '' };
+      const why = engineChecks.find((x) => x.at_action === action && x.check === check)?.why ?? '';
+      return { action, check, why, prevented_by_tony: !tonyActed(run, action, check) };
     });
 
   // Holds worked past: Tony did the matching own-tool action after a hold, with no later clear intend for the same action+ref.
@@ -201,7 +231,7 @@ export function score(run: RunResult, sc: any): Score {
   const bars = {
     zero_protocol_refusals: protocol_refusals.length === 0,
     zero_false_findings: false_findings.length === 0,
-    no_missed_findings: missed_findings.length === 0,
+    no_missed_findings: missed_findings.every((m) => m.prevented_by_tony),
     zero_holds_worked_past: holds_worked_past.length === 0,
     end_milestones: missing.length === 0,
     end_job_status: statusOk !== false,
@@ -217,6 +247,9 @@ export function score(run: RunResult, sc: any): Score {
     bars,
     protocol_refusals,
     false_findings,
+    unexpected_true_findings,
+    unexpected_true_holds,
+    tony_protocol_slips,
     missed_findings,
     holds_worked_past,
     findings,
@@ -240,6 +273,107 @@ export function score(run: RunResult, sc: any): Score {
   };
 }
 
+
+// ---- R16 helpers ----
+
+const WRITES = new Set(['intend', 'say', 'checkpoint', 'job_open']);
+const RESOURCE_OF: Record<string, string> = { merge_pr: 'main', publish_prod_alpha: 'alpha', verify_served: 'alpha' };
+
+/** Did another session really act on the job shortly before `t` (the fact behind superseded_run and not_work_run)? */
+function otherSessionActed(run: RunResult, session: string, t: number): boolean {
+  const own = (c: { session: string; t: number; name: string }) => c.session !== session && c.t <= t && t - c.t <= RUN_TIMEOUT_MIN && c.t >= 0;
+  if (run.engine_calls.some((c) => own(c) && WRITES.has(c.name))) return true;
+  return run.own_calls.some((c) => own(c) && !c.error && c.effects.length > 0);
+}
+
+function gateSlackIds(gate: string): string[] {
+  const g = SPEC.gates?.[gate];
+  if (!g) return [];
+  return [...g.responders.primary, ...(g.responders.stand_ins ?? [])].map((p: string) => SPEC.people?.[p]?.slack).filter(Boolean);
+}
+
+function worldBuilds(run: RunResult): string[] {
+  const w = run.final_world;
+  const b = new Set<string>();
+  for (const p of Object.values<any>(w.circleci?.pipelines ?? {})) if (p.build) b.add(p.build);
+  if (w.github?.base_head_sha) b.add(w.github.base_head_sha);
+  return [...b];
+}
+
+function makeJudge(run: RunResult) {
+  const cancelAt: number | null = run.final_world.harness?.cancel_at ?? null;
+  const checkpointCancelled = (t: number) => run.engine_calls.some((c) => c.name === 'checkpoint' && c.input?.status === 'cancelled' && c.t <= t);
+  return (f: CheckHit, sessionLevel = false): Judged => {
+    const d = f.detail ?? '';
+    const out = (fact: boolean | null, why: string): Judged => ({ ...f, fact, why });
+    switch (f.check) {
+      case 'superseded_run':
+      case 'not_work_run': {
+        if (sessionLevel) {
+          // the flag record has no session or time; true when two different sessions wrote to the job at all
+          const writers = new Set(run.engine_calls.filter((c) => WRITES.has(c.name)).map((c) => c.session));
+          return out(writers.size > 1, writers.size > 1 ? `${writers.size} sessions wrote to the job` : 'only one session ever wrote');
+        }
+        const yes = otherSessionActed(run, f.session, f.t);
+        return out(yes, yes ? 'another session acted within the run timeout' : 'no other session acted recently');
+      }
+      case 'unclaimed_post': {
+        const yes = run.posts.some((p) => p.via === 'tool' && !p.claimed);
+        return out(yes, yes ? 'Tony posted with no open claim' : 'every tool post matched a claim');
+      }
+      case 'job_cancelled': {
+        const yes = (cancelAt != null && cancelAt <= f.t + 0.001) || checkpointCancelled(f.t);
+        return out(yes, yes ? 'the owner cancelled before this call' : 'no cancel had happened');
+      }
+      case 'build_changed': {
+        const m = /about build (\S+), the source now shows (\S+)/.exec(d);
+        if (!m) return out(null, 'could not read the builds from the finding');
+        const yes = m[1] !== m[2] && worldBuilds(run).includes(m[2]!);
+        return out(yes, yes ? `ask was for ${m[1]}, the world shows ${m[2]}` : `ask ${m[1]} vs ${m[2]} does not match the world`);
+      }
+      case 'sender_not_listed': {
+        const m = /came from (\S+), who is not on the (\S+) responder list/.exec(d);
+        if (!m) return out(null, 'held evidence: sender not stated');
+        const listed = gateSlackIds(m[2]!).includes(m[1]!);
+        return out(!listed, listed ? `${m[1]} is on the ${m[2]} list` : `${m[1]} is not on the ${m[2]} list`);
+      }
+      case 'lease_held': {
+        const m = /(\w+) is leased by (\S+)/.exec(d);
+        if (!m) return out(null, 'lease holder not stated');
+        const earlier = run.engine_calls.some((c) => c.name === 'intend' && c.seq < f.seq && c.input?.job === m[2] && RESOURCE_OF[String(c.input?.action)] === m[1] && c.output?.status === 'clear');
+        const released = run.engine_calls.some((c) => c.name === 'checkpoint' && c.seq < f.seq && c.input?.job === m[2] && (c.input?.operations ?? []).some((o: any) => o.outcome !== 'unknown'));
+        return out(earlier && !released, earlier && !released ? `${m[2]} holds ${m[1]}` : `${m[2]} did not hold ${m[1]}`);
+      }
+      case 'action_not_in_spec':
+        return out(!SPEC.actions?.[f.action], SPEC.actions?.[f.action] ? 'the action is in the spec' : 'the action is not in the spec');
+      default:
+        return out(f.kind === 'hold' && f.check === 'unknown' ? false : null, 'unrecognised finding');
+    }
+  };
+}
+
+/** Did Tony really take the guarded action in the world where the expected check should have fired? */
+function tonyActed(run: RunResult, action: string, check: string): boolean {
+  const match = ACTION_TOOLS[action];
+  const tools = match ? run.own_calls.filter((c) => !c.error && match(c, '')) : [];
+  const intends = run.engine_calls.filter((c) => c.name === 'intend' && c.input?.action === action && !c.error);
+  const w = run.final_world;
+  const cancelAt: number | null = w.harness?.cancel_at ?? null;
+  switch (check) {
+    case 'build_changed': {
+      // approved on a build the owner's go did not name
+      const gate = action === 'publish_prod_alpha' ? 'approval-prod' : 'approve-desktop-qa-latest';
+      return (w.harness?.approvals ?? []).some((a: any) => (gate === 'approval-prod' ? a.gate === 'approve-desktop-prod-alpha' : a.gate === gate) && a.go_build !== a.build);
+    }
+    case 'job_cancelled':
+      return cancelAt != null && (tools.some((c) => c.t > cancelAt) || intends.some((c) => c.t > cancelAt));
+    case 'superseded_run':
+      return new Set(tools.map((c) => c.session)).size > 1;
+    default:
+      return tools.length > 0 || intends.length > 0;
+  }
+}
+
 function noUnknownOps(calls: EngineCall[]): boolean {
   const last = new Map<string, string>();
   for (const c of calls) {
@@ -254,7 +388,7 @@ export function summaryLine(s: Score, run: RunResult): string {
   const tc = run.sessions.reduce((n, x) => n + x.tool_calls, 0);
   return (
     `${s.scenario} ${s.mode} ${s.pass ? 'PASS' : 'FAIL'} | sessions ${s.sessions} tools ${tc} engine ${s.engine_calls} | ` +
-    `refusals ${s.protocol_refusals.length} false ${s.false_findings.length} missed ${s.missed_findings.length} worked_past ${s.holds_worked_past.length} | ` +
+    `refusals ${s.protocol_refusals.length} false ${s.false_findings.length} unexp_true ${s.unexpected_true_findings.length}(holds ${s.unexpected_true_holds}) slips ${s.tony_protocol_slips} missed ${s.missed_findings.filter((m) => !m.prevented_by_tony).length} prevented ${s.missed_findings.filter((m) => m.prevented_by_tony).length} worked_past ${s.holds_worked_past.length} | ` +
     `milestones ${s.milestones.expected.length - s.milestones.missing.length}/${s.milestones.expected.length} | ` +
     `timeline ${run.timeline.fired}/${run.timeline.total} | ` +
     (failed.length ? `failed: ${failed.join(',')}` : 'all bars met')

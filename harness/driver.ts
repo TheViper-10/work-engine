@@ -128,7 +128,7 @@ export class Driver {
       const p = this.sc.people?.[r.sender] ?? {};
       const senderId = ev?.sender ?? p.slack ?? r.sender;
       this.world.addMessage(r.thread, { user: senderId, name: p.name ?? r.sender, text: r.text, ts: r.slack_ts, bot: r.type === 'bot_post', tMin: this.now });
-      this.world.noteHumanMessage(r.thread, r.sender, r.text);
+      this.world.noteHumanMessage(r.thread, r.sender, r.text, this.now);
       desc.push(`${r.sender} in ${r.thread}: ${String(r.text).slice(0, 60)}`);
     } else if (r.type === 'timer') {
       await this.o.binding.timer?.(r.kind, this.nowMs(), r);

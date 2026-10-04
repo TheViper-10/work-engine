@@ -87,6 +87,8 @@ export interface OwnPost {
   milestone: string | null;
   /** Text heuristic (live / qa_ready) at post time, for relay posts too. Used only for the double-post bar. */
   text_milestone?: string | null;
+  /** An open say claim in the thread was consumed by this post. */
+  claimed?: boolean;
   /** The connector never emitted an event for this post (fault). */
   dropped: boolean;
 }

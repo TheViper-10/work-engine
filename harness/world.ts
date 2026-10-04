@@ -162,11 +162,18 @@ export class World {
   }
 
   /** A human message landed: derive the slack.* world paths scenarios use in `when`. */
-  noteHumanMessage(thread: string, senderKey: string, text: string): void {
+  noteHumanMessage(thread: string, senderKey: string, text: string, tMin = 0): void {
     const th = this.data.slack.threads[thread];
     if (senderKey === 'owner' && /^\s*go\b|\bgo ahead\b|have the go|is approved/i.test(text)) {
       th.has_owner_go_for_build = this.currentBuild();
+      this.lastGoBuild = this.currentBuild();
     }
+    if (senderKey === 'owner' && /\bcancel/i.test(text)) this.facts().cancel_at ??= tMin;
+  }
+  private lastGoBuild: string | null = null;
+  /** Scoring facts kept in the world data (harness only; Tony's tools never read this). */
+  private facts(): Json {
+    return (this.data.harness ??= { approvals: [], cancel_at: null });
   }
 
   private classifyPost(thread: string, text: string): string | null {
@@ -199,9 +206,10 @@ export class World {
     if (pw && /\bgo\b|\bQA\b|approve/i.test(text)) th.tony_asked_qa_go = true;
 
     // The connector matches any own post (tool or relayed final answer) to the thread's open claim, as the engine does.
-    const milestone = via === 'tool' ? (this.classifyPost(thread, text) ?? this.heuristicMilestone(text)) : this.classifyPost(thread, text);
+    const claimedMs = this.classifyPost(thread, text);
+    const milestone = via === 'tool' ? (claimedMs ?? this.heuristicMilestone(text)) : claimedMs;
     const dropped = this.dropFault(thread, milestone);
-    this.posts.push({ thread, ts, text, via, session: ctx.session, t: ctx.t, milestone, text_milestone: this.heuristicMilestone(text), dropped });
+    this.posts.push({ thread, ts, text, via, session: ctx.session, t: ctx.t, milestone, text_milestone: this.heuristicMilestone(text), claimed: claimedMs != null, dropped });
     const event: EngineEvent | null = dropped
       ? null
       : {
@@ -410,6 +418,7 @@ export class World {
         const all = Object.values<Json>(this.data.circleci.pipelines);
         const p = input.pipeline_id ? this.data.circleci.pipelines[input.pipeline_id] : all[all.length - 1];
         if (p?.jobs) p.jobs[input.gate] = { state: 'approved' };
+        this.facts().approvals.push({ gate: input.gate, build: p?.build ?? null, go_build: this.lastGoBuild, t: ctx.t, session: ctx.session });
         effects.push(`circleci.gates.${input.gate}.state=approved`);
         return { ok: true, gate: input.gate, state: 'approved', pipeline_id: p?.id ?? null };
       }
