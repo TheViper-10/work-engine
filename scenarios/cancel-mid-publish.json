@@ -538,7 +538,8 @@
       "prod_alpha_approved"
     ],
     "deliveries": {
-      "live": []
+      "live": [],
+      "cancel_notice": []
     },
     "max_live_posts_per_thread": 0,
     "no_unknown_operations": true,

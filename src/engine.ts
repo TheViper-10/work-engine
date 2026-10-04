@@ -990,6 +990,13 @@ export class Engine {
     const rel = await this.touchRun(job, ctx, 'adopted', true, true, own);
     this.ownerConfirmed(job);
     await this.sessionFlags(job, ctx, 'intend', rel, false);
+    if (spec?.actions && !act) {
+      // L1: recorded and answered, like an unknown milestone. No lease, no operation in flight, no clear: a name the spec does not have cannot dodge the checks.
+      const ids = Object.keys(spec.actions);
+      await this.addFlag(job, 'unknown_action', `intend named ${a.action}, which is not an action of this job; nothing recorded for it, no lease, nothing in flight`, 'intend');
+      await this.saveJob(job);
+      return ans(true, 'unknown_action', `unknown action ${a.action}; this job's actions are: ${ids.join(', ')}. Nothing was recorded as in flight and no lease was taken. Call intend again with one of those ids.`, { job: job.id, unknown_actions: [a.action], actions: ids });
+    }
     const extraFlags: string[] = [];
 
     const findings: Array<{ check: CheckName; detail: string; next: string }> = [];
@@ -1049,7 +1056,6 @@ export class Engine {
       if (mode === 'hold') { holds.push(text); nexts.push(f.next); } else { flags.push(text); }
       await this.addFlag(job, f.check, f.detail, 'intend', mode);
     }
-    if (!act && spec) flags.push(`action "${a.action}" is not in the workflow spec: no lease and no gate checks`);
 
     if (existing && sameOp) {
       // Same job, action and ref: the same operation back. Nothing new starts.

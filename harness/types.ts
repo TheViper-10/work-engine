@@ -33,7 +33,8 @@ export interface WakeMsg {
   job?: string;
 }
 
-export type Mode = 'flag' | 'hold';
+/** flag and hold set every check to that mode (sim). deploy is the pilot preset, DEPLOY_CHECKS in src/config.ts (R31). */
+export type Mode = 'flag' | 'hold' | 'deploy';
 
 export interface EngineBinding {
   readonly name: string;

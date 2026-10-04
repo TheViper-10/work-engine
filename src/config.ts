@@ -8,6 +8,18 @@ export const CHECK_NAMES: readonly CheckName[] = [
   'sender_not_listed',
 ];
 
+/**
+ * Decision R31: the pilot's check modes, in one place so the snap-in and the harness (`--checks deploy`) read the same set.
+ * Reversible config: change a value here, nothing else.
+ */
+export const DEPLOY_CHECKS: Readonly<Record<CheckName, CheckMode>> = {
+  build_changed: 'hold',
+  job_cancelled: 'hold',
+  superseded_run: 'hold',
+  lease_held: 'flag',
+  sender_not_listed: 'flag',
+};
+
 export interface EngineConfig {
   env: string;
   bot: string;

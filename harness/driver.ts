@@ -305,7 +305,7 @@ export class Driver {
       this.engineCalls.push({ seq: this.world.nextSeq(), t: this.now, session: s.rec.id, name, input, output, error, dm: s.rec.dm, home });
       if (name === 'say' && !error) {
         const st = String(output?.status ?? '');
-        if (!/already_sent|busy/i.test(st) && input?.thread && input?.milestone) this.world.noteClaim(String(input.thread), String(input.milestone));
+        if (st === 'go' && input?.thread && input?.milestone) this.world.noteClaim(String(input.thread), String(input.milestone));
       }
       return { content: JSON.stringify(output), isError: !!error };
     }

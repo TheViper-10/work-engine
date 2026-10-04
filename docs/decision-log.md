@@ -127,3 +127,27 @@ All choices pick the option closest to L1 to L4: the engine records and wakes, T
 - R15 (a mention session joins before acting) and D10 adoption: superseded by A1; mention sessions never act.
 - R17 H5 lease release on cancel with unknowns: superseded by R22.
 - R20-R24 are recorded in full in `docs/job-home-contract.md` ("Implementation judgments locked with this direction").
+
+## R31. Deployment check configuration (owner decision, reversible config)
+- Call: the pilot runs `build_changed`, `job_cancelled`, `superseded_run` as hold and `lease_held`, `sender_not_listed` as flag. The preset is `DEPLOY_CHECKS` in `src/config.ts` (the snap-in imports it); the harness takes `--checks deploy`. `--mode flag|hold` stays for the sim.
+- Evidence: phase-2 gate: the only safety failure that reached a real gate (wrong-build approval) occurred in flag mode and was prevented in hold mode.
+- Alternative: hold on all checks. Rejected for the pilot by the owner; a config edit changes it.
+
+## R32. A cancel outcome is its own milestone
+- Call: the desktop-release spec gains `cancel_notice` (audience request and qa, no promise holders). The playbook says to tell the cancel outcome once per thread owed under this id, never under `live`, also when the cancel came too late. The scenario bar "no live post after cancel" is kept; the honest outcome is a `cancel_notice`. Engine-generic, spec data only.
+- Evidence: `jh-real3-flag-3`: the home claimed its cancel message as `live`; run c: `cancel_notice` once in A and once in Q, no `live`.
+- Alternative: loosen the bar to allow one `live` post. Rejected: it would hide a mis-claimed milestone.
+
+## R33. Unknown action is recorded and answered, never cleared
+- Call: `intend` with an action not in the job's spec records flag `unknown_action`, takes no lease, creates no operation, and answers status `unknown_action` with "unknown action <x>; this job's actions are: <ids>" and the structured `actions` list. Same rule as unknown milestones (L1). Replaces the old `action_not_in_spec` flag with a `clear`.
+- Evidence: phase-2 hold run 2 approved the prod alpha gate via `approve_prod_alpha_gate`, evading every check.
+- Alternative: refuse with an error. Rejected (L1): recorded and answered.
+
+## R34. The interruption-boundary bar checks the designed property
+- Call: `boundaryHolds` counts only writes the engine applied from a mention session (`clear`, `go`, a checkpoint not recorded as a note). A non-home checkpoint recorded as a note, and a routed intend or say, are the boundary working.
+- Evidence: `jh-real3-flag-1` failed only this bar on a note-only checkpoint; rescored PASS on 12 of 12 bars.
+- Alternative: forbid non-home checkpoints in the playbook. Rejected: R30 makes them harmless notes and the engine routes them.
+
+## R35. Harness claim attribution counts only `go`
+- Call: the driver registers a claim for a `say` only when the engine answered `go`. A `route`, `busy`, `already_sent` or hold is not a claim, so a relayed reply to a mention is not an announcement.
+- Evidence: round 4 run a: cancel-mid-publish and stale-go showed a double count caused by a routed `say` from a non-home session. Pre-correction result kept in the Round 4 table.

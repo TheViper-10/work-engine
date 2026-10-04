@@ -302,7 +302,17 @@ export function notHomeActions(calls: EngineCall[]): string[] {
 /** interruption-boundary: the asker was answered in its own thread by a mention session that only read, and the home was never replaced. */
 function boundaryHolds(run: RunResult, b: { answered_in: string; mention_session_actions: number }): boolean {
   const mention = new Set(run.sessions.filter((x) => x.trigger.kind === 'mention').map((x) => x.id));
-  const actions = run.engine_calls.filter((c) => mention.has(c.session) && ['intend', 'checkpoint', 'say'].includes(c.name)).length;
+  // The designed property is "no non-home write applied" (A1, R30). A non-home checkpoint is recorded as a note and a non-home
+  // intend or say is routed; those are the boundary working. Only a write the engine applied counts (R32).
+  const applied = (c: EngineCall) => {
+    const st = String(c.output?.status ?? '');
+    if (c.error || !c.output || typeof c.output !== 'object') return false;
+    if (c.name === 'intend') return st === 'clear';
+    if (c.name === 'say') return st === 'go';
+    if (c.name === 'checkpoint') return c.output.ok !== false && !['route', 'superseded', 'hold'].includes(st) && !/Recorded as a note|not in the job home|not applied/i.test(String(c.output.say_to_tony ?? ''));
+    return false;
+  };
+  const actions = run.engine_calls.filter((c) => mention.has(c.session) && ['intend', 'checkpoint', 'say'].includes(c.name) && applied(c)).length;
   const answered = run.posts.some((p) => p.thread === b.answered_in && mention.has(p.session) && p.text.trim() && !p.dropped);
   const jobs: any[] = run.engine_snapshot?.jobs ?? [];
   const replaced = jobs.some((j) => (j.generation ?? 1) > 1);

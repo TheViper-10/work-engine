@@ -60,6 +60,10 @@
     "live": {
       "audience": { "roles": ["request", "qa"], "promise_holders": true },
       "notes": "The version is live on prod alpha and the served revision was read from the update server. One message per audience thread. Audience: 28-handoff-work-engine-build.md section 3 D3 (request thread, every thread with a promise for live, and the QA thread). Source: 22-tony-coordinator-call-map.md:298-312 (moments 9 and 10; run 6 posted twice and missed B)."
+    },
+    "cancel_notice": {
+      "audience": { "roles": ["request", "qa"], "promise_holders": false },
+      "notes": "The owner cancelled and the outcome is known from the live source: stopped before the publish, or the publish had already completed and prod alpha serves the version. One message per audience thread tells that outcome. It is its own milestone so a late cancel is never announced as live (R32)."
     }
   },
   "actions": {

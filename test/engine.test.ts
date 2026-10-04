@@ -817,3 +817,24 @@ test('checkpoint reached given as a single string is read as one id, not a failu
   const cp2 = await e.engine.checkpoint({ job, status: 'working', reached: 'bogus' as unknown as string[] }, S1);
   assert.deepEqual(cp2.unknown_milestones, ['bogus']);
 });
+
+test('unknown action: intend records it, takes no lease, puts nothing in flight, never answers clear, and lists the spec actions', async () => {
+  const e = setup();
+  const job = await open(e);
+  const ids = Object.keys((SPEC as any).actions);
+  const r = await e.engine.intend({ job, action: 'approve_prod_alpha_gate', ref: 'x1' }, S1);
+  assert.equal(r.ok, true);
+  assert.equal(r.status, 'unknown_action');
+  assert.notEqual(r.status, 'clear');
+  assert.deepEqual(r.actions, ids);
+  assert.deepEqual(r.unknown_actions, ['approve_prod_alpha_gate']);
+  assert.match(r.say_to_tony, new RegExp(`unknown action approve_prod_alpha_gate; this job's actions are: ${ids.join(', ')}`));
+  const v = await e.engine.jobView({ job }, S1);
+  const j = (v.jobs as any[])[0];
+  assert.deepEqual(j.operations ?? [], [], 'no operation in flight');
+  assert.ok(flagsOf(v).includes('unknown_action'));
+  assert.equal(await e.store.get<any>(makeKey('test', 'bot', 'operation', `${job}:approve_prod_alpha_gate:x1`)), null);
+  // a real action still works afterwards
+  assert.equal((await e.engine.intend({ job, action: 'a4', ref: 'x' }, S1)).status, 'clear');
+  await ok(e, [job]);
+});

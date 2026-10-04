@@ -3,7 +3,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { ManualClock } from '../src/clock.ts';
-import { defineConfig } from '../src/config.ts';
+import { DEPLOY_CHECKS, defineConfig } from '../src/config.ts';
 import { Engine } from '../src/engine.ts';
 import { FakeSessionDirectory } from '../src/session-directory.ts';
 import { makeKey, MemoryStore } from '../src/store.ts';
@@ -113,7 +113,7 @@ export class RealEngineBinding implements EngineBinding {
     // A1: a real directory, not the homeForAllSessions default. The driver registers each session's DM when it starts.
     this.directory = new FakeSessionDirectory();
     for (const [sid, dm] of this.registered) this.directory.set(sid, dm);
-    const checks = Object.fromEntries(['superseded_run', 'job_cancelled', 'lease_held', 'build_changed', 'sender_not_listed'].map((c) => [c, this.mode]));
+    const checks = this.mode === 'deploy' ? { ...DEPLOY_CHECKS } : Object.fromEntries(['superseded_run', 'job_cancelled', 'lease_held', 'build_changed', 'sender_not_listed'].map((c) => [c, this.mode]));
     this.engine = new Engine({
       store: this.store,
       clock: this.clock,

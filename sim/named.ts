@@ -362,6 +362,19 @@ const cases: Array<[string, (mode: Mode) => Promise<void>]> = [
     await settle(w);
   }],
 
+  ['unknown-action-not-cleared', async (mode) => {
+    const w = home(mode);
+    await open(w, 'h1', 'A');
+    const r = await w.api('intend', { job: J, action: 'approve_prod_alpha_gate', ref: 'b1' }, 'h1');
+    assert.equal(r.status, 'unknown_action');
+    assert.ok(Array.isArray(r.actions) && r.actions.includes('publish_prod_alpha'));
+    assert.match(r.say_to_tony, /unknown action approve_prod_alpha_gate; this job's actions are: /);
+    const v = await view(w, { job: J }, 'h1');
+    assert.equal(v.operations.length, 0);
+    assert.ok(v.flags.some((f: any) => f.check === 'unknown_action'));
+    await settle(w);
+  }],
+
   ['ib-cancel-unknown', async (mode) => {
     const w = home(mode);
     await open(w, 'h1', 'A');

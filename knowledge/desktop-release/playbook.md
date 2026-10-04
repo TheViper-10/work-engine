@@ -46,6 +46,10 @@ A fact you have not read in this session is not a fact.
   matters to them (the build changed since the go, a stand-in approved).
 - The owner may cancel at any time; listed stand-ins may too. After a cancel, start nothing new;
   settle anything uncertain from the live source and tell the requester the honest outcome.
+  Tell that outcome once per thread owed, and claim it as `cancel_notice`, never as `live`, also
+  when the cancel came too late and the publish had already finished (say so plainly). `live` is
+  only for a release nobody cancelled. Claim and post it before the final `checkpoint(cancelled)`:
+  once the job is cancelled the engine takes no new claims.
 - Evidence from a private thread stays there. Tell other threads only milestones, from public
   facts. The sign-off ask goes only in the QA thread, never in the request thread or any other.
 
@@ -58,7 +62,7 @@ records nothing for any other name.
   Milestones `pr_approved`, then `merged`. Done: merge commit known; the pipeline built from it identified.
 - QA decision. Judge any Playwright failure from the evidence on this pipeline and earlier ones
   (flake, test or product problem; hand deep triage to the Playwright triage skill). Report it and
-  ask the owner once per build for the QA go.
+  ask the owner once per build for the QA go, naming the build in the ask.
   Milestone `qa_go_requested`. Done: the QA hold approved for this build after a go for this build, or the owner told what
   blocks it.
 - QA ready. Depends on the QA approval. Milestone `qa_ready`. Done: the update server's QA channel serves the version.
@@ -67,6 +71,13 @@ records nothing for any other name.
   stand-in, for this build.
 - Live. Approve the prod alpha hold after sign-off. Milestone `live`. Done: the update server's prod alpha channel
   serves the version.
+- Before you post a claimed message, read the latest messages in that thread. If the same news is
+  already there (for example another session's reply), confirm it with `say` and the post link
+  instead of posting again.
+- If `say` answers `busy` (another claim is open in that thread), post nothing there yet: never
+  fold the message into a post claimed for another milestone. Do other work and `say` again.
+  A `build_changed` hold means: the build moved since the go. Ask the responders again for the
+  new build (claim and post the ask, naming the build), wait for that go, then `intend` again.
 - Everyone owed is told once, in their own thread: the request thread, every thread that asked to
   be told, and for live also the QA thread. The briefing lists who is still owed.
 - Release issue completed. Done: the issue is in its completed state.

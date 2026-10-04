@@ -1,4 +1,4 @@
-// CLI: npx tsx harness/run.ts --scenario <id|all> --mode flag|hold --runs N --binding stub|engine --tony model|scripted [--playbook <path>] [--reference <path>[,<path>]] --out harness/out/<stamp>
+// CLI: npx tsx harness/run.ts --scenario <id|all> --mode flag|hold | --checks deploy --runs N --binding stub|engine --tony model|scripted [--playbook <path>] [--reference <path>[,<path>]] --out harness/out/<stamp>
 import { createHash } from 'node:crypto';
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, relative, resolve } from 'node:path';
@@ -32,7 +32,8 @@ function makeBinding(kind: string, guidanceVersion?: string): EngineBinding {
 async function main() {
   const a = args();
   const scenario = a.scenario ?? 'v2-18';
-  const modes: Mode[] = a.mode === 'both' ? ['flag', 'hold'] : [((a.mode ?? 'flag') as Mode)];
+  if (a.checks && a.checks !== 'deploy') throw new Error(`unknown --checks ${a.checks} (only: deploy)`);
+  const modes: Mode[] = a.checks === 'deploy' ? ['deploy'] : a.mode === 'both' ? ['flag', 'hold'] : [((a.mode ?? 'flag') as Mode)];
   const runs = Number(a.runs ?? 1);
   const bindingKind = a.binding ?? 'stub';
   const tonyKind = a.tony ?? 'model';
