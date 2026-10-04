@@ -31,3 +31,9 @@ Resume: read this file, then docs/decision-log.md, then handoff file 28.
 - Compare-and-set on the platform store (R17): phase 3 proof.
 - open_jobs record grows unbounded; cap or bucket in phase 3 (R11).
 - Run 6 pipeline id for number 395883 (needs CircleCI token; not needed for replay).
+
+## Owner redirect (2026-10-04 evening): review before further building
+- Owner proposed one job, one execution DM, and a goal-oriented playbook. Asked to stop for review before implementing or publishing.
+- Delivered for review (all under docs/proposals/): one-dm-per-job-review.md, platform-dm-evidence.md (fde-agent, read-only), fde-skill-method-review.md (fde-agent), playbook-goal-oriented.md, engine-contract-reference.md, agent-guidance-replay.md, playbook-comparison.md (A/B results).
+- Red-team fixes paused on branch redteam-fixes (28/28 repros clear; 6 named sim cases and lint failing). Not merged.
+- Not done: phase 2 10-in-a-row under flag and hold; report 29. Both wait on the owner's architecture decision.

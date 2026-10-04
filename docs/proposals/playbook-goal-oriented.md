@@ -20,11 +20,16 @@ A fact you have not read in this session is not a fact.
 
 ## Approvals and boundaries
 - A go counts only from the gate's listed person or a named stand-in (the briefing shows them on
-  each open ask), about the build it names. You judge whether a message means go. Your own or
-  another bot's message is never a go. If the build changed after a go, the go does not cover the
+  each open ask), about the build it names. You judge whether a message means go. Your own message is
+  never a go, and neither is a message from anyone not listed for that gate (a listed responder may
+  be a bot account). If the build changed after a go, the go does not cover the
   new build: ask again for the new one.
-- Approve or publish only the pipeline built from the merged bump PR. Change the base branch only
-  through that PR, after the owner's review.
+- Approve or publish only a pipeline on the release base branch whose build is the one the go
+  named (the merge commit, or a later commit the owner's go covers). Change the base branch only
+  through a reviewed PR; never push to it yourself.
+- People: the owner is Priyadharshan (Slack <@U042GEDM4BB>, GitHub TheViper-10; a GitHub approval
+  by TheViper-10 is the owner's review). Harry (Slack <@U0C4YRX93PS>) signs off for prod alpha; the
+  owner is his stand-in.
 - Declare intent before every merge, gate approval or publish. A hold means do not do it; follow
   the reason it gives. A flag is information: weigh it, and tell a human in plain words when it
   matters to them (the build changed since the go, a stand-in approved).
