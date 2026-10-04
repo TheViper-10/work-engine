@@ -149,6 +149,11 @@ export class World {
     if (this.claims.some((c) => !c.consumed && c.thread === thread && c.milestone === milestone)) return;
     this.claims.push({ thread, milestone, consumed: false });
   }
+  /** The engine cleared this claim (a post was reported with posted_link): the harness claim is consumed too, so it cannot attribute a later post. */
+  settleClaim(thread: string, milestone: string): void {
+    const c = this.claims.find((x) => !x.consumed && x.thread === thread && x.milestone === milestone);
+    if (c) c.consumed = true;
+  }
   openClaims(thread: string): string[] {
     return this.claims.filter((c) => c.thread === thread && !c.consumed).map((c) => c.milestone);
   }
@@ -224,7 +229,9 @@ export class World {
           sender_id: this.tonySlack,
           sender_kind: 'own_bot',
           ref: `slack:${this.channel}:${ts}`,
-          attrs: { mentions_tony: false, via },
+          // The connector reports the post time and link, as the snap-in's Slack poller does (attrs.ts, in ms). Without them the engine
+          // answers "carried no timestamp; not matched" and only posted_link settles the claim (R38).
+          attrs: { mentions_tony: false, via, ts: EPOCH_MS + ctx.t * 60000, link: `slack:${this.channel}:${ts}` },
           at: EPOCH_MS + ctx.t * 60000,
         };
     return { ts, event };

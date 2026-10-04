@@ -90,6 +90,7 @@ that says what was recorded and what is missing.
 | `job_cancelled` | the job is cancelled or cancel requested |
 | `lease_held` | the action's spec resource is leased by another job |
 | `build_changed` | the action's gate has an answered or open ask for build X and a fresh read says the build is now Y |
+| `no_go_for_build` | the action names a gate, the gate has no live ask (none opened, or the last is stale), and a fresh read gives build B: "no go recorded for build B on <gate>; ask <responders> for build B". A failed read never holds (flag `source_unreadable`). Flag by default; `DEPLOY_CHECKS` holds it (R36) |
 | `sender_not_listed` | `because` names an event whose sender is not on the ask's responder list |
 
 `missing_session` is a flag only and never configurable to hold (D1).
@@ -132,5 +133,5 @@ Milestone audience (D3): the request thread plus promise holders unless the spec
 - `Store`: `get(key)`, `getMany(keys)` (at most 100), `putIfAbsent(key, value)`, `put(key, value)`.
 - `SourceReader`: `currentBuild(job, gate)` (fresh read of the outside system, a fake in phases 1 and 2).
 - `SlackReader`: `findOwnPostAfter(thread, ts)`.
-- `Waker`: `postWake(dm, text)`.
+- `Waker`: `postWake(dm, text, key)`. `key` is the run id for a wake, or run id plus `:n<seq>` for a notice into an active home (R37); the same key is sent at most once whatever the text.
 - `Clock`: injected `now`.

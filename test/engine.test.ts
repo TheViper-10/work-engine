@@ -838,3 +838,63 @@ test('unknown action: intend records it, takes no lease, puts nothing in flight,
   assert.equal((await e.engine.intend({ job, action: 'a4', ref: 'x' }, S1)).status, 'clear');
   await ok(e, [job]);
 });
+
+// ---------------------------------------------------------------- R36 no_go_for_build, R37 keyed wakes
+
+for (const mode of ['flag', 'hold'] as const) {
+  test(`no_go_for_build under ${mode}: a gated intend with no ask on the gate`, async () => {
+    const e = setup({ no_go_for_build: mode });
+    const job = await open(e);
+    const r = await e.engine.intend({ job, action: 'a1', ref: 'pr1' }, S1);
+    assert.equal(r.status, mode === 'hold' ? 'hold' : 'clear');
+    assert.match(r.say_to_tony, /no_go_for_build/);
+    assert.match(r.say_to_tony, /no go recorded for build b1 on g1; ask p1, p2 for build b1/);
+    if (mode === 'hold') assert.equal((r.operation as any).lease_taken, false);
+    const v = (await e.engine.jobView({ job }, S1)).jobs as any[];
+    assert.ok(v[0].flags.some((f: any) => f.check === 'no_go_for_build'));
+    // asking (say) opens the ask for the build; the retry no longer fires
+    await e.engine.say({ job, thread: 'A', milestone: 'm1' }, S1);
+    const again = await e.engine.intend({ job, action: 'a1', ref: mode === 'hold' ? 'pr1' : 'pr2' }, S1);
+    assert.doesNotMatch(again.say_to_tony, /no_go_for_build/);
+    await ok(e, [job]);
+  });
+}
+
+test('no_go_for_build: an action with no gate, and a failed source read, never hold', async () => {
+  const e = setup({ no_go_for_build: 'hold' });
+  const job = await open(e);
+  const free = await e.engine.intend({ job, action: 'a4', ref: 'x' }, S1);
+  assert.equal(free.status, 'clear');
+  assert.doesNotMatch(free.say_to_tony, /no_go_for_build/);
+  e.builds.g1 = null;
+  const r = await e.engine.intend({ job, action: 'a1', ref: 'pr9' }, S1);
+  assert.equal(r.status, 'clear');
+  assert.doesNotMatch(r.say_to_tony, /no_go_for_build/);
+  const v = (await e.engine.jobView({ job }, S1)).jobs as any[];
+  assert.ok(v[0].flags.some((f: any) => f.check === 'source_unreadable'));
+  assert.ok(!v[0].flags.some((f: any) => f.check === 'no_go_for_build'));
+});
+
+test('no_go_for_build is a flag by default and is one of the deploy holds', async () => {
+  assert.equal(defineConfig({ env: 't', bot: 'b', ownBotUserId: BOT }).checks.no_go_for_build, 'flag');
+  const { DEPLOY_CHECKS } = await import('../src/config.ts');
+  assert.equal(DEPLOY_CHECKS.no_go_for_build, 'hold');
+});
+
+test('postWake carries a key: the run id for a wake, run id plus a notice sequence for notices', async () => {
+  const keys: string[] = [];
+  const e = setup();
+  (e.engine as any).waker.postWake = async (_dm: string, text: string, key: string) => { keys.push(`${/notice/.test(text) ? 'notice' : 'wake'}:${key}`); };
+  const job = await open(e);
+  e.clock.advanceMinutes(45);
+  await e.engine.wake(job, 'timer');
+  assert.deepEqual(keys, [`wake:${job}:2`]);
+  await e.engine.intend({ job, action: 'a4', ref: 'bind' }, S1); // the first write binds the pending run
+  await e.engine.ingest({ source: 'slack', delivery_id: 'n1', kind: 'message', thread: 'A', sender_id: 'U9' });
+  e.clock.advanceMinutes(3);
+  await e.engine.ingest({ source: 'slack', delivery_id: 'n2', kind: 'message', thread: 'A', sender_id: 'U9' });
+  const notices = keys.filter((k) => k.startsWith('notice:'));
+  assert.ok(notices.length >= 1, 'a notice was sent: ' + keys.join(','));
+  assert.equal(new Set(notices).size, notices.length, 'each notice has its own key');
+  assert.ok(notices.every((k) => k.startsWith(`notice:${job}:2:n`)), notices.join(','));
+});

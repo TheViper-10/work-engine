@@ -456,8 +456,9 @@ export class Engine {
       if (!cr!.session_id) return false; // a wake run nobody has bound yet will read the inbox in its first view
       if (job.inbox_notice_at !== null && now - job.inbox_notice_at < this.config.noticeCoalesceMinutes * MIN) return false;
       job.inbox_notice_at = now;
+      job.notice_seq = (job.notice_seq ?? 0) + 1;
       const n = this.unprocessed(await this.inboxItems(job)).length;
-      try { await this.waker.postWake(job.dm_id, `Work engine notice for job ${job.id}: new input: ${n} item(s); read job_view.`); } catch { /* the item and the wake reason stay; the next wake carries them */ }
+      try { await this.waker.postWake(job.dm_id, `Work engine notice for job ${job.id}: new input: ${n} item(s); read job_view.`, `${cr!.id}:n${job.notice_seq}`); } catch { /* the item and the wake reason stay; the next wake carries them */ }
       return true;
     }
     job.next_wake_at = Math.min(job.next_wake_at ?? now, now);
@@ -1016,12 +1017,19 @@ export class Engine {
     if (act?.gate) {
       const askKey = job.latest_ask[act.gate];
       const ask = askKey ? await this.get<Ask>('ask', askKey) : null;
-      if (ask && ask.state !== 'stale' && ask.build !== 'unknown') {
+      const live = ask && ask.state !== 'stale' ? ask : null;
+      if (!live || live.build !== 'unknown') {
+        // One fresh read serves both checks. A failed read never holds (H7): it is a flag, as for build_changed.
         const fresh = await this.readBuild(job, act.gate);
         if (fresh === null) {
-          await this.addFlag(job, 'source_unreadable', `could not read the current build for ${act.gate} at intend time; build_changed was not checked`, 'intend');
-        } else if (fresh !== ask.build) {
-          findings.push({ check: 'build_changed', detail: `the ask for ${act.gate} was about build ${ask.build}, the source now shows ${fresh}`, next: `Ask the responders again for build ${fresh} (call say for the milestone that asks), then call intend again.` });
+          await this.addFlag(job, 'source_unreadable', `could not read the current build for ${act.gate} at intend time; ${live ? 'build_changed' : 'no_go_for_build'} was not checked`, 'intend');
+        } else if (live && fresh !== live.build) {
+          findings.push({ check: 'build_changed', detail: `the ask for ${act.gate} was about build ${live.build}, the source now shows ${fresh}`, next: `Ask the responders again for build ${fresh} (call say for the milestone that asks), then call intend again.` });
+        } else if (!live) {
+          // No ask on the gate at all: no go can be on record for this build, and build_changed has nothing to compare.
+          const gr = spec?.gates?.[act.gate]?.responders;
+          const who = gr ? uniq([...gr.primary, ...(gr.stand_ins ?? [])]).join(', ') : 'the gate responders';
+          findings.push({ check: 'no_go_for_build', detail: `no go recorded for build ${fresh} on ${act.gate}; ask ${who} for build ${fresh}`, next: `Claim and post the ask for ${act.gate} naming build ${fresh} (call say for the milestone that asks), wait for the go, then call intend again.` });
         }
       }
       if (a.because) {
@@ -2044,7 +2052,7 @@ export class Engine {
     const text = `Work engine wake for job ${job.id}${job.generation > 1 ? ` (home generation ${job.generation})` : ''}: ${reason}. Call job_view first, then carry on. If you do nothing, the engine wakes you again at ${new Date(job.next_wake_at).toISOString()}.`;
     let posted: void | { stale_version?: boolean };
     try {
-      posted = await this.waker.postWake(job.dm_id, text);
+      posted = await this.waker.postWake(job.dm_id, text, run.id);
     } catch (e) {
       // The reasons were kept, so the retry wake still says why.
       const bad = await this.get<Run>('run', run.id);

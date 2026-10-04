@@ -151,3 +151,21 @@ All choices pick the option closest to L1 to L4: the engine records and wakes, T
 ## R35. Harness claim attribution counts only `go`
 - Call: the driver registers a claim for a `say` only when the engine answered `go`. A `route`, `busy`, `already_sent` or hold is not a claim, so a relayed reply to a mention is not an announcement.
 - Evidence: round 4 run a: cancel-mid-publish and stale-go showed a double count caused by a routed `say` from a non-home session. Pre-correction result kept in the Round 4 table.
+
+## R36. A gated intend with no ask on the gate: `no_go_for_build`
+- Call: new check `no_go_for_build` (configurable like the others, flag by default, hold in `DEPLOY_CHECKS`). When the action's spec names a gate and the gate has no live ask (none opened, or the latest is stale), one fresh `SourceReader` read gives build B and the answer says "no go recorded for build B on <gate>; ask <responders> for build B". `build_changed` keeps the case of an ask for another build. A failed read never holds: flag `source_unreadable` (R17 H7). An ask opened with an unreadable build ("unknown") is skipped as before. The general sim and red-team worlds keep this check as a flag because many of their cases intend a gated action with no ask on purpose; the named case `no-go-for-build` runs it as hold and flag.
+- Evidence: phase-2 round 4 run a: QA approved for build def on a go about abc, because no ask existed so `build_changed` could not fire.
+- Alternative: open the ask inside `intend`. Rejected: the engine would then claim an ask nobody posted (L2).
+
+## R37. Waker key: exactly-once wake by run id
+- Call: `Waker.postWake(dm, text, key)`. Key = the run id for a wake, `<run id>:n<seq>` for a notice (the job carries `notice_seq`). The snap-in waker keys its `wake_attempt` row on sha(dm|key), reads the timeline back for the first text sent under the key, and never resends while that text is visible; the sha(dm|text) key and the per-DM pending record are removed. A retry with a re-timed text and the same key sends once.
+- Alternative: keep the text hash. Rejected: the wake text embeds a timestamp, which forced the per-DM workaround.
+
+## R38. Harness: a repeat `go` and a connector post without time are not new claims
+- Call: (a) the driver registers a claim only on a fresh `go` (`repeat` false) and settles it when the engine answers `confirmed` for the same thread and milestone; (b) the harness connector event for Tony's own post now carries `ts` and `link`, as the snap-in's poller does. Evaluation defect, not an engine or playbook defect.
+- Evidence: see Round 5 in `docs/phase2-gate-results.md`. Without `ts` the engine cannot match the post to the claim ("carried no timestamp; not matched"), the model is told to say again with posted_link, the repeat `go` registered a second harness claim, and the next post in the thread was attributed to it.
+
+
+## R39. Platform store: per-write nonce decides who created a row
+- Call: live QA proof showed 20 concurrent creates of a byte-identical body collapse to one row with up to 19 x 201, so body equality cannot tell the winner. Every created row's body carries a per-write nonce `_w` (stripped on read). A create is "mine" only when the row read back has my nonce. A 500 "conflicted with an ongoing operation" re-reads the key: my nonce = won, another nonce = lost, absent = retry with bounded backoff, at most 3 times. The latest version per key is cached for one invocation (write-through on own writes, dropped after a lost CAS). The fake API mirrors both behaviours and 9 contract tests cover them. Top-level keys `_w` and `_wp` in a stored value are reserved and throw on write.
+- Alternative: compare bodies. Rejected by the evidence above.

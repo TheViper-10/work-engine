@@ -68,7 +68,7 @@ const ACTION_TOOLS: Record<string, (c: OwnCall, ref: string) => boolean> = {
   complete_release_issue: (c) => c.name === 'devrev_issue_complete',
 };
 
-const INTEND_CHECKS = new Set(['superseded_run', 'job_cancelled', 'lease_held', 'build_changed', 'sender_not_listed']);
+const INTEND_CHECKS = new Set(['superseded_run', 'job_cancelled', 'lease_held', 'build_changed', 'no_go_for_build', 'sender_not_listed']);
 /** Engine flags that are not intend checks: counted from the engine's final flag records, not from an intend answer. */
 const SESSION_FLAGS = new Set(['missing_session', 'unclaimed_post', 'not_work_run']);
 

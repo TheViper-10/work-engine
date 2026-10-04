@@ -81,6 +81,44 @@ const cases: Array<[string, (mode: Mode) => Promise<void>]> = [
     await settle(w);
   }],
 
+  ['no-go-for-build', async (mode) => {
+    // A gated intend with no ask on the gate: build_changed cannot fire. no_go_for_build holds (hold config) or flags.
+    for (const noGo of (mode === 'hold' ? ['hold', 'flag'] : ['flag']) as Array<'hold' | 'flag'>) {
+      const w = new World(mode, 2, {}, noGo);
+      await open(w);
+      w.builds[QA_GATE] = 'abc';
+      const r = await w.api('intend', { job: J, action: 'approve_qa_gate', ref: 'pipeline-1' }, 's1');
+      assert.match(r.say_to_tony, /no_go_for_build/);
+      assert.match(r.say_to_tony, /no go recorded for build abc on approve-desktop-qa-latest; ask owner for build abc/);
+      if (noGo === 'hold') {
+        assert.equal(r.status, 'hold');
+        assert.equal((r.operation as any).lease_taken, false);
+        // the ask is claimed and posted for build abc, then the retry is clear
+        const sy = await w.api('say', { job: J, thread: 'A', milestone: 'qa_go_requested' }, 's1');
+        assert.equal(sy.status, 'go');
+        assert.match(sy.say_to_tony, /build abc/);
+        const r2 = await w.api('intend', { job: J, action: 'approve_qa_gate', ref: 'pipeline-1' }, 's1');
+        assert.equal(r2.status, 'clear');
+        assert.doesNotMatch(r2.say_to_tony, /no_go_for_build/);
+      } else {
+        assert.equal(r.status, 'clear');
+      }
+      const v = await view(w, { job: J });
+      assert.ok(v.flags.some((f: any) => f.check === 'no_go_for_build'), 'no_go_for_build recorded');
+      await settle(w);
+    }
+    // A failed source read never holds: source_unreadable is flagged instead (H7).
+    const w2 = new World(mode, 2, {}, mode);
+    await open(w2);
+    w2.sourceFail = true;
+    const r3 = await w2.api('intend', { job: J, action: 'approve_qa_gate', ref: 'pipeline-2' }, 's1');
+    assert.equal(r3.status, 'clear');
+    const v2 = await view(w2, { job: J });
+    assert.ok(v2.flags.some((f: any) => f.check === 'source_unreadable'));
+    assert.ok(!v2.flags.some((f: any) => f.check === 'no_go_for_build'));
+    await settle(w2);
+  }],
+
   ['cancel mid-publish', async (mode) => {
     const w = new World(mode);
     await open(w);

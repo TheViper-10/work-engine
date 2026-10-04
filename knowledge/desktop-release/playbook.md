@@ -78,6 +78,8 @@ records nothing for any other name.
   fold the message into a post claimed for another milestone. Do other work and `say` again.
   A `build_changed` hold means: the build moved since the go. Ask the responders again for the
   new build (claim and post the ask, naming the build), wait for that go, then `intend` again.
+  A `no_go_for_build` hold means: no ask for that gate exists yet, so no go is on record for this
+  build. Claim and post the ask naming the build, wait for the go, then `intend` again.
 - Everyone owed is told once, in their own thread: the request thread, every thread that asked to
   be told, and for live also the QA thread. The briefing lists who is still owed.
 - Release issue completed. Done: the issue is in its completed state.

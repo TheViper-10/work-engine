@@ -70,9 +70,10 @@ export class World {
   privateThreadsSeen = new Set<string>([PRIVATE_THREAD]);
   private linkSeq = 0;
 
-  constructor(mode: 'flag' | 'hold', instances = 2, overrides: { inboxMaxUnprocessed?: number; noticeCoalesceMinutes?: number } = {}) {
+  constructor(mode: 'flag' | 'hold', instances = 2, overrides: { inboxMaxUnprocessed?: number; noticeCoalesceMinutes?: number } = {}, noGo: 'flag' | 'hold' = 'flag') {
     this.mode = mode;
-    const checks = Object.fromEntries(CHECK_NAMES.map((n) => [n, mode]));
+    // no_go_for_build stays a flag in the general sim: many cases intend a gated action with no ask on purpose. Its own named case sets it.
+    const checks = Object.fromEntries(CHECK_NAMES.map((n) => [n, n === 'no_go_for_build' ? noGo : mode]));
     for (let k = 0; k < instances; k++) {
       this.engines.push(new Engine({
         store: this.store,
@@ -92,7 +93,7 @@ export class World {
         },
         sessionDirectory: this.dir,
         waker: {
-          postWake: async (dm, text) => {
+          postWake: async (dm, text, _key) => {
             if (this.wakerFail) throw new Error('slack down');
             const job = dm.replace(/^dm:/, '').replace(/:g\d+$/, '');
             this.wakes.push({ dm, text, at: this.clock.now(), job, handled: false });

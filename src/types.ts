@@ -5,6 +5,7 @@ export type CheckName =
   | 'job_cancelled'
   | 'lease_held'
   | 'build_changed'
+  | 'no_go_for_build'
   | 'sender_not_listed';
 export type CheckMode = 'hold' | 'flag';
 export type FlagKind =
@@ -52,7 +53,11 @@ export interface SlackReader {
 }
 export interface Waker {
   /** May report `stale_version` when the home session is pinned to an old agent version (A3): the engine then replaces the home. */
-  postWake(dm: string, text: string): Promise<void | { stale_version?: boolean }>;
+  /**
+   * `key` names the wake (the run id, or run id plus a notice sequence for notices). The same key is the same wake:
+   * an adapter sends it at most once whatever the text, so a retry with a re-timed text does not stack a second one.
+   */
+  postWake(dm: string, text: string, key: string): Promise<void | { stale_version?: boolean }>;
 }
 
 export type SessionLookup = { dm: string } | { error: string };
@@ -112,6 +117,8 @@ export interface Job {
   inbox_keys: string[];
   inbox_seq: number;
   inbox_notice_at: number | null;
+  /** Count of notices into the home; with the run id it keys each notice for the exactly-once waker. */
+  notice_seq?: number;
   /** owner session -> inbox keys shown in the view it last read (implicitly processed by its next checkpoint). */
   inbox_seen: Record<string, string[]>;
   inbox_escalated: boolean;

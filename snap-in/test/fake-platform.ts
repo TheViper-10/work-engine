@@ -22,7 +22,7 @@ export class Crash extends Error { constructor() { super('process crashed'); thi
 
 interface Row { id: string; leaf_type: string; unique_key: string; title: string; custom_fields: Record<string, unknown>; created_at: number; created_by: string }
 export interface TimelineEntry { id: string; object: string; body: string; created_by: { id: string }; created_at: number; visible_at: number }
-interface Rule { path: string; status?: number; type?: string; timeout?: 'before' | 'after'; times: number; skip: number; match?: (b: any) => boolean }
+interface Rule { path: string; status?: number; type?: string; message?: string; timeout?: 'before' | 'after'; times: number; skip: number; match?: (b: any) => boolean }
 interface Session { id: string; parent: string; agent: string; user: string }
 interface Chat { id: string; display_state: string; members: string[]; users: string[]; type: string }
 export interface SlackMsg { ts: string; user?: string; bot_id?: string; text: string; thread_ts: string; metadata?: { event_type: string } }
@@ -57,6 +57,8 @@ export class FakePlatform {
   private beforeCreate: Array<{ when: (uk: string) => boolean; run: () => void }> = [];
   private crashAfter: number | null = null;
   private seq = 100;
+  /** Creates of one unique_key that land in the same tick are one race window (live QA: identical bodies collapse, distinct ones 409/500). */
+  private inflight = new Map<string, { row: Row; body: string; losers: number }>();
   readonly log: Array<{ path: string; as: Identity | 'slack' | 'github'; status: number }> = [];
   createdKeys: string[] = [];
   private slackRules: Array<{ status: 'ratelimited' | 'timeout'; times: number; channel?: string }> = [];
@@ -64,8 +66,8 @@ export class FakePlatform {
 
   // ---------------------------------------------------------------- failure injection
   /** Fail the next `times` calls to `path` (after skipping `skip`). status 0 with timeout: 'before' | 'after' models a timeout. */
-  inject(path: string, o: { status?: number; type?: string; timeout?: 'before' | 'after'; times?: number; skip?: number; match?: (b: any) => boolean }): void {
-    this.rules.push({ path, status: o.status, type: o.type, timeout: o.timeout, times: o.times ?? 1, skip: o.skip ?? 0, match: o.match });
+  inject(path: string, o: { status?: number; type?: string; message?: string; timeout?: 'before' | 'after'; times?: number; skip?: number; match?: (b: any) => boolean }): void {
+    this.rules.push({ path, status: o.status, type: o.type, message: o.message, timeout: o.timeout, times: o.times ?? 1, skip: o.skip ?? 0, match: o.match });
   }
   /** The process dies right after the n-th successful create from now (the write is applied, the caller never sees it). */
   crashAfterCreates(n: number): void { this.crashAfter = n; }
@@ -137,7 +139,7 @@ export class FakePlatform {
     const principal = this.authorize(path, as, event);
     const rule = this.fire(path, body);
     if (rule?.timeout === 'before') throw new ApiError(0, `${path} unavailable`, 'timeout');
-    if (rule?.status && !rule.timeout) throw new ApiError(rule.status, `${path} failed (${rule.status})`, rule.type);
+    if (rule?.status && !rule.timeout) throw new ApiError(rule.status, rule.message ?? `${path} failed (${rule.status})`, rule.type);
     let crashed = false;
     const out = await this.dispatch(path, body, as, principal, () => { crashed = true; });
     if (rule?.timeout === 'after') throw new ApiError(0, `${path} unavailable`, 'timeout');
@@ -160,9 +162,20 @@ export class FakePlatform {
         if (Buffer.byteLength(body, 'utf8') > BODY_LIMIT) throw new ApiError(400, `field tnt__body is too long, max allowed length is ${BODY_LIMIT}`, 'bad_request');
         if (typeof b.unique_key !== 'string' || !b.unique_key) throw new ApiError(400, 'unique_key required', 'bad_request');
         for (const h of [...this.beforeCreate]) if (h.when(b.unique_key)) { this.beforeCreate.splice(this.beforeCreate.indexOf(h), 1); h.run(); }
+        const racing = this.inflight.get(b.unique_key);
+        if (racing && this.rows.get(b.unique_key) === racing.row) {
+          // Byte-identical body: the server treats it as the same request, every caller gets 201 for the one row.
+          if (racing.body === body) return { custom_object: this.rowView(racing.row) };
+          // Distinct body: one winner; the rest are a mix of 409 and 500 "conflicted with an ongoing operation".
+          racing.losers += 1;
+          if (racing.losers % 2 === 0) throw new ApiError(500, 'The request conflicted with an ongoing operation, please retry', 'internal');
+          throw new ApiError(409, 'Conflict', 'conflict', 'document exists');
+        }
         if (this.rows.has(b.unique_key)) throw new ApiError(409, 'Conflict', 'conflict', 'document exists');
         const row = this.insert(leaf, b.unique_key, b.custom_fields, principal);
         this.createdKeys.push(b.unique_key);
+        this.inflight.set(b.unique_key, { row, body, losers: 0 });
+        setImmediate(() => { if (this.inflight.get(b.unique_key)?.row === row) this.inflight.delete(b.unique_key); });
         if (this.crashAfter !== null) { this.crashAfter -= 1; if (this.crashAfter <= 0) { this.crashAfter = null; markCrash(); } }
         return { custom_object: this.rowView(row) };
       }

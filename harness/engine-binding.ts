@@ -113,7 +113,7 @@ export class RealEngineBinding implements EngineBinding {
     // A1: a real directory, not the homeForAllSessions default. The driver registers each session's DM when it starts.
     this.directory = new FakeSessionDirectory();
     for (const [sid, dm] of this.registered) this.directory.set(sid, dm);
-    const checks = this.mode === 'deploy' ? { ...DEPLOY_CHECKS } : Object.fromEntries(['superseded_run', 'job_cancelled', 'lease_held', 'build_changed', 'sender_not_listed'].map((c) => [c, this.mode]));
+    const checks = this.mode === 'deploy' ? { ...DEPLOY_CHECKS } : Object.fromEntries(['superseded_run', 'job_cancelled', 'lease_held', 'build_changed', 'no_go_for_build', 'sender_not_listed'].map((c) => [c, this.mode]));
     this.engine = new Engine({
       store: this.store,
       clock: this.clock,
@@ -125,7 +125,7 @@ export class RealEngineBinding implements EngineBinding {
         },
       },
       waker: {
-        postWake: async (dm, text) => {
+        postWake: async (dm, text, _key) => {
           // Home ids are dm:<job> for generation 1 and dm:<job>:g<n> after a replacement.
           this.wakeCb({ dm, text, job: dm.startsWith('dm:') ? dm.slice(3).replace(/:g\d+$/, '') : undefined });
         },

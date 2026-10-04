@@ -5,6 +5,7 @@ export const CHECK_NAMES: readonly CheckName[] = [
   'job_cancelled',
   'lease_held',
   'build_changed',
+  'no_go_for_build',
   'sender_not_listed',
 ];
 
@@ -14,6 +15,7 @@ export const CHECK_NAMES: readonly CheckName[] = [
  */
 export const DEPLOY_CHECKS: Readonly<Record<CheckName, CheckMode>> = {
   build_changed: 'hold',
+  no_go_for_build: 'hold',
   job_cancelled: 'hold',
   superseded_run: 'hold',
   lease_held: 'flag',

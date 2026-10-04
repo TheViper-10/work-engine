@@ -114,7 +114,7 @@ test('body over 131072 bytes fails loudly and writes nothing; exactly at the lim
   const f = new FakePlatform(); const s = storeFor(f); const k = K('job', 'big');
   await assert.rejects(s.putIfAbsent(k, { pad: 'x'.repeat(MAX_BODY_BYTES) }), (e: Error) => e instanceof BodyTooLargeError && /131072/.test(e.message));
   assert.equal(f.rowCount(), 0);
-  const overhead = JSON.stringify({ pad: '' }).length;
+  const overhead = JSON.stringify({ _w: '0'.repeat(16), pad: '' }).length; // the stored body also carries the 16-hex write nonce
   await s.putIfAbsent(k, { pad: 'x'.repeat(MAX_BODY_BYTES - overhead) });
   assert.equal(f.rowCount(), 1);
   // multi-byte characters are counted as bytes, not characters
@@ -183,4 +183,83 @@ test('the public get accepts id only; the adapter uses the internal get by uniqu
 test('PlatformStore satisfies the engine Store shape', () => {
   const s: import('../../src/store.ts').Store = new PlatformStore({ api: { call: async () => ({}) } });
   assert.equal(typeof s.putIfVersion, 'function');
+});
+
+const CONFLICT_MSG = 'The request conflicted with an ongoing operation, please retry';
+
+test('the fake: byte-identical concurrent creates collapse to one row and all get 201; distinct bodies give one 201, the rest 409 or 500', async () => {
+  const same = new FakePlatform(); const api = same.deps().devrev(same.timerEvent());
+  const mk = (body: string) => api.call('custom-objects.create', { leaf_type: 'work_record', unique_key: 'k@v1', custom_fields: { tnt__body: body } }, 'service');
+  const ids = await Promise.all(Array.from({ length: 20 }, () => mk('{"a":1}')));
+  assert.equal(same.rowCount(), 1); assert.equal(new Set(ids.map((r) => r.custom_object.id)).size, 1);
+
+  const distinct = new FakePlatform(); const dapi = distinct.deps().devrev(distinct.timerEvent());
+  const out = await Promise.allSettled(Array.from({ length: 20 }, (_, i) => dapi.call('custom-objects.create', { leaf_type: 'work_record', unique_key: 'k@v1', custom_fields: { tnt__body: `{"a":${i}}` } }, 'service')));
+  const errs = out.filter((o): o is PromiseRejectedResult => o.status === 'rejected').map((o) => o.reason as ApiError);
+  assert.equal(out.filter((o) => o.status === 'fulfilled').length, 1); assert.equal(distinct.rowCount(), 1);
+  assert.ok(errs.some((e) => e.status === 409)); assert.ok(errs.some((e) => e.status === 500 && e.message === CONFLICT_MSG));
+  assert.ok(errs.every((e) => e.status === 409 || e.status === 500));
+});
+
+test('20 concurrent putIfAbsent of identical values: exactly one caller reports created=true, all see the same value', async () => {
+  const f = new FakePlatform(); const k = K('job', 'same');
+  const results = await Promise.all(Array.from({ length: 20 }, () => storeFor(f).putIfAbsent(k, { same: true })));
+  assert.equal(results.filter((r) => r.created).length, 1);
+  for (const r of results) assert.deepEqual(r.value, { same: true });
+  assert.equal(f.rowCount(), 1);
+});
+
+test('20 concurrent putIfAbsent of distinct values: exactly one created, the rest not, all agree on the winner', async () => {
+  const f = new FakePlatform(); const k = K('job', 'distinct');
+  const results = await Promise.all(Array.from({ length: 20 }, (_, i) => storeFor(f).putIfAbsent(k, { who: i })));
+  assert.equal(results.filter((r) => r.created).length, 1);
+  const winner = results.find((r) => r.created)!.value;
+  for (const r of results) assert.deepEqual(r.value, winner);
+  assert.deepEqual(await storeFor(f).get(k), winner);
+});
+
+test('the nonce is stored in tnt__body but never returned by a read; non-object values round-trip', async () => {
+  const f = new FakePlatform(); const s = storeFor(f); const k = K('job', 'nonce');
+  await s.putIfAbsent(k, { a: [1, 2], b: { c: null } });
+  assert.match(f.rows.get(`${k}@v1`)!.custom_fields.tnt__body as string, /^\{"_w":"[0-9a-f]{16}",/);
+  assert.deepEqual(await storeFor(f).get(k), { a: [1, 2], b: { c: null } });
+  await s.putIfAbsent(K('job', 'arr'), [1, 'x']); await s.putIfAbsent(K('job', 'num'), 7);
+  assert.deepEqual(await storeFor(f).get(K('job', 'arr')), [1, 'x']); assert.equal(await storeFor(f).get(K('job', 'num')), 7);
+  // rows written without a nonce (raw, older rows) read back unchanged
+  f.insertRaw('work_record', `${K('job', 'old')}@v1`, { old: true });
+  assert.deepEqual(await storeFor(f).get(K('job', 'old')), { old: true });
+});
+
+test('a 500 "conflicted with an ongoing operation" with the row absent is retried and then lands', async () => {
+  const f = new FakePlatform(); const s = storeFor(f);
+  f.inject('custom-objects.create', { status: 500, message: CONFLICT_MSG, times: 2 });
+  const r = await s.putIfAbsent(K('job', 'c500'), { ok: 1 });
+  assert.equal(r.created, true); assert.equal(s.calls.create, 3); assert.equal(f.rowCount(), 1);
+});
+
+test('the 500-then-absent retry is bounded at 3 retries and then surfaces', async () => {
+  const f = new FakePlatform(); const s = storeFor(f);
+  f.inject('custom-objects.create', { status: 500, message: CONFLICT_MSG, times: 50 });
+  await assert.rejects(s.putIfAbsent(K('job', 'c500b'), { ok: 1 }), (e: ApiError) => /did not settle/.test(e.message));
+  assert.equal(s.calls.create, 4); assert.equal(f.rowCount(), 0);
+});
+
+test('a 500 conflict where another writer owns the row is a lost write, not ours', async () => {
+  const f = new FakePlatform(); const k = K('job', 'c500c');
+  f.inject('custom-objects.create', { status: 500, message: CONFLICT_MSG });
+  f.raceBeforeCreate((u) => u === `${k}@v1`, () => undefined);
+  f.insertRaw('work_record', `${k}@v1`, { theirs: true });
+  const r = await storeFor(f).putIfAbsent(k, { mine: true });
+  assert.equal(r.created, false); assert.deepEqual(r.value, { theirs: true });
+});
+
+test('latest version is cached per key: a second read costs no probe; a lost CAS invalidates', async () => {
+  const f = new FakePlatform(); const k = K('job', 'cache'); const s = storeFor(f);
+  await s.put(k, { v: 1 }); await s.put(k, { v: 2 }); await s.put(k, { v: 3 });
+  const before = s.calls.get + s.calls.list;
+  assert.deepEqual(await s.getVersioned(k), { value: { v: 3 }, version: 3 });
+  assert.equal(s.calls.get + s.calls.list, before, 'write-through: no reads needed after own writes');
+  await storeFor(f).put(k, { v: 4 }); // another process moves the key
+  assert.deepEqual(await s.putIfVersion(k, { v: 'x' }, 3), { ok: false, version: 4 });
+  assert.deepEqual(await s.getVersioned(k), { value: { v: 4 }, version: 4 });
 });

@@ -305,7 +305,10 @@ export class Driver {
       this.engineCalls.push({ seq: this.world.nextSeq(), t: this.now, session: s.rec.id, name, input, output, error, dm: s.rec.dm, home });
       if (name === 'say' && !error) {
         const st = String(output?.status ?? '');
-        if (st === 'go' && input?.thread && input?.milestone) this.world.noteClaim(String(input.thread), String(input.milestone));
+        // R38: a fresh go registers a claim. A repeat go ("you already hold this claim") is the same claim, and a post already
+        // consumed it: registering again left an orphan that the next post of the thread was attributed to.
+        if (st === 'go' && !output?.repeat && input?.thread && input?.milestone) this.world.noteClaim(String(input.thread), String(input.milestone));
+        if (st === 'confirmed' && input?.thread && input?.milestone) this.world.settleClaim(String(input.thread), String(input.milestone));
       }
       return { content: JSON.stringify(output), isError: !!error };
     }

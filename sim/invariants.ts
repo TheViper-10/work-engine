@@ -33,7 +33,7 @@ export function checkAnswer(w: World, call: string, args: any, ans: Answer, sid:
     const holds = (ans.holds as string[] | undefined) ?? [];
     if (w.mode !== 'hold') bad.push(`intend: hold under flag config`);
     if (holds.length === 0) bad.push('intend: hold without a reason');
-    for (const h of holds) if (!CHECK_NAMES.some((n) => h.startsWith(`${n}:`))) bad.push(`intend: hold "${h}" is not one of the five checks`);
+    for (const h of holds) if (!CHECK_NAMES.some((n) => h.startsWith(`${n}:`))) bad.push(`intend: hold "${h}" is not one of the checks`);
     if (!/Next:/.test(ans.say_to_tony)) bad.push('intend: hold without a next move in words');
     const op = ans.operation as any;
     if (!ans.existing && (!op || op.outcome !== 'held' || op.lease_taken)) bad.push('intend: hold left an operation in flight or took a lease');

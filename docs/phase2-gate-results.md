@@ -115,3 +115,44 @@ The three required scenarios: stale-go PASS, cancel-mid-publish PASS, interrupti
 - Wrong-build approval: run a of stale-go approved QA for build def on a go about abc under deploy config, because the ask had not been claimed yet so the engine had no ask build to compare (the hold needs an open ask). Fixed in run b and c by the playbook (ask first, naming the build); the engine gap (a go recorded in the inbox but no ask on the gate) is noted for phase 3: an approval `intend` with no open ask cannot check `build_changed`.
 - No private leak, no action from a non-home session (`one_action_owner` met in all runs), no post after a cancel other than the `cancel_notice`.
 - The unknown action bypass is closed in the engine (R33); no run tried it this round.
+
+## Round 5 (duplicate posts, no_go_for_build, keyed wakes)
+
+Date: 2026-10-04. Base: main 4177dea. Model: Sonnet 5.5 through the gateway, engine binding, `--checks deploy`, 1 run per cell. Fix rounds used: 1 for twin-mention, 2 for private-evidence (the second was a scenario reply, below).
+
+### Diagnosis of the two duplicates (saved runs `r4c-real-twin-mention`, `r4c-real-private-evidence`)
+
+Every post was traced to its `say` calls and the engine's answers. Both runs show the same chain: the model claimed the right milestone with a fresh `go`, posted it, the engine never matched the post ("own post carried no timestamp; not matched"), the model was told to `say` again with `posted_link` and first got a repeat `go` ("you already hold this claim"), and then `confirmed`.
+
+- Cause 1 (harness connector): the harness event for Tony's own post carried no `ts` and no `link`. The snap-in's real poller sets both (`attrs.ts` in ms), and the engine matches a post to its claim only by time. So in the harness every post waited for `posted_link`.
+- Cause 2 (harness attribution): the driver registered a new claim on every `go`, including the repeat `go`. The post had already consumed the first claim, so the repeat `go` left an orphan claim, and the next post in that thread was attributed to the orphan's milestone.
+- twin-mention: `live` is claimed and posted in A (ts 21) and Q (22), repeat `go` in A and Q (seq 113, 114), then `confirmed`. Orphan `live`-in-A claim. Next post in A, the `prod_alpha_approved` message (ts 23), was attributed to `live`, so `live` counted twice in A. The engine's own state shows one `live` delivery per thread.
+- private-evidence: `pr_approved` is claimed, posted, then `say` again (repeat `go` at seq 40), leaving an orphan `pr_approved`. The next post in A, the `merged` message, was attributed to `pr_approved`, so `pr_approved` counted twice in A.
+- Class: evaluation defect in both runs, not model judgment (the model claimed the right milestone each time), and not an engine defect (the engine answered `go` once per thread and milestone for a fresh claim; the repeat `go` is the designed answer to a `say` from the claim's owner). No unclaimed_post and no missing milestone id was involved in these two duplicates. Pre-correction results stay as recorded in Round 4: twin-mention c FAIL, private-evidence c strict PASS and outcome FAIL. Replaying the saved runs with corrected attribution gives one post per milestone and thread in both.
+- Fix (layer: harness, R38): the driver registers a claim only on a fresh `go` (`repeat` false) and settles it on `confirmed`; the harness connector event carries `ts` and `link`. No playbook change for the duplicates.
+
+### no_go_for_build (R36)
+
+Engine gap closed: `intend` for an action whose gate has no live ask now answers per config. Deploy config holds it. Playbook gained one line. The hold changed the model's order in private-evidence: it now asks for the QA go naming the build before approving, as the stale-go round b wording already asks. The first real rerun of private-evidence (`r5-real-private-evidence`) then stopped at the hold: the only owner go in the scenario was sent before the ask ("go, that one is a flake"), so no answer to the ask ever came, and the model (correctly) did not count that earlier go for an unnamed build. That is a scenario defect, not a model one: `stale-go` already carries a reply that fires once Tony asks for a build. `private-evidence` now has the same reply ("go, aaaa0001 is good to go to QA", only sent if Tony asks for aaaa0001). No bar changed.
+
+### Waker key (R37)
+
+`postWake(dm, text, key)`; the engine passes the run id, or run id plus `:n<seq>` for a notice. The snap-in waker keys its `wake_attempt` row on sha(dm|key), reads the timeline back for the first text sent under the key, and the sha(dm|text) key and per-DM pending record are gone. New test: a retried wake with different text and the same key sends once. 83 snap-in tests.
+
+### Platform store (R39)
+
+Nonce-based create ownership and the 500 re-read path in `snap-in/src/store-platform.ts`; 9 contract tests; fake API mirrors the server.
+
+### Real-model runs (deploy config, 1 run each, after fixes)
+
+| scenario | run | strict (D7) | outcome | engine calls | model requests | note |
+|---|---|---|---|---|---|---|
+| twin-mention | r5 | PASS | PASS | 39 | 68 | all bars met; one flag `unclaimed_post` (the model posted the bump PR message in B without a claim, which the engine cannot stop); `live` once per thread |
+| private-evidence | r5 | FAIL | FAIL | 38 | 69 | 4 of 8 milestones; stopped at a `no_go_for_build` hold, the scenario had no answer to the ask (scenario defect, fixed) |
+| private-evidence | r5b | PASS | PASS | 38 | 62 | all bars met after the scenario reply |
+
+Scripted replay with `--checks deploy` (stale-go, cancel-mid-publish, interruption-boundary, twin-mention, private-evidence): 5 of 5 strict and outcome PASS. Caveat: 1 run per cell; twin-mention and private-evidence passed under the corrected harness, which removes the evaluation defect but does not show the model never double-posts.
+
+### Checks
+
+lint ok; 54 unit tests; sim 1,000 + 1,000 orders and 46 named cases (new: `no-go-for-build`); 28 repros clear; 83 snap-in tests; snap-in build and pack ok. Tarball `snap-in/dist-tarballs/work-engine-qa-v1.tgz`, secret scan no matches, sha256 recorded in the commit message body.

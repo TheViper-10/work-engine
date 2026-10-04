@@ -19,7 +19,7 @@ const LOGICAL = 'dm:desktop-release:5.2.11';
 
 test('first wake creates a hidden DM with Tony and the wake user, maps it both ways, and comments once', async () => {
   const f = new FakePlatform(); const { waker, store } = wakerFor(f);
-  await waker.postWake(LOGICAL, 'wake one');
+  await waker.postWake(LOGICAL, 'wake one', 'wake one');
   const chats = [...f.chats.values()];
   assert.equal(chats.length, 1); assert.equal(chats[0].display_state, 'hidden');
   assert.deepEqual(chats[0].members, [TONY]); assert.deepEqual(chats[0].users, [OWNER_USER]);
@@ -31,92 +31,102 @@ test('first wake creates a hidden DM with Tony and the wake user, maps it both w
 
 test('the trigger goes through the owner keyring token, never the caller or service token', async () => {
   const f = new FakePlatform(); const { waker } = wakerFor(f);
-  await waker.postWake(LOGICAL, 'who posts');
+  await waker.postWake(LOGICAL, 'who posts', 'who posts');
   assert.deepEqual(f.triggers.map((t) => t.by), ['owner']);
   assert.ok(f.log.filter((l) => l.path === 'workflows.trigger').every((l) => l.as === 'owner'));
 });
 
 test('a second wake reuses the same DM', async () => {
   const f = new FakePlatform(); const { waker } = wakerFor(f);
-  await waker.postWake(LOGICAL, 'one'); f.clock.advanceMinutes(10); await waker.postWake(LOGICAL, 'two');
+  await waker.postWake(LOGICAL, 'one', 'one'); f.clock.advanceMinutes(10); await waker.postWake(LOGICAL, 'two', 'two');
   assert.equal(f.chats.size, 1);
   assert.equal(f.comments([...f.chats.keys()][0]).length, 2);
 });
 
 test('exactly once: the same wake text twice posts one comment', async () => {
   const f = new FakePlatform(); const { waker } = wakerFor(f);
-  await waker.postWake(LOGICAL, 'same'); await waker.postWake(LOGICAL, 'same');
+  await waker.postWake(LOGICAL, 'same', 'same'); await waker.postWake(LOGICAL, 'same', 'same');
   assert.equal(f.triggers.length, 1);
 });
 
 test('exactly once with a slow workflow: the retry reads the timeline, sees nothing yet, and does not resend inside the grace period', async () => {
   const f = new FakePlatform(); f.triggerDelayMs = 20_000; const { waker } = wakerFor(f);
-  await waker.postWake(LOGICAL, 'slow');
-  await assert.rejects(waker.postWake(LOGICAL, 'slow'), /already attempted/);
+  await waker.postWake(LOGICAL, 'slow', 'slow');
+  await assert.rejects(waker.postWake(LOGICAL, 'slow', 'slow'), /already attempted/);
   assert.equal(f.triggers.length, 1);
   f.clock.advance(30_000);
-  await waker.postWake(LOGICAL, 'slow'); // now visible: confirmed, nothing resent
+  await waker.postWake(LOGICAL, 'slow', 'slow'); // now visible: confirmed, nothing resent
   assert.equal(f.triggers.length, 1);
 });
 
 test('a timeout after the trigger ran: the retry finds the comment and does not post again', async () => {
   const f = new FakePlatform(); const { waker } = wakerFor(f);
   f.inject('workflows.trigger', { timeout: 'after' });
-  await assert.rejects(waker.postWake(LOGICAL, 'maybe'), (e: ApiError) => e.status === 0);
+  await assert.rejects(waker.postWake(LOGICAL, 'maybe', 'maybe'), (e: ApiError) => e.status === 0);
   assert.equal(f.triggers.length, 1);
-  await waker.postWake(LOGICAL, 'maybe');
+  await waker.postWake(LOGICAL, 'maybe', 'maybe');
   assert.equal(f.triggers.length, 1); assert.equal(f.comments([...f.chats.keys()][0]).length, 1);
 });
 
 test('a timeout before the trigger ran: resend only after the grace period, and then exactly once', async () => {
   const f = new FakePlatform(); const { waker } = wakerFor(f);
   f.inject('workflows.trigger', { timeout: 'before' });
-  await assert.rejects(waker.postWake(LOGICAL, 'lost'));
+  await assert.rejects(waker.postWake(LOGICAL, 'lost', 'lost'));
   assert.equal(f.triggers.length, 0);
-  await assert.rejects(waker.postWake(LOGICAL, 'lost'), /already attempted/);
+  await assert.rejects(waker.postWake(LOGICAL, 'lost', 'lost'), /already attempted/);
   f.clock.advance(WAKE_GRACE_MS + 1000);
-  await waker.postWake(LOGICAL, 'lost');
+  await waker.postWake(LOGICAL, 'lost', 'lost');
   assert.equal(f.triggers.length, 1);
 });
 
 test('a definite refusal (403) sends nothing and the next attempt may go at once', async () => {
   const f = new FakePlatform(); const { waker } = wakerFor(f);
   f.inject('workflows.trigger', { status: 403, type: 'forbidden' });
-  await assert.rejects(waker.postWake(LOGICAL, 'denied'), (e: ApiError) => e.status === 403);
+  await assert.rejects(waker.postWake(LOGICAL, 'denied', 'denied'), (e: ApiError) => e.status === 403);
   assert.equal(f.triggers.length, 0);
-  await waker.postWake(LOGICAL, 'denied');
+  await waker.postWake(LOGICAL, 'denied', 'denied');
   assert.equal(f.triggers.length, 1);
 });
 
-test('a different text while an earlier wake is unconfirmed is held back until the first is read back', async () => {
+test('a retried wake with different text and the same key sends once', async () => {
   const f = new FakePlatform(); f.triggerDelayMs = 60_000; const { waker } = wakerFor(f);
-  await waker.postWake(LOGICAL, 'first text');
+  await waker.postWake(LOGICAL, 'wake at 10:00', 'run:1');
   f.clock.advance(10_000);
-  await assert.rejects(waker.postWake(LOGICAL, 'first text, retimed'), /earlier wake/);
+  await assert.rejects(waker.postWake(LOGICAL, 'wake at 10:01, retimed', 'run:1'), /already attempted/);
   assert.equal(f.triggers.length, 1);
   f.clock.advance(60_000);
-  await waker.postWake(LOGICAL, 'first text, retimed'); // first is now visible: no second comment stacked
+  await waker.postWake(LOGICAL, 'wake at 10:02, retimed again', 'run:1'); // first is visible now: confirmed, nothing resent
   assert.equal(f.triggers.length, 1);
+  assert.equal(f.comments([...f.chats.keys()][0]).length, 1);
+  assert.equal(f.comments([...f.chats.keys()][0])[0].body, 'wake at 10:00');
+});
+
+test('a different key to the same DM is a new wake and is sent', async () => {
+  const f = new FakePlatform(); const { waker } = wakerFor(f);
+  await waker.postWake(LOGICAL, 'run one', 'run:1');
+  await waker.postWake(LOGICAL, 'notice', 'run:1:n1');
+  await waker.postWake(LOGICAL, 'run two', 'run:2');
+  assert.equal(f.triggers.length, 3);
 });
 
 test('missing owner keyring: postWake throws, nothing is posted, and the DM mapping is kept', async () => {
   const f = new FakePlatform(); const { waker } = wakerFor(f, { keyring: false });
-  await assert.rejects(waker.postWake(LOGICAL, 'nokey'), /owner_identity/);
+  await assert.rejects(waker.postWake(LOGICAL, 'nokey', 'nokey'), /owner_identity/);
   assert.equal(f.triggers.length, 0);
   // nothing was sent, so once the keyring is present the retry goes at once (no grace wait)
   const again = wakerFor(f);
-  await again.waker.postWake(LOGICAL, 'nokey');
+  await again.waker.postWake(LOGICAL, 'nokey', 'nokey');
   assert.equal(f.triggers.length, 1);
 });
 
 test('crash between chats.create and the dmmap write leaves at most one orphan and never two mapped homes', async () => {
   const f = new FakePlatform(); const first = wakerFor(f);
   f.inject('chats.update', { status: 500, times: 10 }); // the process dies here: DM created, mapping still "creating"
-  await assert.rejects(first.waker.postWake(LOGICAL, 'crash'));
+  await assert.rejects(first.waker.postWake(LOGICAL, 'crash', 'crash'));
   assert.equal(f.chats.size, 1);
   f.clearRules();
   const second = wakerFor(f);
-  await second.waker.postWake(LOGICAL, 'crash');
+  await second.waker.postWake(LOGICAL, 'crash', 'crash');
   assert.ok(f.chats.size <= 2);
   const map: any = await second.store.get(dmmapKey('qa', 'tony', LOGICAL));
   assert.equal(map.state, 'ready');
@@ -127,18 +137,18 @@ test('crash between chats.create and the dmmap write leaves at most one orphan a
 
 test('stale version: a changed default version is reported and nothing is posted into the old home', async () => {
   const f = new FakePlatform(); const { waker } = wakerFor(f);
-  await waker.postWake(LOGICAL, 'v1');
+  await waker.postWake(LOGICAL, 'v1', 'v1');
   f.tonyVersion = `${TONY}:version/2`; f.clock.advanceMinutes(10);
-  const r = await waker.postWake(LOGICAL, 'after publish');
+  const r = await waker.postWake(LOGICAL, 'after publish', 'after publish');
   assert.deepEqual(r, { stale_version: true });
   assert.equal(f.triggers.length, 1);
 });
 
 test('after the engine replaces the home, the new logical id gets its own DM at the new version', async () => {
   const f = new FakePlatform(); const { waker, store } = wakerFor(f);
-  await waker.postWake(LOGICAL, 'v1');
+  await waker.postWake(LOGICAL, 'v1', 'v1');
   f.tonyVersion = `${TONY}:version/2`;
-  await waker.postWake(`${LOGICAL}:g2`, 'g2 wake');
+  await waker.postWake(`${LOGICAL}:g2`, 'g2 wake', 'g2 wake');
   assert.equal(f.chats.size, 2);
   const map: any = await store.get(dmmapKey('qa', 'tony', `${LOGICAL}:g2`));
   assert.equal(map.agent_version, f.tonyVersion);
@@ -149,6 +159,6 @@ test('after the engine replaces the home, the new logical id gets its own DM at 
 test('429 on chats.create surfaces so the engine keeps its wake reason', async () => {
   const f = new FakePlatform(); const { waker } = wakerFor(f);
   f.inject('chats.create', { status: 429, type: 'rate_limited' });
-  await assert.rejects(waker.postWake(LOGICAL, 'busy'), (e: ApiError) => e.status === 429);
+  await assert.rejects(waker.postWake(LOGICAL, 'busy', 'busy'), (e: ApiError) => e.status === 429);
   assert.equal(f.triggers.length, 0);
 });

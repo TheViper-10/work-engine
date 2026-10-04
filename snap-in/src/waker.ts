@@ -1,21 +1,19 @@
 // PlatformWaker: lazy creation of the hidden job-home DM, the wake post through a clone of workflow 16 with the
 // owner keyring token, a stale-version check, and an exactly-once guard around the post.
 //
-// Exactly-once without an engine key argument: postWake(dm, text) only has the text. The adapter derives
-// key = sha(dm|text) and keeps a create-if-absent `wake_attempt:<key>` row before any trigger. An existing attempt
-// means "possibly sent": read the DM timeline back for the text, and resend only when it is absent AND a grace
-// period has passed since the attempt. A different text to a home with an unconfirmed earlier wake is also read back
-// first, because the engine's wake text embeds a timestamp and so differs between retries.
+// Exactly-once by the engine's key: postWake(dm, text, key) gets key = the run id (or run id plus a notice sequence).
+// The adapter keeps a create-if-absent `wake_attempt:<sha(dm|key)>` row before any trigger. An existing attempt means
+// "possibly sent": read the DM timeline back for the FIRST text sent under that key, and resend only when it is absent AND
+// a grace period has passed. The text does not matter to identity, so a retry whose text differs (the engine's wake text
+// embeds a timestamp) sends once.
 import { makeKey, type Store } from '../../src/store.ts';
 import type { Clock, Waker } from '../../src/types.ts';
 import { ApiError, sha, type DevRevApi } from './platform.ts';
 import { dmmapKey, dmrevKey, type DmMapRow } from './directory.ts';
 
 export const WAKE_GRACE_MS = 3 * 60_000;
-export const WAKE_PENDING_KIND = 'wake_pending';
 
 export interface WakeAttempt { state: 'intent' | 'triggered' | 'confirmed'; dm: string; text: string; receipt_key: string; run: string | null; at: number; tries: number }
-interface Pending { key: string; text: string }
 
 export interface WakerOptions {
   store: Store;
@@ -68,30 +66,15 @@ export class PlatformWaker implements Waker {
     return entries.some((e) => typeof e?.id === 'string' && e.id.includes(':comment/') && typeof e.body === 'string' && e.body.includes(text));
   }
 
-  async postWake(logical: string, text: string): Promise<void | { stale_version?: boolean }> {
+  async postWake(logical: string, text: string, wakeKey: string): Promise<void | { stale_version?: boolean }> {
     const home = await this.ensureHome(logical);
     const current = await this.defaultVersion();
     if (home.agent_version && current && home.agent_version !== current) {
       // A3: the home session is pinned to an old agent version. Do not post into it; the engine replaces the home.
       return { stale_version: true };
     }
-    const key = sha(`${home.dm}|${text}`);
+    const key = sha(`${home.dm}|${wakeKey}`);
     const now = this.o.clock.now();
-    const pendKey = this.k(WAKE_PENDING_KIND, sha(home.dm));
-
-    // A prior wake to this DM that is not yet confirmed: read the timeline before anything is sent.
-    const pend = await this.o.store.get<Pending>(pendKey);
-    if (pend && pend.key !== key) {
-      const prior = await this.o.store.get<WakeAttempt>(this.k('wake_attempt', pend.key));
-      if (prior && prior.state !== 'confirmed') {
-        if (await this.timelineHas(home.dm, prior.text)) {
-          await this.o.store.put(this.k('wake_attempt', pend.key), { ...prior, state: 'confirmed' });
-          await this.o.store.put(pendKey, null);
-          return; // the earlier wake reached the home and carries the same job; do not stack a second comment
-        }
-        if (now - prior.at < WAKE_GRACE_MS) throw new Error('an earlier wake to this home is unconfirmed; waiting before any resend');
-      }
-    }
 
     const attemptKey = this.k('wake_attempt', key);
     const mine: WakeAttempt = { state: 'intent', dm: home.dm, text, receipt_key: key, run: null, at: now, tries: 1 };
@@ -99,18 +82,17 @@ export class PlatformWaker implements Waker {
     let attempt = made.value;
     if (!made.created) {
       if (attempt.state === 'confirmed') return;
-      if (await this.timelineHas(home.dm, text)) { await this.o.store.put(attemptKey, { ...attempt, state: 'confirmed' }); return; }
+      if (await this.timelineHas(home.dm, attempt.text)) { await this.o.store.put(attemptKey, { ...attempt, state: 'confirmed' }); return; }
       if (now - attempt.at < WAKE_GRACE_MS) throw new Error('wake already attempted and not yet visible in the home; waiting before any resend');
       attempt = { ...attempt, state: 'intent', at: now, tries: attempt.tries + 1 };
       await this.o.store.put(attemptKey, attempt);
     }
-    await this.o.store.put(pendKey, { key, text } satisfies Pending);
 
     let run: string | undefined;
     try {
       const res = await this.o.owner.call('workflows.trigger', {
         id: this.o.wakeWorkflow, step_reference_key: 'start',
-        payload: { value: { dm_id: home.dm, continuation_note: text, receipt_key: `${key}.${attempt.tries}` } },
+        payload: { value: { dm_id: home.dm, continuation_note: attempt.text, receipt_key: `${key}.${attempt.tries}` } },
       });
       run = res?.workflow_run_id ?? res?.workflow_run?.id;
     } catch (e) {
@@ -121,9 +103,8 @@ export class PlatformWaker implements Waker {
     }
     await this.o.store.put(attemptKey, { ...attempt, state: 'triggered', run: run ?? null });
     // Read back once; a miss is normal (the clone runs asynchronously) and is settled by the next call.
-    if (await this.timelineHas(home.dm, text).catch(() => false)) {
+    if (await this.timelineHas(home.dm, attempt.text).catch(() => false)) {
       await this.o.store.put(attemptKey, { ...attempt, state: 'confirmed', run: run ?? null });
-      await this.o.store.put(pendKey, null);
     }
   }
 }
