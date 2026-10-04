@@ -70,7 +70,8 @@ class Play {
     const d = v?.jobs?.[0];
     if (!d) return 'No such job.';
     this.target = d.target;
-    if (d.work_run !== 'you') return 'Another session is the work run; nothing for me to do.';
+    // R17 (M2): a read never binds a run. 'none' means nobody holds the job, so a woken session goes on and its first write binds it.
+    if (d.work_run === 'other') return 'Another session is the work run; nothing for me to do.';
     return yield* this.pass(null, '');
   }
 
