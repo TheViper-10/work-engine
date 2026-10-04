@@ -13,7 +13,7 @@ import { readFileSync } from 'node:fs';
 
 const WF = 'desktop-release';
 /** Rows created by the interruption-boundary journey. Lower it when a change removes writes; never raise it without a decision-log entry. */
-const ROW_BUDGET = 66; // R42: was 77 before the unchanged-write skip and the single post-trigger write
+const ROW_BUDGET = 67; // R50: +1 for the dmmap `created` row written before the hide (was 66; 77 before R42)
 
 test('interruption-boundary journey through the dispatcher', async () => {
   const f = new FakePlatform(); const d = dispatcher(f);

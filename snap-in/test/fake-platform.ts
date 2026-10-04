@@ -272,12 +272,16 @@ export class FakePlatform {
         this.requireAgent(as);
         return { agent: { id: b.id, default_version_id: this.versionShape === 'object' ? { id: this.tonyVersion } : this.tonyVersion } };
       case 'chats.create': {
+        // Live QA: the proven body is {agent_members[{agent}], users, type:"dm", is_default, display_state}.
+        if (b.type !== 'dm' || !Array.isArray(b.agent_members) || !b.agent_members[0]?.agent || !Array.isArray(b.users) || !b.users.length) throw new ApiError(400, 'Invalid field', 'invalid_field');
         this.requireAgent(as);
         const id = `${ORG}:dm/${(this.seq += 1).toString(36)}home`;
         this.chats.set(id, { id, display_state: b.display_state ?? 'global', members: (b.agent_members ?? []).map((m: any) => m.agent), users: b.users ?? [], type: b.type });
         return { chat: { id } };
       }
       case 'chats.update': {
+        // Live QA (S4c): chats.update without `type` is 400 invalid_field; {id, type:"dm", display_state} is 200.
+        if (b.type !== 'dm') throw new ApiError(400, 'Invalid field: type', 'invalid_field');
         const c = this.chats.get(b.id);
         if (!c) throw new ApiError(404, 'not_found', 'not_found');
         this.requireMember(as, b.id);
@@ -286,6 +290,7 @@ export class FakePlatform {
       }
       case 'workflows.trigger': {
         if (as !== 'owner') throw new ApiError(403, 'forbidden', 'forbidden');
+        if (b.step_reference_key !== 'start' || !b.payload?.value) throw new ApiError(400, 'Invalid field: step_reference_key / payload.value', 'invalid_field');
         if (b.id !== WAKE_WORKFLOW) throw new ApiError(404, 'workflow not found', 'not_found');
         const v = b.payload?.value ?? {};
         if (!this.chats.has(v.dm_id)) throw new ApiError(400, 'unknown dm', 'bad_request');

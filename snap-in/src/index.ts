@@ -2,6 +2,7 @@
 // Every call builds the engine on a PlatformStore and runs exactly one engine entry point. There is no queue:
 // the engine's own compare-and-set is the only ordering it relies on.
 import { Engine } from '../../src/engine.ts';
+import type { EngineConfig } from '../../src/config.ts';
 import { SystemClock } from '../../src/clock.ts';
 import type { Answer, Ctx } from '../../src/types.ts';
 import { PlatformSessionDirectory } from './directory.ts';
@@ -36,7 +37,16 @@ export async function buildRuntime(event: any, deps: Deps, as: Identity, snapInI
   const id = event?.context?.snap_in_id || snapInId;
   if (!id) throw new Error('missing installation context');
   const snap = await api.call('snap-ins.get', { id }, as);
-  const inputs = readInputs(snap?.snap_in?.inputs_values ?? {});
+  return assembleRuntime(event, deps, as, readInputs(snap?.snap_in?.inputs_values ?? {}));
+}
+
+/**
+ * The wiring of adapters and engine for a given set of inputs. Shared by buildRuntime and the local live probe
+ * (scripts/live-probe.ts), so the probe runs exactly the production wiring with different credentials and inputs.
+ * `config` lets the probe choose the check modes; production uses engineConfig(inputs).
+ */
+export function assembleRuntime(event: any, deps: Deps, as: Identity, inputs: Inputs, config: EngineConfig = engineConfig(inputs)): Runtime {
+  const api: DevRevApi = deps.devrev(event);
   const store = new PlatformStore({ api: scoped(api, as), sleep: deps.sleep });
   // ai-agent.sessions.get: the caller token on the operation path (proven live); the owner token on the timer path (not proven live, not called there today).
   const directory = new PlatformSessionDirectory({ api: scoped(api, as === 'caller' ? 'caller' : 'owner'), store, env: inputs.env, bot: inputs.bot });
@@ -46,7 +56,7 @@ export async function buildRuntime(event: any, deps: Deps, as: Identity, snapInI
   });
   const slackApi = deps.slack(event);
   const engine = new Engine({
-    store, clock: deps.clock, config: engineConfig(inputs), specs: SPECS, sessionDirectory: directory, waker,
+    store, clock: deps.clock, config, specs: SPECS, sessionDirectory: directory, waker,
     sourceReader: new GithubSourceReader({ api: deps.github(event), repo: inputs.github_repo, branch: inputs.mock_branch, statePath: inputs.state_path, prGates: PR_GATES }),
     slackReader: new PlatformSlackReader({ api: slackApi, allow: inputs.slack_channel_allowlist, ownBotUserId: inputs.own_bot_user }),
     guidanceVersion: inputs.guidance_version || undefined,

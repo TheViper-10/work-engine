@@ -65,7 +65,7 @@ export class PlatformWaker implements Waker {
 
   /** Diagnostics recorded by this instance (also written, at most once an hour, as a `diag` row). */
   readonly diagnostics: string[] = [];
-  private diagHour = -1;
+  private readonly diagHours = new Map<string, number>();
 
   /**
    * R49: the stale-version check is advisory. A failed read of the agent (403 on a private object, timeout, a bad shape)
@@ -80,18 +80,18 @@ export class PlatformWaker implements Waker {
     } catch (e) {
       // A missing credential (not an API answer) is not a version problem: the trigger below reports it, so it leaves no row.
       if (!(e instanceof ApiError)) return null;
-      await this.diagnose(`ai-agents.get failed (${e.status}); agent version unknown, wake continues`);
+      await this.diagnose('version_read', `ai-agents.get failed (${e.status}); agent version unknown, wake continues`);
       return null;
     }
   }
 
-  private async diagnose(message: string): Promise<void> {
+  private async diagnose(kind: string, message: string): Promise<void> {
     const now = this.o.clock.now();
     const hour = Math.floor(now / 3_600_000);
-    if (this.diagHour === hour) return;
-    this.diagHour = hour;
+    if (this.diagHours.get(kind) === hour) return;
+    this.diagHours.set(kind, hour);
     this.diagnostics.push(message);
-    try { await this.o.store.putIfAbsent(this.k('diag', `version_read.${hour}`), { at: now, message }); } catch { /* a diagnostic must never block a wake */ }
+    try { await this.o.store.putIfAbsent(this.k('diag', `${kind.startsWith('hide.') ? 'hide' : kind}.${hour}`), { at: now, message }); } catch { /* a diagnostic must never block a wake */ }
   }
 
   /** R41: no I/O. Without a wake user, a wake workflow or an agent every post must fail, so the engine records it once and waits for a config change. */
@@ -101,35 +101,59 @@ export class PlatformWaker implements Waker {
   }
 
   /**
-   * Real DM for a logical home, creating it on first use. Idempotent per logical id. */
+   * Real DM for a logical home, creating it on first use. Idempotent per logical id.
+   *
+   * States of the dmmap row: `creating` (no DM yet) -> `created` (DM id recorded, hide not yet confirmed) -> `ready` (hidden).
+   * The DM id is written as soon as chats.create succeeds, before the hide, so no later attempt can create a second DM for
+   * this logical home. A failed hide is cosmetic (a visible DM) and never blocks the wake; a duplicate DM is a correctness
+   * problem. Recovery from `created` reuses the recorded DM and hides it again.
+   */
   async ensureHome(logical: string): Promise<DmMapRow & { dm: string }> {
     const mapKey = dmmapKey(this.o.env, this.o.bot, logical);
     // A ready home needs no identity work. Checked first so a config error never leaves a "creating" row behind.
     const have = await this.o.store.get<DmMapRow>(mapKey);
     if (have?.state === 'ready' && have.dm) return have as DmMapRow & { dm: string };
-    const user = await this.resolveOwnerUser();
+    const user = have?.dm ? '' : await this.resolveOwnerUser();
     const first = await this.o.store.putIfAbsent<DmMapRow>(mapKey, { state: 'creating', dm: null, agent_version: null, created_at: this.o.clock.now() });
-    if (first.value.state === 'ready' && first.value.dm) return first.value as DmMapRow & { dm: string };
-    // R41: "creating" is recoverable, never a dead end. Every real wake attempt that finds it in this state creates the DM
-    // again. State "creating": create the DM. A crash after chats.create and before the ready write leaves one orphan hidden
-    // DM on the next pass; the dmmap row stays create-if-absent, so a job never gets two mapped homes.
-    const version = await this.defaultVersion();
-    let dm: string | undefined;
-    try {
-      const created = await this.o.owner.call('chats.create', {
-        agent_members: [{ agent: this.o.tonyAgent }], users: [user], type: 'dm', is_default: false, display_state: 'global',
-      });
-      dm = created?.chat?.id;
-      if (!dm) throw new Error('chats.create returned no id');
-      await this.o.owner.call('chats.update', { id: dm, display_state: 'hidden' });
-    } catch (e) {
-      if (refused(e)) throw new WakeConfigError(`the owner_identity token was refused when creating the job home (${(e as ApiError).status})`);
-      throw e;
+    let row: DmMapRow = first.value;
+    if (row.state === 'ready' && row.dm) return row as DmMapRow & { dm: string };
+    if (!row.dm) {
+      // R41: "creating" is recoverable, never a dead end. Only a row with no recorded DM creates one.
+      const ownerUser = user || await this.resolveOwnerUser();
+      const version = await this.defaultVersion();
+      let dm: string | undefined;
+      try {
+        const created = await this.o.owner.call('chats.create', {
+          agent_members: [{ agent: this.o.tonyAgent }], users: [ownerUser], type: 'dm', is_default: false, display_state: 'global',
+        });
+        dm = created?.chat?.id;
+        if (!dm) throw new Error('chats.create returned no id');
+      } catch (e) {
+        if (refused(e)) throw new WakeConfigError(`the owner_identity token was refused when creating the job home (${(e as ApiError).status})`);
+        throw e;
+      }
+      // Record the DM BEFORE hiding it: from here on this logical home has exactly one DM, whatever happens next.
+      row = { state: 'created', dm, agent_version: version, created_at: this.o.clock.now() };
+      await this.o.store.put(mapKey, row);
     }
-    const ready: DmMapRow = { state: 'ready', dm, agent_version: version, created_at: this.o.clock.now() };
-    await this.o.store.put(mapKey, ready);
+    const dm = row.dm as string;
     await this.o.store.putIfAbsent(dmrevKey(this.o.env, this.o.bot, dm), { logical });
-    return ready as DmMapRow & { dm: string };
+    if (await this.hide(dm)) {
+      row = { ...row, state: 'ready' };
+      await this.o.store.put(mapKey, row);
+    }
+    return row as DmMapRow & { dm: string };
+  }
+
+  /** chats.update needs `type: "dm"` (live QA: without it 400 invalid_field). Non-fatal: returns false and records a diagnostic. */
+  private async hide(dm: string): Promise<boolean> {
+    try {
+      await this.o.owner.call('chats.update', { id: dm, type: 'dm', display_state: 'hidden' });
+      return true;
+    } catch (e) {
+      await this.diagnose(`hide.${dm}`, `chats.update (hide) failed (${e instanceof ApiError ? e.status : (e as Error).message}); the home ${dm} stays visible, wake continues`);
+      return false;
+    }
   }
 
   private async timelineHas(dm: string, text: string): Promise<boolean> {

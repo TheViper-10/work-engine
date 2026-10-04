@@ -55,3 +55,9 @@ test('R49: only work_record/work_event custom objects use the service account; e
     assert.ok(f.log.filter((l) => l.path === route).every((l) => l.as === 'owner'), `${route} runs as the owner token`);
   }
 });
+
+test('R50: every route in IDENTITY.md states whether its exact body is proven live', () => {
+  const rows = DOC.split('\n').filter((l) => /^\| `[^`]+`/.test(l));
+  assert.ok(rows.length >= 13);
+  for (const l of rows) assert.match(l.split('|').map((x) => x.trim())[6] ?? '', /^(yes|no)\b/, `body proven live column: ${l.slice(0, 40)}`);
+});

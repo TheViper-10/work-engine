@@ -120,20 +120,49 @@ test('missing owner keyring: postWake throws, nothing is posted, and the DM mapp
   assert.equal(f.triggers.length, 1);
 });
 
-test('crash between chats.create and the dmmap write leaves at most one orphan and never two mapped homes', async () => {
+test('crash between chats.create and the hide: the DM is recorded first, recovery reuses it and never creates a second', async () => {
   const f = new FakePlatform(); const first = wakerFor(f);
-  f.inject('chats.update', { status: 500, times: 10 }); // the process dies here: DM created, mapping still "creating"
-  await assert.rejects(first.waker.postWake(LOGICAL, 'crash', 'crash'));
+  f.inject('chats.update', { status: 500, times: 10 });
+  await first.waker.postWake(LOGICAL, 'crash', 'crash'); // a failed hide is non-fatal: the wake still goes out
   assert.equal(f.chats.size, 1);
+  const map1: any = await first.store.get(dmmapKey('qa', 'tony', LOGICAL));
+  assert.equal(map1.state, 'created'); assert.equal(map1.dm, [...f.chats.keys()][0]);
   f.clearRules();
   const second = wakerFor(f);
   await second.waker.postWake(LOGICAL, 'crash', 'crash');
-  assert.ok(f.chats.size <= 2);
+  assert.equal(f.chats.size, 1, 'no second DM');
   const map: any = await second.store.get(dmmapKey('qa', 'tony', LOGICAL));
-  assert.equal(map.state, 'ready');
-  const mapped = [...f.chats.values()].filter((c) => c.id === map.dm);
-  assert.equal(mapped.length, 1); assert.equal(mapped[0].display_state, 'hidden');
+  assert.equal(map.state, 'ready'); assert.equal(map.dm, map1.dm);
+  assert.equal(f.chats.get(map.dm)!.display_state, 'hidden');
   assert.equal(f.comments(map.dm).length, 1);
+});
+
+test('live defect S4c: the hide carries type "dm"; a hide failure (400 invalid_field) makes no second DM on any retry and still wakes once', async () => {
+  const f = new FakePlatform(); const { waker, store } = wakerFor(f);
+  f.inject('chats.update', { status: 400, type: 'invalid_field', times: 100 });
+  for (let i = 0; i < 4; i += 1) { await waker.postWake(LOGICAL, `wake ${i}`, 'run-1'); f.clock.advanceMinutes(6); }
+  assert.equal(f.chats.size, 1, 'exactly one DM however many retries');
+  assert.equal(f.triggers.length, 1, 'one wake for one key');
+  assert.equal(f.chats.get([...f.chats.keys()][0])!.display_state, 'global', 'still visible: cosmetic only');
+  assert.equal(((await store.get(dmmapKey('qa', 'tony', LOGICAL))) as any).state, 'created');
+  assert.equal(waker.diagnostics.filter((d) => /chats\.update \(hide\)/.test(d)).length, 1);
+  // The directory already resolves the recorded DM to the logical home.
+  const dm = [...f.chats.keys()][0];
+  const dir = new PlatformSessionDirectory({ api: scoped(f.deps().devrev(f.timerEvent()), 'service'), store: storeFor(f), env: 'qa', bot: 'tony' });
+  assert.deepEqual(await dir.dmOf(f.sessionIn(dm)), { dm: LOGICAL });
+  f.clearRules();
+  await waker.postWake(LOGICAL, 'later', 'run-2');
+  assert.equal(f.chats.size, 1); assert.equal(f.chats.get(dm)!.display_state, 'hidden');
+  assert.equal(f.log.filter((l) => l.path === 'chats.update' && l.status === 200).length, 1);
+  assert.equal(f.log.filter((l) => l.path === 'chats.create').length, 1);
+});
+
+test('the fake rejects chats.update without type "dm" (as live QA does)', async () => {
+  const f = new FakePlatform(); const { api } = wakerFor(f);
+  const dm = (await api.call('chats.create', { agent_members: [{ agent: TONY }], users: [OWNER_USER], type: 'dm', is_default: false, display_state: 'global' }, 'owner')).chat.id;
+  await assert.rejects(api.call('chats.update', { id: dm, display_state: 'hidden' }, 'owner'), (e: any) => e.status === 400 && e.type === 'invalid_field');
+  await api.call('chats.update', { id: dm, type: 'dm', display_state: 'hidden' }, 'owner');
+  assert.equal(f.chats.get(dm)!.display_state, 'hidden');
 });
 
 test('stale version: a changed default version is reported and nothing is posted into the old home', async () => {

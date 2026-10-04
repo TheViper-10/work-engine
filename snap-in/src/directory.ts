@@ -7,7 +7,7 @@ import { makeKey, type Store } from '../../src/store.ts';
 import type { SessionDirectory, SessionLookup } from '../../src/types.ts';
 import { ApiError, sha, type DevRevApi } from './platform.ts';
 
-export interface DmMapRow { state: 'creating' | 'ready'; dm: string | null; agent_version: string | null; created_at: number }
+export interface DmMapRow { state: 'creating' | 'created' | 'ready'; dm: string | null; agent_version: string | null; created_at: number }
 export interface DmRevRow { logical: string }
 
 export const dmmapKey = (env: string, bot: string, logical: string): string => makeKey(env, bot, 'dmmap', logical);
