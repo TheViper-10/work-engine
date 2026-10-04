@@ -59,6 +59,10 @@ const uk = (key: string, n: number): string => `${key}@v${n}`;
 /** work-engine:<env>:<bot>:<kind>:<id>; events are their own type. */
 export function leafOf(key: string): Leaf { return key.split(':')[3] === 'event' ? 'work_event' : 'work_record'; }
 
+// Authorship: rows written on the operation path are created with the caller's token, so their author is the caller
+// (for example devu/1), not the service account. That is fine: the engine never reads or checks a row's author. The
+// only identity the engine trusts is the platform-looked-up session, and ownership of a key is decided by the nonce
+// and the versioned unique_key, not by who created the row.
 export class PlatformStore implements Store {
   private readonly api: DevRevApi;
   private readonly sleep: (ms: number) => Promise<void>;

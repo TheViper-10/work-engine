@@ -11,7 +11,8 @@ export type CheckMode = 'hold' | 'flag';
 export type FlagKind =
   | CheckName | 'missing_session' | 'unclaimed_post' | 'not_work_run' | 'job_ended'
   | 'source_unreadable' | 'ambiguous_outcome' | 'unknown_outcome'
-  | 'identity_unconfirmed' | 'ambiguous_association' | 'escalate' | 'unknown_milestone' | 'unknown_action';
+  | 'identity_unconfirmed' | 'ambiguous_association' | 'escalate' | 'unknown_milestone' | 'unknown_action'
+  | 'wake_failed' | 'admin_close';
 
 export interface Clock {
   now(): number; // epoch ms
@@ -58,6 +59,11 @@ export interface Waker {
    * an adapter sends it at most once whatever the text, so a retry with a re-timed text does not stack a second one.
    */
   postWake(dm: string, text: string, key: string): Promise<void | { stale_version?: boolean }>;
+  /**
+   * R41: a cheap, local check (no I/O, no writes) for a configuration that makes every wake fail. A string is the
+   * config error. The engine then records it once and does not try the post again until the next recheck.
+   */
+  preflight?(): string | null;
 }
 
 export type SessionLookup = { dm: string } | { error: string };
@@ -127,7 +133,16 @@ export interface Job {
   cleanup_pending: string[];
   cleanup_escalated: boolean;
   guidance_version: string | null;
+  /** R41: the state of a failing wake; absent when wakes work. */
+  wake_fail?: WakeFail;
 }
+
+/** R45: thrown by a Waker when no retry can help until configuration changes (not an outage). The engine flags it once and rechecks hourly. */
+export class WakeConfigError extends Error {
+  constructor(message: string) { super(message); this.name = 'WakeConfigError'; }
+}
+
+export interface WakeFail { count: number; first_at: number; last_at: number; retry_at: number; error: string; config: boolean; escalated: boolean; /** config error found by preflight (fixed as soon as preflight passes) */ pre?: boolean }
 
 export type InboxKind = 'message' | 'approval' | 'cancel' | 'request' | 'route' | 'note' | 'late';
 export interface InboxItem {

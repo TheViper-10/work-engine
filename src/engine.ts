@@ -4,6 +4,7 @@
 import { CHECK_NAMES, type EngineConfig } from './config.ts';
 import { makeKey, MAX_BATCH, type Store } from './store.ts';
 import { homeForAllSessions } from './session-directory.ts';
+import { WakeConfigError } from './types.ts';
 import type {
   Answer, Ask, CheckName, Claim, Clock, Ctx, Delivery, EventRecord, FlagKind, FlagRecord, IngestEvent,
   InboxItem, InboxKind, Job, JobStatus, Lease, Operation, Promise_, Run, SessionDirectory, SlackReader, SourceReader,
@@ -52,6 +53,14 @@ const MAX_TRIES = 8;
 class Conflict extends Error {}
 /** Version of each record object as last read or written, so save() can compare-and-set. */
 const versions = new WeakMap<object, number>();
+/** R42: JSON of each versioned record as last read or written, so save() can skip a write that changes nothing. */
+const snapshots = new WeakMap<object, string>();
+/** R40: the sweep cursor is written only once it lags this many buckets (1 hour at 5 minute buckets); a tick never writes it otherwise. */
+const CURSOR_LAG_BUCKETS = 12;
+/** R41: wake retry backoff doubles from 1 minute up to this cap; a config error is rechecked this often (no post is tried). */
+const WAKE_BACKOFF_CAP_MIN = 30;
+const WAKE_CONFIG_RECHECK_MIN = 60;
+const WAKE_ESCALATE_ATTEMPTS = 4;
 
 function ans(ok: boolean, status: string, say_to_tony: string, extra: Record<string, unknown> = {}): Answer {
   return { ok, status, say_to_tony, ...extra };
@@ -160,21 +169,24 @@ export class Engine {
   /** Reads a record and remembers its version, so save() can compare-and-set. */
   private async get<T>(kind: string, id: string): Promise<T | null> {
     const r = await this.store.getVersioned<T>(this.k(kind, id));
-    if (r.value !== null && typeof r.value === 'object') versions.set(r.value as object, r.version);
+    if (r.value !== null && typeof r.value === 'object') { versions.set(r.value as object, r.version); snapshots.set(r.value as object, JSON.stringify(r.value)); }
     return r.value;
   }
   /** Plain write, for records only one writer ever touches (flags, events, links, cursor). */
   private async put<T>(kind: string, id: string, v: T): Promise<void> { await this.store.put(this.k(kind, id), v); }
   /** Compare-and-set write: fails with Conflict when the record changed since it was read (absent = version 0). */
   private async save<T extends object>(kind: string, id: string, v: T): Promise<void> {
+    // R42: a record that is byte-equal to what was read (or last written) needs no new version row.
+    if (versions.has(v) && snapshots.get(v) === JSON.stringify(v)) return;
     const r = await this.store.putIfVersion(this.k(kind, id), v, versions.get(v) ?? 0);
     if (!r.ok) throw new Conflict(`${kind}:${id}`);
     versions.set(v, r.version);
+    snapshots.set(v, JSON.stringify(v));
   }
   /** Create-if-absent; the returned value is versioned so it can be saved later. */
   private async create<T extends object>(kind: string, id: string, v: T): Promise<{ created: boolean; value: T }> {
     const r = await this.store.putIfAbsent(this.k(kind, id), v);
-    if (r.created) { versions.set(v, 1); return { created: true, value: v }; }
+    if (r.created) { versions.set(v, 1); snapshots.set(v, JSON.stringify(v)); return { created: true, value: v }; }
     const cur = await this.get<T>(kind, id);
     return { created: false, value: cur ?? r.value };
   }
@@ -202,7 +214,7 @@ export class Engine {
     const out: Array<T | null> = [];
     for (const c of chunk(ids, MAX_BATCH)) {
       for (const r of await this.store.getManyVersioned<T>(c.map((i) => this.k(kind, i)))) {
-        if (r.value !== null && typeof r.value === 'object') versions.set(r.value as object, r.version);
+        if (r.value !== null && typeof r.value === 'object') { versions.set(r.value as object, r.version); snapshots.set(r.value as object, JSON.stringify(r.value)); }
         out.push(r.value);
       }
     }
@@ -550,6 +562,7 @@ export class Engine {
       j.inbox_seen = {};
       j.inbox_notice_at = null;
       j.next_wake_at = now;
+      delete j.wake_fail;
     }))!;
     if (oldRun) {
       const r = await this.get<Run>('run', `${job.id}:${oldRun}`);
@@ -760,7 +773,7 @@ export class Engine {
     });
   }
 
-  private async finishJob(job: Job, terminal: 'done' | 'cancelled'): Promise<void> {
+  private async finishJob(job: Job, terminal: 'done' | 'cancelled', skipCleanup = false): Promise<void> {
     const now = this.now();
     job.status = terminal;
     job.closed_at = now;
@@ -775,7 +788,7 @@ export class Engine {
       job.claims = {};
       // R22 (supersedes R17 H5): an unknown operation may still be publishing, so its lease stays held until readback.
       job.cleanup_pending = [];
-      for (const o of await this.manyPresent<Operation>('operation', job.op_keys)) {
+      for (const o of skipCleanup ? [] : await this.manyPresent<Operation>('operation', job.op_keys)) {
         if (o.outcome !== 'unknown') continue;
         job.cleanup_pending.push(o.key);
         await this.addFlag(job, 'unknown_outcome', `${o.action} on ${o.ref} ended the job with an unknown outcome; its lease stays held until the outcome is read back (cleanup pending)`, 'cancel');
@@ -1653,6 +1666,12 @@ export class Engine {
     const L: string[] = [];
     L.push(`Job ${job.id}: status ${job.status} (you reported "${job.reported_status}")${job.waiting_for ? `, waiting for ${job.waiting_for}` : ''}.`);
     L.push(`Next wake: ${job.next_wake_at ? `${new Date(job.next_wake_at).toISOString()} (in ${fmtAge(Math.abs(job.next_wake_at - now))}${job.next_wake_at < now ? ' ago, overdue' : ''})` : 'none (closed)'}. Work run: ${workRun === 'you' ? 'you' : workRun === 'other' ? 'another session is working on it' : 'nobody'}${run ? `, ${runBusy ? 'busy' : 'idle'}` : ''}.`);
+    if (job.wake_fail) {
+      const wf = job.wake_fail;
+      L.push(wf.config
+        ? `Wake: cannot be delivered, the wake configuration is missing (${wf.error}). Tell ${job.requester ?? 'the job owner'}: nobody can be woken for this job until the snap-in configuration is fixed or an operator closes the job.`
+        : `Wake: the last ${wf.count} attempt(s) to post into the job home failed (${wf.error}); next try ${new Date(wf.retry_at).toISOString()}.${wf.escalated ? ` Tell ${job.requester ?? 'the job owner'}: the job home cannot be woken, so nobody is working this job; an operator can close it.` : ''}`);
+    }
     L.push(`Linked threads: ${job.threads.map((t) => `${t} (${job.roles[t]}${job.private_threads.includes(t) ? ', private' : ''})`).join(', ') || 'none'}.`);
     const specIds = Object.keys(spec?.milestones ?? {});
     const msView = specIds.map((m) => ({ id: m, reached: !!job.milestones[m] }));
@@ -1882,7 +1901,9 @@ export class Engine {
         if (job.status === 'queued') seen.delete(id); // may be promoted by a later job in this sweep: look again
       }
     }
-    await this.put('sweep_cursor', 'main', { bucket: nowB });
+    // R40: the cursor is a lower bound on where to start reading, not a position that must be exact: re-reading a few
+    // old buckets is cheap and harmless (jobs are re-checked), a row per tick is not. Write only once it lags.
+    if (nowB - cur.bucket > CURSOR_LAG_BUCKETS) await this.put('sweep_cursor', 'main', { bucket: nowB });
     return ans(true, 'swept', `Sweep checked ${summary.jobs_checked} job(s): woke ${summary.woke.length}, ${summary.operations_unknown} operation(s) turned unknown, ${summary.promises_due} promise(s) due, ${summary.claims_reconciled} claim(s) reconciled.`, summary);
   }
 
@@ -2018,6 +2039,86 @@ export class Engine {
     }
   }
 
+  /** R41: inside a backoff or a config block, keep the job's wake at the retry time. Writes only when something moved it. */
+  private async parkWake(job: Job): Promise<void> {
+    const at = job.wake_fail!.retry_at;
+    if (job.next_wake_at === at) return;
+    job.next_wake_at = at;
+    await this.saveJob(job);
+    await this.schedule(job.id, at);
+  }
+
+  /** R41: wake config is missing. Flag once (naming the owner), then wait for the config to change without posting. */
+  private async wakeBlocked(job: Job, err: string, pre: boolean, no: (status: string, say: string) => Answer & { woke: boolean }): Promise<Answer & { woke: boolean }> {
+    const now = this.now();
+    const prev = job.wake_fail;
+    if (prev?.config && prev.error === err) {
+      // The same error as before: no new flag. Each hourly recheck moves the retry time (one row).
+      if (now >= prev.retry_at) { prev.retry_at = now + WAKE_CONFIG_RECHECK_MIN * MIN; prev.last_at = now; prev.count += 1; }
+      await this.parkWake(job);
+      if (job.wake_fail!.last_at === now) await this.saveJob(job);
+      return no('wake_blocked', `${job.id}: wakes are not configured (${err}); nothing was posted.`);
+    }
+    job.wake_fail = { count: 1, first_at: now, last_at: now, retry_at: now + WAKE_CONFIG_RECHECK_MIN * MIN, error: err, config: true, escalated: true, pre };
+    await this.addFlag(job, 'escalate', `the job home cannot be woken: ${err}; tell ${job.requester ?? 'the job owner'}, who must fix the snap-in configuration or have an operator close the job`, 'wake');
+    this.addReason(job, `escalate: wakes cannot be delivered (${err}); tell ${job.requester ?? 'the job owner'}`);
+    job.next_wake_at = job.wake_fail.retry_at;
+    await this.saveJob(job);
+    await this.schedule(job.id, job.next_wake_at);
+    return no('wake_blocked', `${job.id}: wakes are not configured (${err}); flagged once, nothing was posted.`);
+  }
+
+  /** R41: a failed post is recorded once; the retry time doubles from 1 to 30 minutes; one escalation after a few tries or the identity window. */
+  private async recordWakeFailure(jobId: string, message: string): Promise<number> {
+    const now = this.now();
+    const j = await this.get<Job>('job', jobId);
+    if (!j) return now + MIN;
+    const prev = j.wake_fail && !j.wake_fail.config ? j.wake_fail : null;
+    const count = (prev?.count ?? 0) + 1;
+    const first = prev?.first_at ?? now;
+    const err = message.slice(0, 200);
+    const wf = { count, first_at: first, last_at: now, retry_at: now + Math.min(2 ** (count - 1), WAKE_BACKOFF_CAP_MIN) * MIN, error: err, config: false, escalated: prev?.escalated ?? false };
+    if (!prev) await this.addFlag(j, 'wake_failed', `posting the wake to the job home failed (${err}); retrying with backoff`, 'wake');
+    if (!wf.escalated && (count >= WAKE_ESCALATE_ATTEMPTS || now - first >= this.config.identityEscalateMinutes * MIN)) {
+      wf.escalated = true;
+      await this.addFlag(j, 'escalate', `the job home could not be woken ${count} time(s) over ${fmtAge(now - first)} (${err}); tell ${j.requester ?? 'the job owner'}`, 'wake');
+      this.addReason(j, `escalate: the job home could not be woken for ${fmtAge(now - first)}; tell ${j.requester ?? 'the job owner'} that nobody is working this job`);
+    }
+    j.wake_fail = wf;
+    j.next_wake_at = wf.retry_at;
+    await this.saveJob(j);
+    await this.schedule(jobId, wf.retry_at);
+    return wf.retry_at;
+  }
+
+  // ---------------------------------------------------------------- admin close (R43)
+
+  /**
+   * Operator cleanup for a job that cannot be closed any other way (for example its home was never created).
+   * Closes it as cancelled with the reason on the record. Runs no effect: no post, no wake, no outcome is invented;
+   * operations still in flight are marked unknown and their leases are released so other jobs are not held.
+   */
+  adminClose(jobId: string, reason: string): Promise<Answer> {
+    return this.serial(() => this.doAdminClose(jobId, reason));
+  }
+
+  private async doAdminClose(jobId: string, reason: string): Promise<Answer> {
+    const job = await this.get<Job>('job', jobId);
+    if (!job) return ans(false, 'no_such_job', `admin close: there is no job "${jobId}".`);
+    if (job.status === 'done' || job.status === 'cancelled') return ans(true, 'job_ended', `admin close: ${jobId} has already ended.`, { job: jobId });
+    const why = reason.trim() || 'no reason given';
+    for (const o of await this.unresolvedOps(job, true)) {
+      if (o.outcome === 'in_flight') { o.outcome = 'unknown'; o.note = o.note || 'the job was closed by an operator while this was in flight; the outcome was never read back'; }
+      await this.releaseLease(o);
+      await this.save('operation', o.key, o);
+    }
+    job.cancel_reason = `admin close: ${why}`;
+    delete job.wake_fail;
+    await this.addFlag(job, 'admin_close', `closed as cancelled by an operator: ${why}`, 'admin');
+    await this.finishJob(job, 'cancelled', true);
+    return ans(true, 'admin_closed', `Closed ${jobId} as cancelled (${why}). No effect was run.`, { job: jobId });
+  }
+
   // ---------------------------------------------------------------- wake
 
   private doWake(jobId: string, reason: string): Promise<Answer> {
@@ -2038,6 +2139,17 @@ export class Engine {
       await this.schedule(job.id, job.next_wake_at);
       return no('run_active', `A run is already active for ${jobId}; no new wake.`);
     }
+    // R41: a config error (no post can ever work) is recorded once and not retried until the config changes.
+    const cfgErr = this.waker.preflight?.() ?? null;
+    if (cfgErr) return this.wakeBlocked(job, cfgErr, true, no);
+    if (job.wake_fail?.pre) {
+      delete job.wake_fail; // the missing input is filled in: try the post on this pass
+      await this.saveJob(job);
+    } else if (job.wake_fail && now < job.wake_fail.retry_at) {
+      // Inside the backoff: no run, no post, no row. Only put the wake back at its retry time if something pulled it earlier.
+      await this.parkWake(job);
+      return no('wake_backoff', `${jobId}: the last wake could not be posted; next try at ${new Date(job.wake_fail.retry_at).toISOString()}.`);
+    }
     const n = job.run_seq + 1;
     const run: Run = { id: `${job.id}:${n}`, job: job.id, n, generation: job.generation, session_id: null, origin: 'wake', started_at: now, last_activity_at: now, state: 'active' };
     const r = await this.create('run', run.id, run);
@@ -2057,12 +2169,20 @@ export class Engine {
       // The reasons were kept, so the retry wake still says why.
       const bad = await this.get<Run>('run', run.id);
       if (bad && bad.session_id === null) { bad.state = 'idle'; await this.save('run', bad.id, bad); }
-      await this.updateJob(job.id, (j) => { j.next_wake_at = Math.min(j.next_wake_at ?? now + MIN, now + MIN); });
-      await this.schedule(job.id, now + MIN);
-      return { ...ans(false, 'wake_failed', `Posting the wake failed (${(e as Error).message}); retrying in 1 minute.`, { job: jobId }), woke: false };
+      if (e instanceof WakeConfigError) {
+        const fresh = await this.get<Job>('job', job.id);
+        if (fresh) return this.wakeBlocked(fresh, e.message, false, no);
+      }
+      const next = await this.recordWakeFailure(job.id, (e as Error).message);
+      return { ...ans(false, 'wake_failed', `Posting the wake failed (${(e as Error).message}); next try at ${new Date(next).toISOString()}.`, { job: jobId }), woke: false };
     }
-    // A pending reason is cleared only after a wake was posted that carried it (M3).
-    await this.updateJob(job.id, (j) => { j.wake_reasons = j.wake_reasons.filter((x) => !posting.includes(x)); });
+    // A pending reason is cleared only after a wake was posted that carried it (M3). A posted wake also ends any failure state.
+    await this.updateJob(job.id, (j) => {
+      const left = j.wake_reasons.filter((x) => !posting.includes(x));
+      if (left.length === j.wake_reasons.length && !j.wake_fail) return false;
+      j.wake_reasons = left;
+      delete j.wake_fail;
+    });
     if (posted && posted.stale_version && !afterReplace) {
       // A3: the home session is pinned to an old agent version; move the job to a fresh home.
       const rr = await this.doReplaceHome(job.id, 'the home session is pinned to a stale agent version', false);

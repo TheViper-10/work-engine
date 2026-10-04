@@ -898,3 +898,130 @@ test('postWake carries a key: the run id for a wake, run id plus a notice sequen
   assert.equal(new Set(notices).size, notices.length, 'each notice has its own key');
   assert.ok(notices.every((k) => k.startsWith(`notice:${job}:2:n`)), notices.join(','));
 });
+
+// ---------------------------------------------------------------- R40 to R43: write budget, wake backoff, admin close
+
+/** Counts rows the store would create: every successful put, create-if-absent or compare-and-set is one new version row. */
+class CountingStore extends MemoryStore {
+  writes = 0;
+  log: string[] = [];
+  override async put<T>(key: string, value: T): Promise<void> { this.writes += 1; this.log.push(key); return super.put(key, value); }
+  override async putIfAbsent<T>(key: string, value: T) { const r = await super.putIfAbsent(key, value); if (r.created) { this.writes += 1; this.log.push(key); } return r; }
+  override async putIfVersion<T>(key: string, value: T, version: number) { const r = await super.putIfVersion(key, value, version); if (r.ok) { this.writes += 1; this.log.push(key); } return r; }
+}
+
+function setupCounting(opts: { fail?: () => boolean; preflight?: () => string | null } = {}) {
+  const store = new CountingStore();
+  const clock = new ManualClock(T0);
+  const attempts: number[] = [];
+  const engine = new Engine({
+    store, clock,
+    sourceReader: { currentBuild: async () => 'b1' },
+    slackReader: { findOwnPostAfter: async () => null },
+    waker: {
+      postWake: async () => { attempts.push(clock.now()); if (opts.fail?.()) throw new Error('home cannot be created'); },
+      ...(opts.preflight ? { preflight: opts.preflight } : {}),
+    },
+    config: defineConfig({ env: 'test', bot: 'bot', ownBotUserId: BOT }),
+    specs: [SPEC],
+  });
+  return { store, clock, attempts, engine };
+}
+
+test('R40: a sweep with no due work writes zero rows', async () => {
+  const e = setupCounting();
+  const job = (await e.engine.jobOpen({ workflow: 'wf-test', target: 't1', thread: 'A', requester: 'U1' }, S1)).job as string;
+  await e.engine.sweep(); // the open wake is due now: it is posted and the job moves to its 30 minute wake
+  const before = e.store.writes;
+  for (let i = 0; i < 10; i++) { e.clock.advance(MIN); await e.engine.sweep(); }
+  assert.equal(e.store.writes - before, 0, 'ten idle sweeps wrote rows');
+  assert.deepEqual(await e.engine.checkInvariants([job]), []);
+  // a whole day: the cursor row is at most one per hour of lag (was one per minute); the other rows are the real 30 minute wakes
+  e.store.log = [];
+  for (let i = 0; i < 1440; i++) { e.clock.advance(MIN); await e.engine.sweep(); }
+  const cursor = e.store.log.filter((k) => k.includes(':sweep_cursor:')).length;
+  assert.ok(cursor <= 24, `the cursor wrote ${cursor} rows in a day`);
+});
+
+test('R41: a failing waker backs off 1, 2, 4, 8 minutes, writes nothing inside the backoff, and escalates once', async () => {
+  const e = setupCounting({ fail: () => true });
+  const job = (await e.engine.jobOpen({ workflow: 'wf-test', target: 't1', thread: 'A', requester: 'U1' }, S1)).job as string;
+  const perTick: number[] = [];
+  let cursorRows = 0; // the cursor row (one per hour of lag, R40) is counted apart from the wake rows
+  e.clock.advance(30 * MIN); // the first wake is due
+  const t1 = e.clock.now();
+  for (let i = 0; i < 70; i++) { const w = e.store.writes; e.store.log = []; await e.engine.sweep(); perTick.push(e.store.writes - w); cursorRows += e.store.log.filter((k) => k.includes(':sweep_cursor:')).length; perTick[perTick.length - 1] -= e.store.log.filter((k) => k.includes(':sweep_cursor:')).length; e.clock.advance(MIN); }
+  // attempts at minutes 0, 1, 3, 7, 15, 31, 61 after the first due wake: the gaps are 1, 2, 4, 8, 16, 30
+  const mins = e.attempts.map((t) => Math.round((t - t1) / MIN));
+  assert.deepEqual(mins, [0, 1, 3, 7, 15, 31, 61]);
+  assert.ok(cursorRows <= 2, `the cursor wrote ${cursorRows} rows in 70 minutes`);
+  const quiet = perTick.filter((n, i) => !mins.includes(i));
+  assert.equal(quiet.reduce((a, b) => a + b, 0), 0, `ticks inside the backoff wrote rows: ${perTick.join(',')}`);
+  const perFail = perTick.filter((n, i) => mins.includes(i));
+  assert.ok(Math.max(...perFail.slice(1)) <= 8, `a repeat failure is bounded, got ${perFail.join(',')}`);
+  assert.ok(perFail.reduce((a, b) => a + b, 0) <= 60, `an hour of failing wakes wrote ${perFail.reduce((a, b) => a + b, 0)} rows (was about 270)`);
+  const view: any = await e.engine.jobView({ job }, S2);
+  const flags: string[] = view.jobs[0].flags.map((f: any) => f.check);
+  assert.equal(flags.filter((c) => c === 'wake_failed').length, 1, 'the failure is recorded once');
+  assert.equal(flags.filter((c) => c === 'escalate').length, 1, 'escalates once');
+  assert.match(view.say_to_tony, /Wake:.*failed.*Tell U1/s, 'the view names the owner');
+  await ok(e as any, [job]);
+});
+
+test('R41: a wake that works after failures clears the failure state and posts once', async () => {
+  let down = true;
+  const e = setupCounting({ fail: () => down });
+  const job = (await e.engine.jobOpen({ workflow: 'wf-test', target: 't1', thread: 'A' }, S1)).job as string;
+  e.clock.advance(30 * MIN);
+  for (let i = 0; i < 5; i++) { await e.engine.sweep(); e.clock.advance(MIN); }
+  assert.ok(e.attempts.length >= 2);
+  down = false;
+  for (let i = 0; i < 10; i++) { await e.engine.sweep(); e.clock.advance(MIN); }
+  const ok1 = e.attempts.length;
+  const w = e.store.writes;
+  for (let i = 0; i < 5; i++) { await e.engine.sweep(); e.clock.advance(MIN); }
+  assert.ok(e.store.writes - w <= 1, 'after recovery, idle ticks write nothing (at most the hourly cursor)');
+  assert.equal(e.attempts.length, ok1);
+  const view: any = await e.engine.jobView({ job }, S2);
+  assert.doesNotMatch(view.say_to_tony, /Wake:/);
+});
+
+test('R41: a missing wake config is flagged once, never posted, and tried again after it is fixed', async () => {
+  let cfg: string | null = 'snap-in input wake_user is empty';
+  const e = setupCounting({ preflight: () => cfg });
+  const job = (await e.engine.jobOpen({ workflow: 'wf-test', target: 't1', thread: 'A', requester: 'U1' }, S1)).job as string;
+  e.clock.advance(30 * MIN);
+  await e.engine.sweep(); // the first due wake: flagged once
+  const w = e.store.writes; e.store.log = [];
+  for (let i = 0; i < 50; i++) { e.clock.advance(MIN); await e.engine.sweep(); }
+  assert.deepEqual(e.store.log.filter((k) => !k.includes(':sweep_cursor:')), [], 'no rows while the config is missing (inside the recheck window)');
+  assert.equal(e.attempts.length, 0, 'no post was tried');
+  const view: any = await e.engine.jobView({ job }, S2);
+  assert.equal(view.jobs[0].flags.filter((f: any) => f.check === 'escalate').length, 1);
+  assert.match(view.say_to_tony, /wake configuration is missing.*Tell U1/s);
+  cfg = null;
+  for (let i = 0; i < 70; i++) { e.clock.advance(MIN); await e.engine.sweep(); }
+  assert.ok(e.attempts.length >= 1, 'after the config is fixed the post is tried');
+  assert.equal((await e.engine.checkInvariants([job])).length, 0);
+});
+
+test('R43: adminClose cancels a stuck job with a reason, runs no effect, and a second call writes nothing', async () => {
+  const e = setupCounting({ fail: () => true });
+  const job = (await e.engine.jobOpen({ workflow: 'wf-test', target: 't1', thread: 'A' }, S1)).job as string;
+  e.clock.advance(30 * MIN);
+  await e.engine.sweep();
+  const r = await e.engine.adminClose(job, 'home never created');
+  assert.equal(r.status, 'admin_closed');
+  const posts = e.attempts.length;
+  const j: any = await e.store.get(makeKey('test', 'bot', 'job', job));
+  assert.equal(j.status, 'cancelled'); assert.match(j.cancel_reason, /home never created/); assert.equal(j.next_wake_at, null);
+  assert.deepEqual(await e.engine.checkInvariants([job]), []);
+  const w = e.store.writes; e.store.log = [];
+  assert.equal((await e.engine.adminClose(job, 'again')).status, 'job_ended');
+  for (let i = 0; i < 5; i++) { e.clock.advance(MIN); await e.engine.sweep(); }
+  assert.deepEqual(e.store.log.filter((k) => !k.includes(':sweep_cursor:')), []); void w; assert.equal(e.attempts.length, posts, 'closing posted nothing');
+  assert.equal((await e.engine.adminClose('wf-test:none', 'x')).status, 'no_such_job');
+  // the target is free again for a new job
+  const next = await e.engine.jobOpen({ workflow: 'wf-test', target: 't1', thread: 'B' }, S1);
+  assert.equal(next.status, 'opened');
+});

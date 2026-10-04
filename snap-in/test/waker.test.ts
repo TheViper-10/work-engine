@@ -3,9 +3,10 @@ import { test } from 'node:test';
 import { scoped } from '../src/platform.ts';
 import { dmmapKey, dmrevKey, PlatformSessionDirectory } from '../src/directory.ts';
 import { PlatformWaker, WAKE_GRACE_MS } from '../src/waker.ts';
+import { WakeConfigError } from '../../src/types.ts';
 import { ApiError } from '../src/platform.ts';
-import { FakePlatform, TONY, OWNER_USER, WAKE_WORKFLOW } from './fake-platform.ts';
-import { storeFor } from './helpers.ts';
+import { ALLOWED, FakePlatform, TONY, OWNER_USER, WAKE_WORKFLOW } from './fake-platform.ts';
+import { dispatcher, OWNER_SLACK, storeFor } from './helpers.ts';
 
 function wakerFor(f: FakePlatform, o: { keyring?: boolean } = {}) {
   const ev = f.timerEvent();
@@ -82,7 +83,7 @@ test('a timeout before the trigger ran: resend only after the grace period, and 
 test('a definite refusal (403) sends nothing and the next attempt may go at once', async () => {
   const f = new FakePlatform(); const { waker } = wakerFor(f);
   f.inject('workflows.trigger', { status: 403, type: 'forbidden' });
-  await assert.rejects(waker.postWake(LOGICAL, 'denied', 'denied'), (e: ApiError) => e.status === 403);
+  await assert.rejects(waker.postWake(LOGICAL, 'denied', 'denied'), (e: Error) => e instanceof WakeConfigError && /refused the owner_identity token \(403\)/.test(e.message));
   assert.equal(f.triggers.length, 0);
   await waker.postWake(LOGICAL, 'denied', 'denied');
   assert.equal(f.triggers.length, 1);
@@ -161,4 +162,55 @@ test('429 on chats.create surfaces so the engine keeps its wake reason', async (
   f.inject('chats.create', { status: 429, type: 'rate_limited' });
   await assert.rejects(waker.postWake(LOGICAL, 'busy', 'busy'), (e: ApiError) => e.status === 429);
   assert.equal(f.triggers.length, 0);
+});
+
+test('R45: the home DM is created by the owner token for the owner token\'s own user, resolved once', async () => {
+  const f = new FakePlatform(); f.ownerUser = 'don:identity:dvrv-us-1:devo/1lKlCUXYGG:devu/1';
+  f.installInputs.wake_user = 'devu/1'; // short form of the same user: the cross-check accepts it
+  const api = f.deps().devrev(f.timerEvent());
+  const waker = new PlatformWaker({ store: storeFor(f), clock: f.clock, env: 'qa', bot: 'tony', chat: scoped(api, 'service'), owner: scoped(api, 'owner'), tonyAgent: TONY, wakeUser: 'devu/1', wakeWorkflow: WAKE_WORKFLOW });
+  await waker.postWake(LOGICAL, 'a', 'k1');
+  await waker.postWake('dm:desktop-release:other', 'b', 'k2');
+  const chats = [...f.chats.values()];
+  assert.equal(chats.length, 2);
+  for (const c of chats) assert.deepEqual(c.users, [f.ownerUser]);
+  assert.equal(f.log.filter((l) => l.path === 'dev-users.self').length, 1, 'resolved once and cached');
+  assert.ok(f.log.filter((l) => l.path === 'chats.create' || l.path === 'chats.update').every((l) => l.as === 'owner'));
+});
+
+test('R45: a wake_user that is not the owner token\'s user is a config error before any DM exists', async () => {
+  const f = new FakePlatform(); f.ownerUser = 'don:identity:dvrv-us-1:devo/1lKlCUXYGG:devu/1';
+  const api = f.deps().devrev(f.timerEvent());
+  const waker = new PlatformWaker({ store: storeFor(f), clock: f.clock, env: 'qa', bot: 'tony', chat: scoped(api, 'service'), owner: scoped(api, 'owner'), tonyAgent: TONY, wakeUser: 'don:identity:dvrv-us-1:devo/1lKlCUXYGG:devu/2', wakeWorkflow: WAKE_WORKFLOW });
+  await assert.rejects(waker.postWake(LOGICAL, 'x', 'k'), (e: Error) => e instanceof WakeConfigError && /must be the same user/.test(e.message));
+  assert.equal(f.chats.size, 0); assert.equal(f.triggers.length, 0);
+  assert.equal([...f.rows.keys()].filter((k) => /:dmmap:/.test(k)).length, 0, 'no dmmap row is left at "creating"');
+});
+
+test('R45: a non-member 403 from the wake workflow is a config error, not an endless retry', async () => {
+  const f = new FakePlatform(); const { waker, store } = wakerFor(f);
+  // a home that exists but does not contain the owner token's user
+  f.chats.set('dm-foreign', { id: 'dm-foreign', display_state: 'hidden', members: [TONY], users: ['someone-else'], type: 'dm' });
+  await store.put(dmmapKey('qa', 'tony', LOGICAL), { state: 'ready', dm: 'dm-foreign', agent_version: f.tonyVersion, created_at: 1 });
+  await assert.rejects(waker.postWake(LOGICAL, 'x', 'k'), (e: Error) => e instanceof WakeConfigError && /refused the owner_identity token \(403\)/.test(e.message));
+  assert.equal(f.triggers.length, 0);
+});
+
+test('R45: through the dispatcher a 403 from the wake workflow is flagged once and stops the retries', async () => {
+  const f = new FakePlatform(); const d = dispatcher(f);
+  const rootA = f.root(ALLOWED, OWNER_SLACK, 'r');
+  const opened = await d.call({ call: 'job_open', workflow: 'desktop-release', target: '6.0.1', thread: `${ALLOWED}:${rootA}`, intent: 'join', requester: OWNER_SLACK });
+  f.inject('workflows.trigger', { status: 403, type: 'forbidden', times: 1000 });
+  f.clock.advanceMinutes(31); await d.tick(); // the first due wake is refused and flagged
+  const after = f.creates; const triggerCalls = () => f.log.filter((l) => l.path === 'workflows.trigger').length;
+  const calls = triggerCalls();
+  for (let i = 0; i < 50; i++) { f.clock.advanceMinutes(1); await d.tick(); }
+  assert.equal(triggerCalls(), calls, 'the post is not retried inside the hourly recheck');
+  assert.ok(f.creates - after <= 2, `50 ticks created ${f.creates - after} rows: ${f.createdKeys.slice(after).join(', ')}`);
+  const view: any = await d.call({ call: 'job_view', job: opened.job });
+  assert.match(String(view.say_to_tony), /wake configuration is missing[^]*refused the owner_identity token/);
+});
+
+test('R45: a wake is not called failed before 5 minutes (a reply can take about 3)', () => {
+  assert.ok(WAKE_GRACE_MS >= 5 * 60_000);
 });

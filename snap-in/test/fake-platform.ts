@@ -36,6 +36,8 @@ export class FakePlatform {
   readonly sessions = new Map<string, Session>();
   readonly timeline = new Map<string, TimelineEntry[]>();
   readonly triggers: Array<{ id: string; dm: string; note: string; receipt: string; by: Identity }> = [];
+  /** The user behind the owner_identity keyring token. */
+  ownerUser = OWNER_USER;
   tonyVersion = `${TONY}:version/1`;
   listLagMs = 5000;
   triggerDelayMs = 0;
@@ -91,6 +93,8 @@ export class FakePlatform {
   }
   sessionIn(dm: string): string { return this.newSession(dm); }
   comments(dm: string): TimelineEntry[] { return this.timeline.get(dm) ?? []; }
+  /** Successful row creates so far (each is one new immutable version row). The row-budget counter. */
+  get creates(): number { return this.createdKeys.length; }
   rowCount(leaf?: string): number { return [...this.rows.values()].filter((r) => !leaf || r.leaf_type === leaf).length; }
   insertRaw(leaf: string, uk: string, value: unknown): void {
     this.insert(leaf, uk, { tnt__kind: uk.split(':')[3] ?? '', tnt__job_key: '', tnt__state: '', tnt__version: Number(uk.split('@v')[1] ?? 1), tnt__body: JSON.stringify(value) }, 'raw');
@@ -208,6 +212,8 @@ export class FakePlatform {
         if (!s) throw new ApiError(404, 'not_found', 'not_found');
         return { agent_session: { id: s.id, agent: s.agent, parent: s.parent, session_object: `${s.parent}|${s.user}` } };
       }
+      case 'dev-users.self':
+        return { dev_user: { id: as === 'owner' ? this.ownerUser : OWNER_USER } };
       case 'ai-agents.get':
         return { ai_agent: { id: b.id, default_version_id: this.tonyVersion } };
       case 'chats.create': {
@@ -226,6 +232,8 @@ export class FakePlatform {
         if (b.id !== WAKE_WORKFLOW) throw new ApiError(404, 'workflow not found', 'not_found');
         const v = b.payload?.value ?? {};
         if (!this.chats.has(v.dm_id)) throw new ApiError(400, 'unknown dm', 'bad_request');
+        // The clone's add_comment step runs as the triggering user: a non-member gets a 403 and nothing is posted.
+        if (!this.chats.get(v.dm_id)!.users.includes(this.ownerUser)) throw new ApiError(403, 'add_comment: forbidden (not a member of the conversation)', 'forbidden');
         const run = `${WAKE_WORKFLOW}:workflow_run/${this.seq += 1}`;
         const list = this.timeline.get(v.dm_id) ?? [];
         list.push({ id: `${v.dm_id}:comment/${list.length + 1}`, object: v.dm_id, body: String(v.continuation_note), created_by: { id: OWNER_USER }, created_at: this.clock.now(), visible_at: this.clock.now() + this.triggerDelayMs });

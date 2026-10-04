@@ -9,7 +9,7 @@ import { ApiError, httpDeps, scoped, type Deps, type DevRevApi, type Identity } 
 import { PlatformSlackReader, SlackPoller, normThread } from './slack.ts';
 import { GithubSourceReader } from './source.ts';
 import { BodyTooLargeError, PlatformStore } from './store-platform.ts';
-import { engineConfig, readInputs, SPECS, type Inputs } from './specs.ts';
+import { engineConfig, parseAdminClose, readInputs, SPECS, type Inputs } from './specs.ts';
 import { PlatformWaker } from './waker.ts';
 
 export const CALLS = ['job_open', 'job_view', 'intend', 'say', 'promise_add', 'checkpoint'] as const;
@@ -140,12 +140,17 @@ export async function runOperation(event: any, deps: Deps): Promise<Answer> {
 
 // ---------------------------------------------------------------- timer path
 
-export interface TickResult { poll: Awaited<ReturnType<SlackPoller['poll']>> | null; sweep: Answer | null; errors: string[] }
+export interface TickResult { poll: Awaited<ReturnType<SlackPoller['poll']>> | null; sweep: Answer | null; errors: string[]; admin: Answer[] }
 
 export async function runTick(event: any, deps: Deps): Promise<TickResult> {
-  const out: TickResult = { poll: null, sweep: null, errors: [] };
+  const out: TickResult = { poll: null, sweep: null, errors: [], admin: [] };
   const started = deps.clock.now();
   const rt = await buildRuntime(event, deps, 'service');
+  // R43: operator cleanup. The list comes only from the installation's inputs, which a session or an operation call cannot set.
+  // The service-account timer context is the only place it runs. An already-ended job is a no-op (no rows), so a stale entry is harmless.
+  for (const { job, reason } of parseAdminClose(rt.inputs.admin_close_jobs)) {
+    try { out.admin.push(await rt.engine.adminClose(job, reason)); } catch (e) { out.errors.push(`admin_close ${job}: ${(e as Error).message}`); }
+  }
   try { out.poll = await rt.poller.poll(); out.errors.push(...out.poll.errors); } catch (e) { out.errors.push(`poll: ${(e as Error).message}`); }
   if (deps.clock.now() - started > TICK_BUDGET_MS) { out.errors.push('tick budget spent after the poll; sweep left for the next tick'); return out; }
   try { out.sweep = await rt.engine.sweep(); } catch (e) { out.errors.push(`sweep: ${(e as Error).message}`); }

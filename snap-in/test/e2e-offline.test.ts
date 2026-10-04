@@ -11,6 +11,8 @@ import { storeFor } from './helpers.ts';
 import { createWorkEngine } from '../src/index.ts';
 
 const WF = 'desktop-release';
+/** Rows created by the interruption-boundary journey. Lower it when a change removes writes; never raise it without a decision-log entry. */
+const ROW_BUDGET = 66; // R42: was 77 before the unchanged-write skip and the single post-trigger write
 
 test('interruption-boundary journey through the dispatcher', async () => {
   const f = new FakePlatform(); const d = dispatcher(f);
@@ -98,9 +100,17 @@ test('interruption-boundary journey through the dispatcher', async () => {
   const map: any = await store.get(dmmapKey('qa', 'tony', jobRow.dm_id));
   assert.equal(map.dm, home.id);
   // nothing was written by an unexpected identity: the caller path never used the owner keyring
-  assert.ok(f.log.filter((l) => l.as === 'owner').every((l) => l.path === 'workflows.trigger'));
+  // the owner token is used for exactly four things: who it is, creating and hiding the home DM, and the wake trigger
+  assert.ok(f.log.filter((l) => l.as === 'owner').every((l) => ['workflows.trigger', 'dev-users.self', 'chats.create', 'chats.update'].includes(l.path)));
+  assert.ok(f.log.filter((l) => l.path === 'chats.create' || l.path === 'chats.update').every((l) => l.as === 'owner'), 'the service account never creates the home DM');
   // the operation path has no owner keyring: a notice attempted there is refused before any send, so sent triggers match successful owner calls
-  assert.equal(f.log.filter((l) => l.as === 'owner' && l.status === 200).length, f.triggers.length);
+  assert.equal(f.log.filter((l) => l.as === 'owner' && l.path === 'workflows.trigger' && l.status === 200).length, f.triggers.length);
+  // R42 row budget: every created row is one immutable version; print the journey's total and its split by kind.
+  const byKind: Record<string, number> = {};
+  for (const k of f.rows.keys()) { const kind = k.split(':')[3] ?? '?'; byKind[kind] = (byKind[kind] ?? 0) + 1; }
+  if (process.env.ROWS_DETAIL) { const per: Record<string, number> = {}; for (const k of f.rows.keys()) { const b = k.replace(/@v\d+$/, ''); per[b] = (per[b] ?? 0) + 1; } console.log(Object.entries(per).filter(([, n]) => n > 1).map(([k, n]) => `${n} ${k.split(':').slice(3).join(':')}`).join('\n')); }
+  console.log(`ROWS interruption-boundary journey: ${f.rows.size} total ${JSON.stringify(byKind)}`);
+  assert.ok(f.rows.size <= ROW_BUDGET, `journey created ${f.rows.size} rows, budget ${ROW_BUDGET}: ${JSON.stringify(byKind)}`);
 });
 
 test('dispatcher rejects authority fields, unknown calls and unsupported events', async () => {
@@ -177,4 +187,112 @@ test('the operation path with no owner keyring cannot wake, and the caller token
 test('a factory built on the fake is independent of the real HTTP deps', () => {
   const f = new FakePlatform();
   assert.equal(typeof createWorkEngine(f.deps()), 'function');
+});
+
+// ---------------------------------------------------------------- R40 to R43: live QA defects, reproduced offline
+
+async function openAndWake(f: FakePlatform, d: ReturnType<typeof dispatcher>, target: string) {
+  const rootA = f.root(ALLOWED, OWNER_SLACK, 'r'); const threadA = `${ALLOWED}:${rootA}`;
+  const opened = await d.call({ call: 'job_open', workflow: WF, target, thread: threadA, intent: 'join', requester: OWNER_SLACK });
+  return { job: opened.job as string, threadA };
+}
+
+test('live defect 1: ten idle ticks create zero rows through the dispatcher', async () => {
+  const f = new FakePlatform(); const d = dispatcher(f);
+  const { job } = await openAndWake(f, d, '5.3.1');
+  f.clock.advanceMinutes(1); await d.tick(); // wakes the job, creates the home
+  const home = [...f.chats.values()][0]; const s = f.sessionIn(home.id);
+  const cp = await d.call({ call: 'checkpoint', job, status: 'working', waiting_for: 'qa', next_wake_in: '60m', agent_session_id: s });
+  assert.equal(cp.ok, true);
+  await d.tick(); // settle anything the checkpoint left for the sweep
+  const before = f.creates;
+  for (let i = 0; i < 10; i++) { f.clock.advanceMinutes(1); await d.tick(); }
+  assert.equal(f.creates - before, 0, `idle ticks created: ${f.createdKeys.slice(before).join(', ')}`);
+});
+
+test('live defect 1b: a bare install with no job also writes nothing per tick', async () => {
+  const f = new FakePlatform(); const d = dispatcher(f);
+  for (let i = 0; i < 10; i++) { f.clock.advanceMinutes(1); await d.tick(); }
+  assert.equal(f.creates, 0);
+});
+
+test('live defect 2: empty wake_user and wake_workflow are flagged once and cost no rows per tick afterwards', async () => {
+  const f = new FakePlatform(); f.installInputs.wake_user = ''; f.installInputs.wake_workflow = ''; const d = dispatcher(f);
+  const { job } = await openAndWake(f, d, '5.3.2');
+  f.clock.advanceMinutes(1); await d.tick();
+  const afterFirst = f.creates;
+  for (let i = 0; i < 60; i++) { f.clock.advanceMinutes(1); await d.tick(); }
+  assert.ok(f.creates - afterFirst <= 6, `60 ticks with no wake config created ${f.creates - afterFirst} rows (live: about 270)`);
+  assert.equal(f.chats.size, 0, 'no home DM was created against a config that cannot wake it');
+  assert.equal(f.triggers.length, 0);
+  const dmmaps = [...f.rows.keys()].filter((k) => /:dmmap:/.test(k));
+  assert.deepEqual(dmmaps, [], 'no dmmap row stuck at "creating"');
+  const store = storeFor(f);
+  const flags = [...f.rows.keys()].filter((k) => /:flag:/.test(k) && k.endsWith('@v1'));
+  const bodies = await Promise.all(flags.map((k) => store.get<any>(k.replace(/@v1$/, ''))));
+  assert.equal(bodies.filter((b) => b.check === 'escalate' && /cannot be woken/.test(b.detail)).length, 1, 'the wake failure escalates exactly once (the separate identity escalation is a different flag)');
+  const view: any = await d.call({ call: 'job_view', job });
+  assert.match(String(view.say_to_tony), /wake configuration is missing/);
+  assert.match(String(view.say_to_tony), new RegExp(OWNER_SLACK));
+});
+
+test('live defect 2b: a wake that fails after the dmmap is written to "creating" backs off, then recovers on a real attempt', async () => {
+  const f = new FakePlatform(); const d = dispatcher(f);
+  const { job } = await openAndWake(f, d, '5.3.3');
+  f.inject('chats.create', { status: 500, type: 'internal', message: 'boom', times: 3 });
+  const perTick: number[] = [];
+  for (let i = 0; i < 40; i++) { f.clock.advanceMinutes(1); const c = f.creates; await d.tick(); perTick.push(f.creates - c); }
+  const total = perTick.reduce((a, b) => a + b, 0);
+  assert.ok(total < 60, `40 failing ticks wrote ${total} rows: ${perTick.join(',')}`);
+  const map = [...f.rows.keys()].filter((k) => /:dmmap:dm:/.test(k));
+  assert.equal(map.length > 0, true);
+  // chats.create stops failing; the next real wake attempt creates the DM and the map becomes ready
+  for (let i = 0; i < 70; i++) { f.clock.advanceMinutes(1); await d.tick(); }
+  const homes = [...f.chats.values()];
+  assert.equal(homes.length, 1, 'the home was created once, after the failure cleared');
+  assert.ok(f.triggers.length >= 1);
+  const store = storeFor(f);
+  const jobRow: any = await store.get(`work-engine:qa:tony:job:${job}`);
+  const row: any = await store.get(dmmapKey('qa', 'tony', jobRow.dm_id));
+  assert.equal(row.state, 'ready'); assert.equal(row.dm, homes[0].id);
+});
+
+test('live defect 3: a job whose home cannot be created is closed by the operator list, with no effect', async () => {
+  const f = new FakePlatform(); f.installInputs.wake_user = ''; const d = dispatcher(f);
+  const { job } = await openAndWake(f, d, '5.3.4');
+  const mention = f.newMentionDm();
+  // the conversation session cannot cancel (by design)
+  const cancel = await d.call({ call: 'checkpoint', job, status: 'cancelled', agent_session_id: mention.session });
+  assert.notEqual(cancel.job_status, 'cancelled');
+  f.clock.advanceMinutes(1); await d.tick();
+  // an operation input cannot reach the admin path
+  const forged = await d.call({ call: 'job_view', job, admin_close: job } as any);
+  assert.equal(forged.ok !== undefined, true);
+  const jobKey = `work-engine:qa:tony:job:${job}`;
+  const store = storeFor(f);
+  assert.notEqual((await store.get<any>(jobKey))!.status, 'cancelled', 'no operation input closes a job');
+  // the operator sets admin_close_jobs on the installation; the next timer tick closes it
+  f.installInputs.admin_close_jobs = `${job}=home never created (wake config was empty)`;
+  const posts = f.triggers.length; const chats = f.chats.size;
+  f.clock.advanceMinutes(1); await d.tick();
+  const closed = (await storeFor(f).get<any>(jobKey))!; // a fresh store: the earlier one caches the latest version
+  assert.equal(closed.status, 'cancelled'); assert.match(closed.cancel_reason, /home never created/); assert.equal(closed.next_wake_at, null);
+  assert.equal(f.triggers.length, posts); assert.equal(f.chats.size, chats, 'closing created no DM and posted nothing');
+  // the list stays set: later ticks write nothing
+  const c = f.creates;
+  for (let i = 0; i < 5; i++) { f.clock.advanceMinutes(1); await d.tick(); }
+  assert.equal(f.creates, c);
+});
+
+test('the admin close list is read only from the installation, never from an operation call', async () => {
+  const f = new FakePlatform(); const d = dispatcher(f);
+  const { job } = await openAndWake(f, d, '5.3.5');
+  for (const field of ['admin_close_jobs', 'admin_close', 'admin_token', 'maintenance']) {
+    await d.call({ call: 'job_view', job, [field]: job } as any);
+  }
+  f.clock.advanceMinutes(1); await d.tick();
+  assert.notEqual((await storeFor(f).get<any>(`work-engine:qa:tony:job:${job}`))!.status, 'cancelled');
+  const m = (await import('node:fs')).readFileSync(new URL('../manifest.yaml', import.meta.url), 'utf8');
+  const opBlock = m.slice(m.indexOf('operations:'));
+  assert.doesNotMatch(opBlock, /admin_close|admin_token|maintenance/);
 });

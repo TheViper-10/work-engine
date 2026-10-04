@@ -97,6 +97,11 @@ inputs:
       default_value: ''
       is_required: false
       ui: { display_name: 'Guidance version (sha of playbook and references)' }
+    - name: admin_close_jobs
+      field_type: text
+      default_value: ''
+      is_required: false
+      ui: { display_name: 'Operator cleanup: jobs to close as cancelled (job-id=reason; job-id=reason)' }
 
 event_sources:
   organization:
