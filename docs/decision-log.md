@@ -98,3 +98,13 @@ All choices pick the option closest to L1 to L4: the engine records and wakes, T
 - **Indexes (M9).** Ended jobs are pruned from `thread_index` and `open_jobs`. Per-job key arrays inside one record are parked for phase 3 sharding.
 - **Lows.** L2: `intend` on a done job keeps it done and flags `job_ended`. L3: re-linking with `private: true` upgrades the link. L4: `say` and `promise_add` on an ended job record the call and answer in words, `ok` true. L1 (14-day outage, clock skew) is parked: phase 3 sweeps scan a bounded catch-up window and use the store's clock.
 - **Lint (M7).** Add a Slack id pattern and string-split detection for banned words; add a spec lint that rejects keys outside the spec shape and values that are not plain ids. `qa`, `live` and `main` stay allowed in engine code only as spec-read values, not literals: literal comparisons to any spec id fail.
+
+## R18. R17 completion: test expectations and two engine fixes from the random sim
+- Calls: the named cases "crash after post", "missed bot post" and "twin runs" were stale tests, not engine bugs. R17 intentionally answers `busy` while a claim is younger than `claim_stale_minutes` and lets only a write bind a run (M2), so the tests now advance the clock past the stale window or bind with a write. Engine fixes found by the random sim: a delivery voided by a cancel after it was claimed is treated as a stale unseen claim (the next session reads the thread before posting), and `sweep` re-reads the due index for up to four passes so a job promoted during the sweep is woken in the same sweep. `intend` now sets the resource on an operation that first arrived by checkpoint.
+- Evidence: `redteam-fixes` b7c2fb9; lint, 33 unit tests, 1,000 + 1,000 random orders, 16 named cases and 28 repros green. Merged to `main` (8b4f9fe; previous `main` tagged `pre-r17-merge`).
+- Alternative: unbounded sweep loop. Rejected; four passes bound the work per sweep and the next sweep catches anything left.
+
+## R19. Scripted Tony stands down only when another session is the work run
+- Call: after R17 M2, a wake view shows `work_run: none` until the first write; the scripted Tony now continues on `none` and stops only on `other` (133ddd6). Scripted replay: 9 of 9 pass in flag and hold, engine calls median 82, max 95.
+- Evidence: post-merge scripted run went 0 of 9 because every woken session quit after one `job_view`.
+- Alternative: make `job_view` bind a pending wake run again. Rejected; it reopens red-team M2.
