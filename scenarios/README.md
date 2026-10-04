@@ -43,6 +43,8 @@ Each entry that reaches the engine carries `event`: `{source, kind, thread, send
 sender_kind, ref, attrs, delivered}`. `delivered: false` means the world changes but the engine
 never receives the event (the dropped merge webhook in `run4`).
 
+`event.attrs.inbox_kind` (`cancel`, `request`, `approval`, `message`) is the connector's structured hint for the engine's inbox routing; the engine never reads message text. It is set on go, sign-off and cancel messages.
+
 Placeholders: `<pr>` and `<id>` are replaced by the scenario's PR number and pipeline id.
 
 ## Scenarios and their source
@@ -57,6 +59,7 @@ Placeholders: `<pr>` and `<id>` are replaced by the scenario's PR number and pip
 | `private-evidence.json` | derived | v2.18 B/C shape | private thread C evidence hidden from B |
 | `twin-mention.json` | derived | v2.18 mention burst, bad run 2026-10-03 | two mentions and a twin wake during an active run |
 | `missed-bot-post.json` | derived | handoff 28 section 2 (posting option B) | Tony's live post not seen; sweep reconciles |
+| `interruption-boundary.json` | derived | job-home contract A1, A4; stale-go base | B asks for status while the home worker waits on A's go; B answered in B by a non-home session, run unchanged; the go reaches the inbox and is applied to build abc |
 | `queued-second-release.json` | derived | call-map moment 3 (`release_in_progress`) | 5.2.12 requested mid-run becomes a queued job |
 
 Derived variants reuse one compact happy-path timeline (kickoff, B question, unmentioned approval,

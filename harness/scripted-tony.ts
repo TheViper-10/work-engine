@@ -63,7 +63,7 @@ class Play {
   async *main(): G<string> {
     const mention = /^\[[^\]]+\] Slack message in thread (\w+) from/.exec(this.trigger);
     if (mention) return yield* this.mentionSession(mention[1]!, this.trigger.split(':\n\n').slice(1).join(':\n\n'));
-    const w = /for job (desktop-release:[^\s:]+): /.exec(this.trigger);
+    const w = /for job (desktop-release:\S+?)(?: \(home generation \d+\))?: /.exec(this.trigger);
     if (!w) return 'Nothing to do.';
     this.jobId = w[1]!;
     const [v] = yield [{ name: 'job_view', input: { job: this.jobId } }];
@@ -79,10 +79,11 @@ class Play {
     return label === 'Q' ? 'qa' : label === 'A' || label === 'D' ? 'request' : 'side';
   }
 
+  /** A mention session runs outside the job home (A1): it answers from job_view, links its thread, records promises. It never acts. */
   private async *mentionSession(thread: string, text: string): G<string> {
     const [v0] = yield [{ name: 'job_view', input: { thread } }];
-    let workRun = 'none';
     let queuedBehind = '';
+    let view: any = v0?.jobs?.[0];
     const explicit = /\b(\d+\.\d+\.\d+)\b/.exec(text)?.[1];
     const after = /after this one|also do/i.test(text);
     if (v0?.status === 'no_job_here') {
@@ -96,35 +97,24 @@ class Play {
       }
       if (after && open.length) { intent = 'queue'; queuedBehind = open[0]!; }
       const [o] = yield [{ name: 'job_open', input: { workflow: 'desktop-release', target, thread, role: this.roleOf(thread), private: this.privateLabels.has(thread) || undefined, intent } }];
-      this.jobId = o?.job ?? '';
       this.target = target;
-      workRun = o?.work_run ?? 'none';
+      // route: the request needs the job owner. Nothing was started; say so.
+      if (o?.status === 'route') return 'The job owner has been told and will follow up here.';
+      this.jobId = o?.job ?? '';
+      view = o?.view;
     } else {
-      const d = v0?.jobs?.[0];
-      if (!d) return 'I could not find that release.';
-      this.jobId = d.job;
-      this.target = d.target;
-      workRun = d.work_run;
-      if (d.status !== 'done' && d.status !== 'cancelled' && workRun === 'none') {
-        const [o] = yield [{ name: 'job_open', input: { workflow: 'desktop-release', target: d.target, thread, role: this.roleOf(thread), private: this.privateLabels.has(thread) || undefined, intent: 'join' } }];
-        workRun = o?.work_run ?? 'none';
-      }
+      if (!view) return 'I could not find that release.';
+      this.jobId = view.job;
+      this.target = view.target;
     }
-    if (queuedBehind) {
-      if (workRun === 'you') yield [this.cp(`queued behind ${queuedBehind}`, queuedBehind, '30m')];
-      return `${this.target} is queued behind ${queuedBehind.split(':')[1]}. I will start it once that release is live.`;
-    }
+    if (queuedBehind) return `${this.target} is queued behind ${queuedBehind.split(':')[1]}. I will start it once that release is live.`;
     const wantsPromise = /tell me when|let me know when|ping me when/i.test(text);
-    if (wantsPromise) {
+    if (wantsPromise && this.jobId) {
       const about = /\blive|alpha done|on alpha\b/i.test(text) && !/QA/i.test(text) ? 'live' : 'qa_ready';
       yield [{ name: 'promise_add', input: { job: this.jobId, thread, about, fallback_time: '4h' } }];
     }
-    if (workRun === 'you') return yield* this.pass(thread, text);
-    // conversation session: answer from the briefing and live reads, do not act
-    const F: any = yield* this.read();
-    this.lastF = F;
-    if (/\bcancel/i.test(text) && F.view.status !== 'cancelled') return 'Understood. I will not start anything new; the release is being cancelled.';
-    return this.answer(F, text, null);
+    if (/\bcancel/i.test(text) && view?.status !== 'cancelled') return 'Understood. The job owner has been told and will handle the cancel.';
+    return this.answer({ view: view ?? {} }, text, null);
   }
 
   // ------------------------------------------------------------ reads
@@ -176,6 +166,9 @@ class Play {
     const input: any = { job: this.jobId, status, waiting_for: waiting, next_wake_in: wake };
     if (operations?.length) input.operations = operations;
     if (reached?.length) input.reached = reached;
+    // Acknowledge the inbox items the last read showed (structured ids from job_view, never text).
+    const seen: string[] = (this.lastF?.view?.inbox ?? []).map((i: any) => i.id).filter((x: unknown) => typeof x === 'string');
+    if (seen.length) input.processed = seen;
     return { name: 'checkpoint', input };
   }
 
@@ -194,7 +187,9 @@ class Play {
       this.lastF = F;
       const st = F.view.status;
       if (st === 'done' || st === 'cancelled') break;
-      const ownerCancel = F.msgsA.some((m: any) => m.user === this.owner && /\bcancel/i.test(m.text));
+      // Structured first: an inbox item of kind cancel from the owner. The text match stays as a fallback for an undelivered event.
+      const inboxCancel = (F.view.inbox ?? []).some((i: any) => !i.held && i.kind === 'cancel' && i.sender === this.owner);
+      const ownerCancel = inboxCancel || F.msgsA.some((m: any) => m.user === this.owner && /\bcancel/i.test(m.text));
       if (ownerCancel || st === 'cancel_requested') { yield* this.cancel(F); break; }
       if (!F.pr) {
         // Another release of the same base branch that is not yet live on prod alpha goes first: wait behind it.
@@ -429,10 +424,14 @@ class Play {
         if (!r.sent) return yield* wait(this, 'could not ask Harry yet', 'a retry', '5m');
         return 'again';
       }
-      const askQ = F.msgsQ.filter((m: any) => m.user === this.tony && PHRASE.signoff_requested.test(m.text)).pop();
-      const askTs = ts(askQ);
-      const harryMsg = F.msgsQ.filter((m: any) => m.user === this.harry && /sign(ing)? off|approved/i.test(m.text) && ts(m) > askTs).pop();
-      const ownerMsg = F.msgsA.filter((m: any) => m.user === this.owner && /go ahead|you have the go|is approved/i.test(m.text) && ts(m) > askTs).pop();
+      // A sign-off counts when it came after the build was in QA, even if it arrived before the ask: a mention session can no
+      // longer post the ask, so the home may post it after the person already answered. Order is message order (a ts may be synthetic).
+      const qaIdx = F.msgsQ.findIndex((m: any) => m.user === this.harry && /released in QA/i.test(m.text));
+      const askIdx = F.msgsQ.map((m: any, i: number) => (m.user === this.tony && PHRASE.signoff_requested.test(m.text) ? i : -1)).filter((i: number) => i >= 0).pop() ?? -1;
+      const sinceIdx = qaIdx >= 0 ? qaIdx : askIdx;
+      const askTs = ts(F.msgsQ[askIdx]);
+      const harryMsg = F.msgsQ.filter((m: any, i: number) => m.user === this.harry && /sign(ing)? off|approved/i.test(m.text) && i > sinceIdx).pop();
+      const ownerMsg = F.msgsA.filter((m: any) => m.user === this.owner && /go ahead|you have the go|is approved/i.test(m.text) && ts(m) > (askTs || 0)).pop();
       if (!harryMsg && !ownerMsg) return yield* wait(this, 'waiting for the test sign-off', "Harry's sign-off");
       this.standin = !harryMsg;
       const because = harryMsg ? this.eventId(F, this.harry, this.qaThread) : this.eventId(F, this.owner, this.reqThread);

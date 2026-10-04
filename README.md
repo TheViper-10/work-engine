@@ -8,7 +8,7 @@ Design source: `~/.agents/memory/agents/fde-agent/artifacts/tony-shared-state/28
 
 Layout:
 - `src/` generic engine core (no workflow names; enforced by `npm run lint:generic`)
-- `workflows/<name>/` spec data and playbook text per workflow
+- `workflows/<name>/` spec data per workflow; `knowledge/<name>/` canonical playbook, references, lessons
 - `scenarios/` replay inputs
 - `sim/` simulator (random orders and named cases)
 - `harness/` phase 2 replay harness

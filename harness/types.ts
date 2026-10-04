@@ -53,6 +53,10 @@ export interface EngineBinding {
   setMode?(mode: Mode): void;
   /** Optional: final engine-side state for scoring (job status, milestones, deliveries). */
   snapshot?(): any | Promise<any>;
+  /** Optional: tell the engine which DM a session lives in (its session directory). Called once when a session starts. */
+  registerSession?(sessionId: string, dm: string): void;
+  /** Optional: the job's current home DM, read without side effects (for the one_action_owner bar). */
+  homeOf?(job: string): Promise<string | undefined>;
 }
 
 export interface OwnCall {
@@ -74,6 +78,10 @@ export interface EngineCall {
   input: any;
   output: any;
   error?: string;
+  /** DM of the session that made the call. */
+  dm?: string;
+  /** The job's home DM when the call was made (jobs only). */
+  home?: string;
 }
 
 export interface OwnPost {
@@ -96,6 +104,10 @@ export interface OwnPost {
 export interface SessionRecord {
   id: string;
   trigger: { kind: 'mention' | 'wake'; thread?: string; sender?: string; text: string };
+  /** The DM this session runs in: the job home for a wake, mention:<thread>:<n> for a Slack mention. */
+  dm: string;
+  /** Wakes and notices delivered into this session as new user messages while it was active. */
+  steers: { t: number; text: string }[];
   start_t: number;
   end_t: number;
   turns: number;
@@ -122,5 +134,5 @@ export interface RunResult {
   usage: { input_tokens: number; output_tokens: number; requests: number };
   engine_snapshot?: any;
   /** Which playbook/reference files built the system prompt (harness extra). */
-  config?: { playbook_path: string; reference_paths: string[]; playbook_sha256: string; prompt_sha256: string };
+  config?: { playbook_path: string; reference_paths: string[]; playbook_sha256: string; prompt_sha256: string; guidance_version: { combined: string; files: Record<string, string> } };
 }

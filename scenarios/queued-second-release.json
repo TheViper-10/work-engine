@@ -330,7 +330,8 @@
         "sender_kind": "human",
         "ref": null,
         "attrs": {
-          "mentions_tony": false
+          "mentions_tony": false,
+          "inbox_kind": "approval"
         },
         "delivered": true
       },
@@ -426,7 +427,8 @@
         "sender_kind": "other_bot",
         "ref": null,
         "attrs": {
-          "mentions_tony": false
+          "mentions_tony": false,
+          "inbox_kind": "approval"
         },
         "delivered": true
       },

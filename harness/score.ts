@@ -53,6 +53,7 @@ export interface Score {
   sessions_truncated: number;
   session_errors: string[];
   invariant_violations: string[];
+  action_owner_violations: string[];
   session_flags: { check: string; call: string; detail: string }[];
   world_reached: string[];
   timeline_reached: boolean;
@@ -228,6 +229,7 @@ export function score(run: RunResult, sc: any): Score {
 
   const invariant_violations: string[] = snap?.invariants ?? [];
   const session_errors = run.sessions.filter((s) => s.error).map((s) => `${s.id}: ${s.error}`);
+  const actionOwnerViolations = notHomeActions(calls);
   const bars = {
     zero_protocol_refusals: protocol_refusals.length === 0,
     zero_false_findings: false_findings.length === 0,
@@ -239,6 +241,8 @@ export function score(run: RunResult, sc: any): Score {
     live_once_per_thread: checks.max_live_posts_per_thread === true,
     no_session_errors: session_errors.length === 0,
     engine_invariants: invariant_violations.length === 0,
+    one_action_owner: actionOwnerViolations.length === 0,
+    ...(expEnd.interruption_boundary ? { interruption_boundary: boundaryHolds(run, expEnd.interruption_boundary) } : {}),
   };
   return {
     scenario: run.scenario,
@@ -266,6 +270,7 @@ export function score(run: RunResult, sc: any): Score {
     sessions_truncated: run.sessions.filter((s) => s.truncated).length,
     session_errors,
     invariant_violations,
+    action_owner_violations: actionOwnerViolations,
     session_flags: session_flags.map((f) => ({ check: f.check, call: f.call, detail: f.detail })),
     world_reached,
     timeline_reached: run.timeline.unfired.length === 0,
@@ -273,6 +278,36 @@ export function score(run: RunResult, sc: any): Score {
   };
 }
 
+
+/**
+ * one_action_owner (A1): every intend that got clear or a say that got go, and every committed checkpoint, came from a
+ * session whose DM was the job's home at that moment. A checkpoint counts as committed when it carried operation outcomes
+ * or reached milestones and the engine did not say they were not applied (a non-home checkpoint is only a note, R30).
+ */
+export function notHomeActions(calls: EngineCall[]): string[] {
+  const bad: string[] = [];
+  for (const c of calls) {
+    if (c.error || !c.output || typeof c.output !== 'object' || c.home === undefined) continue;
+    const st = String(c.output.status ?? '');
+    const acted =
+      (c.name === 'intend' && st === 'clear') ||
+      (c.name === 'say' && st === 'go') ||
+      (c.name === 'checkpoint' && c.output.ok !== false && !['route', 'superseded', 'hold'].includes(st) &&
+        ((c.input?.operations?.length ?? 0) > 0 || (c.input?.reached?.length ?? 0) > 0) && !/not in the job home/i.test(String(c.output.say_to_tony ?? '')));
+    if (acted && c.dm !== c.home) bad.push(`#${c.seq} ${c.name}${c.input?.action ? ' ' + c.input.action : ''} answered ${st} for session ${c.session} in ${c.dm}, but the home was ${c.home}`);
+  }
+  return bad;
+}
+
+/** interruption-boundary: the asker was answered in its own thread by a mention session that only read, and the home was never replaced. */
+function boundaryHolds(run: RunResult, b: { answered_in: string; mention_session_actions: number }): boolean {
+  const mention = new Set(run.sessions.filter((x) => x.trigger.kind === 'mention').map((x) => x.id));
+  const actions = run.engine_calls.filter((c) => mention.has(c.session) && ['intend', 'checkpoint', 'say'].includes(c.name)).length;
+  const answered = run.posts.some((p) => p.thread === b.answered_in && mention.has(p.session) && p.text.trim() && !p.dropped);
+  const jobs: any[] = run.engine_snapshot?.jobs ?? [];
+  const replaced = jobs.some((j) => (j.generation ?? 1) > 1);
+  return actions <= b.mention_session_actions && answered && !replaced;
+}
 
 // ---- R16 helpers ----
 

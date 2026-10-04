@@ -26,6 +26,8 @@ interface Session {
   nextAt: number;
   done: boolean;
   relayThread?: string;
+  /** Steer messages waiting to be appended to the next user turn. */
+  pending: string[];
 }
 
 interface Trigger {
@@ -72,6 +74,7 @@ export class Driver {
   readonly system: string;
   private log: (l: string) => void;
   private deliverySeq = 0;
+  private mentionSeq: Record<string, number> = {};
 
   constructor(private o: DriverOptions) {
     this.sc = fillPlaceholders(o.scenario);
@@ -79,7 +82,7 @@ export class Driver {
     this.entries = (this.sc.timeline as any[])
       .map((raw, idx) => ({ idx, raw, trueAt: null, fired: false }))
       .filter((e) => e.raw.type !== 'timer' || e.raw.kind !== 'sweep');
-    this.system = buildSystemPrompt(o.playbook, this.sc, 'the job DM');
+    this.system = buildSystemPrompt(o.playbook, this.sc, 'the job home DM');
     this.log = o.log ?? (() => {});
     o.binding.attach?.(this.world, this.sc);
     o.binding.setMode?.(o.mode);
@@ -168,8 +171,17 @@ export class Driver {
   private startQueued(): void {
     const stillQueued: Trigger[] = [];
     for (const tr of this.queued) {
-      if (this.sessions.some((s) => !s.done && s.key === tr.key)) {
-        stillQueued.push(tr); // serialize per thread (mentions) or per DM (wakes)
+      const active = this.sessions.find((s) => !s.done && s.key === tr.key);
+      if (active && tr.kind === 'wake') {
+        // Steer: a wake or notice posted in a home DM whose session is still active goes into that session as a new user message.
+        const text = `[${isoAt(this.now)}] The work engine wrote in ${tr.dm ?? 'the job home DM'} while you were working:\n\n${tr.text}`;
+        active.pending.push(text);
+        active.rec.steers.push({ t: this.now, text: tr.text });
+        this.log(`[t=${this.now.toFixed(1)}] steer into ${active.rec.id} (${active.rec.dm}): ${tr.text.slice(0, 70)}`);
+        continue;
+      }
+      if (active) {
+        stillQueued.push(tr); // mentions are serialized per thread
         continue;
       }
       if (this.sessionCount >= MAX_SESSIONS_PER_RUN) {
@@ -183,8 +195,12 @@ export class Driver {
         tr.kind === 'mention'
           ? `[${isoAt(this.now)}] Slack message in thread ${tr.thread} from ${sender?.name ?? tr.sender} (<@${sender?.slack ?? tr.sender}>) mentioning you:\n\n${tr.text}`
           : `[${isoAt(this.now)}] The work engine woke you in ${tr.dm ?? 'the job DM'}:\n\n${tr.text}`;
+      const dm = tr.kind === 'wake' ? tr.dm ?? 'dm:unknown' : `mention:${tr.thread}:${(this.mentionSeq[tr.thread ?? ''] = (this.mentionSeq[tr.thread ?? ''] ?? 0) + 1)}`;
+      this.o.binding.registerSession?.(id, dm);
       const rec: SessionRecord = {
         id,
+        dm,
+        steers: [],
         trigger: { kind: tr.kind, thread: tr.thread, sender: tr.sender, text: tr.text },
         start_t: this.now,
         end_t: this.now,
@@ -195,8 +211,8 @@ export class Driver {
         transcript: [{ role: 'user', text: userText }],
       };
       this.records.push(rec);
-      this.sessions.push({ rec, key: tr.key, messages: [{ role: 'user', content: userText }], nextAt: this.now, done: false, relayThread: tr.kind === 'mention' ? tr.thread : undefined });
-      this.log(`[t=${this.now.toFixed(1)}] session ${id} start (${tr.kind}${tr.thread ? ' ' + tr.thread : ''})`);
+      this.sessions.push({ rec, key: tr.key, messages: [{ role: 'user', content: userText }], nextAt: this.now, done: false, pending: [], relayThread: tr.kind === 'mention' ? tr.thread : undefined });
+      this.log(`[t=${this.now.toFixed(1)}] session ${id} start (${tr.kind}${tr.thread ? ' ' + tr.thread : ''}) in ${dm}`);
     }
     this.queued = stillQueued;
   }
@@ -208,6 +224,7 @@ export class Driver {
   private async stepSession(s: Session): Promise<void> {
     this.now = Math.max(this.now, s.nextAt);
     const rec = s.rec;
+    this.applySteers(s);
     let resp;
     try {
       resp = await this.o.tony.send({ system: this.system, messages: s.messages, tools: this.allTools() });
@@ -252,6 +269,20 @@ export class Driver {
     this.updatePredicates();
   }
 
+  /** Append waiting steer messages to the last user turn (after any tool results), so the model sees them as new user input. */
+  private applySteers(s: Session): void {
+    if (!s.pending.length) return;
+    const last = s.messages[s.messages.length - 1]!;
+    for (const text of s.pending.splice(0)) {
+      if (last.role === 'user') {
+        last.content = typeof last.content === 'string' ? `${last.content}\n\n${text}` : [...last.content, { type: 'text', text }];
+      } else {
+        s.messages.push({ role: 'user', content: text });
+      }
+      s.rec.transcript.push({ role: 'user', steer: true, text });
+    }
+  }
+
   private endSession(s: Session): void {
     s.done = true;
     s.rec.end_t = this.now;
@@ -263,13 +294,15 @@ export class Driver {
     if (ENGINE_TOOL_NAMES.includes(name)) {
       let output: any;
       let error: string | undefined;
+      const jobArg = typeof input?.job === 'string' ? input.job : undefined;
+      const home = jobArg ? await this.o.binding.homeOf?.(jobArg) : undefined;
       try {
         output = await this.o.binding.callTool(name, input, { session_id: s.rec.id, now: this.nowMs() });
       } catch (e) {
         error = (e as Error).message;
         output = { ok: false, error };
       }
-      this.engineCalls.push({ seq: this.world.nextSeq(), t: this.now, session: s.rec.id, name, input, output, error });
+      this.engineCalls.push({ seq: this.world.nextSeq(), t: this.now, session: s.rec.id, name, input, output, error, dm: s.rec.dm, home });
       if (name === 'say' && !error) {
         const st = String(output?.status ?? '');
         if (!/already_sent|busy/i.test(st) && input?.thread && input?.milestone) this.world.noteClaim(String(input.thread), String(input.milestone));
@@ -302,7 +335,8 @@ export class Driver {
       if (ns) cands.push({ at: ns.nextAt, rank: 2, kind: 'session' });
       cands.sort((a, b) => a.at - b.at || a.rank - b.rank);
       const c = cands[0]!;
-      if (c.at > horizon) break;
+      // A session that started before the horizon is allowed to finish (a bounded grace), so the run never ends mid-session.
+      if (c.at > horizon && !(c.kind === 'session' && c.at <= horizon + 30)) break;
       if (c.kind === 'entry') {
         this.now = Math.max(this.now, c.at);
         await this.fire(ne!.e);
@@ -348,6 +382,6 @@ export class Driver {
   }
 }
 
-export function loadPlaybook(root: string, path = `${root}/workflows/desktop-release/playbook.md`): string {
+export function loadPlaybook(root: string, path = `${root}/knowledge/desktop-release/playbook.md`): string {
   return readFileSync(path, 'utf8');
 }

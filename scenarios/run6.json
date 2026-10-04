@@ -367,7 +367,8 @@
         "sender_kind": "human",
         "ref": "slack:C0C4K4EGZT6:1791085451.875129",
         "attrs": {
-          "mentions_tony": true
+          "mentions_tony": true,
+          "inbox_kind": "approval"
         },
         "delivered": true
       },
@@ -466,7 +467,8 @@
         "sender_kind": "other_bot",
         "ref": "slack:C0C4K4EGZT6:1791087163.496399",
         "attrs": {
-          "mentions_tony": false
+          "mentions_tony": false,
+          "inbox_kind": "approval"
         },
         "delivered": true
       },

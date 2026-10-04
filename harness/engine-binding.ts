@@ -5,8 +5,9 @@ import { join } from 'node:path';
 import { ManualClock } from '../src/clock.ts';
 import { defineConfig } from '../src/config.ts';
 import { Engine } from '../src/engine.ts';
-import { MemoryStore } from '../src/store.ts';
-import type { IngestEvent, Spec } from '../src/types.ts';
+import { FakeSessionDirectory } from '../src/session-directory.ts';
+import { makeKey, MemoryStore } from '../src/store.ts';
+import type { IngestEvent, Job, Spec } from '../src/types.ts';
 import type { EngineBinding, EngineCtx, EngineEvent, Mode, ToolSchema, WakeMsg } from './types.ts';
 import { EPOCH_MS, type World } from './world.ts';
 
@@ -36,7 +37,7 @@ export const REAL_ENGINE_TOOLS: ToolSchema[] = [
   },
   {
     name: 'intend',
-    description: 'Say what you are about to do, before you do it. Actions: open_bump_pr, merge_pr, approve_qa_gate, verify_qa, publish_prod_alpha, verify_served, complete_release_issue. because is the event id of the human go.',
+    description: 'Say what you are about to do, before you do it. Actions: open_bump_pr, merge_pr, approve_qa_gate, verify_qa, publish_prod_alpha, verify_served, complete_release_issue. because is the event id (or #n inbox id) of the human go. Only the session in the job home can act; others get route.',
     input_schema: {
       type: 'object',
       properties: { job: S, action: S, ref: S, because: S },
@@ -73,6 +74,7 @@ export const REAL_ENGINE_TOOLS: ToolSchema[] = [
           },
         },
         reached: { type: 'array', items: S },
+        processed: { type: 'array', items: S, description: 'Inbox items you handled: #n from job_view, event ids or inbox keys. Items in your last job_view are acknowledged anyway.' },
       },
       required: ['job', 'status'],
     },
@@ -95,8 +97,10 @@ export class RealEngineBinding implements EngineBinding {
   private wakeCb: (w: WakeMsg) => void = () => {};
   private jobs: string[] = [];
   private seenDeliveries = new Set<string>();
+  private directory = new FakeSessionDirectory();
+  private registered = new Map<string, string>();
 
-  constructor(root: string) {
+  constructor(root: string, private guidanceVersion?: string) {
     this.spec = JSON.parse(readFileSync(join(root, 'workflows/desktop-release/spec.json'), 'utf8')) as Spec;
     this.build();
   }
@@ -106,6 +110,9 @@ export class RealEngineBinding implements EngineBinding {
     this.clock = new ManualClock(EPOCH_MS);
     this.jobs = [];
     this.seenDeliveries = new Set();
+    // A1: a real directory, not the homeForAllSessions default. The driver registers each session's DM when it starts.
+    this.directory = new FakeSessionDirectory();
+    for (const [sid, dm] of this.registered) this.directory.set(sid, dm);
     const checks = Object.fromEntries(['superseded_run', 'job_cancelled', 'lease_held', 'build_changed', 'sender_not_listed'].map((c) => [c, this.mode]));
     this.engine = new Engine({
       store: this.store,
@@ -119,12 +126,25 @@ export class RealEngineBinding implements EngineBinding {
       },
       waker: {
         postWake: async (dm, text) => {
-          this.wakeCb({ dm, text, job: dm.startsWith('dm:') ? dm.slice(3) : undefined });
+          // Home ids are dm:<job> for generation 1 and dm:<job>:g<n> after a replacement.
+          this.wakeCb({ dm, text, job: dm.startsWith('dm:') ? dm.slice(3).replace(/:g\d+$/, '') : undefined });
         },
       },
       config: defineConfig({ env: 'replay', bot: 'tony', ownBotUserId: this.ownBot, checks }),
       specs: [this.spec],
+      sessionDirectory: this.directory,
+      guidanceVersion: this.guidanceVersion,
     });
+  }
+
+  registerSession(sessionId: string, dm: string): void {
+    this.registered.set(sessionId, dm);
+    this.directory.set(sessionId, dm);
+  }
+
+  async homeOf(job: string): Promise<string | undefined> {
+    const j = await this.store.get<Job>(makeKey('replay', 'tony', 'job', job));
+    return j?.dm_id;
   }
 
   /** Which build a gate's ask is about: the newest pipeline build for CircleCI gates, else the base head. */
@@ -220,6 +240,11 @@ export class RealEngineBinding implements EngineBinding {
         flags: d.flags,
         operations: d.operations,
         promises: d.promises,
+        generation: d.generation,
+        home: d.home,
+        inbox_unprocessed: d.inbox_unprocessed,
+        cleanup_pending: d.cleanup_pending,
+        guidance_version: d.guidance_version,
       });
     }
     const invariants = await this.engine.checkInvariants(this.jobs);

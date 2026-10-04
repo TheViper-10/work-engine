@@ -113,7 +113,7 @@ ${people}
 - Tony's own Slack id is ${sc.initial_world?.slack?.tony_user ?? 'U0C4FFYJGE6'}.
 - The release tracking issue is ${sc.initial_world?.github?.scripted_ids?.release_issue ?? 'unknown'}${sc.initial_world?.github?.scripted_ids?.parent_issue ? ` (child of ${sc.initial_world.github.scripted_ids.parent_issue})` : ''}; completing it is your last step.
 - The release base branch is ${sc.initial_world?.github?.base_branch ?? 'main'} on ${sc.initial_world?.github?.repo ?? 'the repo'}.
-- Your job direct message is ${dmId}. A session starts either when someone mentions you in a thread (your final message is relayed to that thread by the connector) or when the work engine wakes you in that direct message (your final message there goes to the direct message, not to a thread).
+- Your job home is ${dmId}. A session starts either when someone mentions you in a Slack thread (it runs in its own conversation, not the job home; your final message is relayed to that thread by the connector) or when the work engine wakes you in the job home (your final message there goes to the home, not to a thread). A wake or notice that arrives while you are working in the home shows up as a new message in your conversation.
 - Each session is a fresh conversation. You have no memory of earlier sessions except what the engine briefing and the live sources show.
 - The current time is given at the start of each turn. Each of your tool rounds takes about one minute.`;
 }

@@ -405,7 +405,8 @@
         "sender_kind": "human",
         "ref": "slack:C0C4K4EGZT6:1790911075.375239",
         "attrs": {
-          "mentions_tony": false
+          "mentions_tony": false,
+          "inbox_kind": "approval"
         },
         "delivered": true
       },
@@ -570,7 +571,8 @@
         "sender_kind": "human",
         "ref": "slack:C0C4K4EGZT6:1790913972.933429",
         "attrs": {
-          "mentions_tony": true
+          "mentions_tony": true,
+          "inbox_kind": "approval"
         },
         "delivered": true
       },
@@ -591,7 +593,8 @@
         "sender_kind": "other_bot",
         "ref": "slack:C0C4K4EGZT6:1790912579.524889",
         "attrs": {
-          "mentions_tony": false
+          "mentions_tony": false,
+          "inbox_kind": "approval"
         },
         "delivered": true
       },
@@ -613,7 +616,8 @@
         "sender_kind": "human",
         "ref": "slack:C0C4K4EGZT6:1790914585.366809",
         "attrs": {
-          "mentions_tony": true
+          "mentions_tony": true,
+          "inbox_kind": "approval"
         },
         "delivered": true
       },
