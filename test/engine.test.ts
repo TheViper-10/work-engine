@@ -778,3 +778,42 @@ test('default directory homeForAllSessions maps every session to the job home (h
   assert.equal((await e.engine.intend({ job, action: 'a4', ref: 'x' }, S2)).status, 'clear');
   assert.deepEqual(await homeForAllSessions.dmOf('any', { id: 'j', dm: 'dm:j', generation: 1 }), { dm: 'dm:j' });
 });
+
+test('unknown milestone ids: say, promise_add and checkpoint record nothing for them and answer with the spec ids', async () => {
+  const e = setup();
+  const job = await open(e);
+  const list = 'm1, m2, m_final';
+  const sy = await e.engine.say({ job, thread: 'A', milestone: 'pr_open' }, S1);
+  assert.equal(sy.ok, true);
+  assert.equal(sy.status, 'unknown_milestone');
+  assert.deepEqual(sy.unknown_milestones, ['pr_open']);
+  assert.match(sy.say_to_tony, new RegExp(`unknown milestone pr_open; this job's milestones are: ${list}`));
+  const pa = await e.engine.promiseAdd({ job, thread: 'A', about: 'signoff' }, S1);
+  assert.equal(pa.status, 'unknown_milestone');
+  assert.deepEqual(pa.unknown_milestones, ['signoff']);
+  const cp = await e.engine.checkpoint({ job, status: 'working', reached: ['qa_approved', 'm1'] }, S1);
+  assert.equal(cp.ok, true);
+  assert.deepEqual(cp.unknown_milestones, ['qa_approved']);
+  assert.match(cp.say_to_tony, /unknown milestone qa_approved; this job's milestones are: m1, m2, m_final/);
+  assert.match(cp.say_to_tony, /Milestone m1 marked reached/);
+  const v = await e.engine.jobView({ job }, S1);
+  const j = (v.jobs as any[])[0];
+  assert.deepEqual(Object.keys(j.milestones), ['m1']);
+  assert.deepEqual(j.spec_milestones, [{ id: 'm1', reached: true }, { id: 'm2', reached: false }, { id: 'm_final', reached: false }]);
+  assert.match(v.say_to_tony, /Milestones \(use these ids\): m1 reached, m2 not reached, m_final not reached/);
+  assert.deepEqual(j.promises, []);
+  assert.equal(j.claims.length, 0);
+  assert.equal(j.owed.filter((d: any) => d.milestone === 'pr_open' || d.milestone === 'qa_approved').length, 0);
+  assert.ok(flagsOf(v).includes('unknown_milestone'));
+  await ok(e, [job]);
+});
+
+test('checkpoint reached given as a single string is read as one id, not a failure', async () => {
+  const e = setup();
+  const job = await open(e);
+  const cp = await e.engine.checkpoint({ job, status: 'working', reached: 'm1' as unknown as string[] }, S1);
+  assert.equal(cp.ok, true);
+  assert.match(cp.say_to_tony, /Milestone m1 marked reached/);
+  const cp2 = await e.engine.checkpoint({ job, status: 'working', reached: 'bogus' as unknown as string[] }, S1);
+  assert.deepEqual(cp2.unknown_milestones, ['bogus']);
+});

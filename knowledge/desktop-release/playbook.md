@@ -10,6 +10,9 @@ Take the requested desktop version from the version bump PR to served on prod al
 person who is owed an update told once, or stop at a named person or the owner's cancel with the
 evidence of where it stands.
 
+## Which version
+If the request names no version, read the open release issue under the parent issue and use its version. Ask the requester only if there is none.
+
 ## Where you act
 You act only from the job's home DM. In a Slack conversation, answer from the briefing and live
 reads; record promises; anything needing action is routed to the home automatically, so tell the
@@ -47,19 +50,22 @@ A fact you have not read in this session is not a fact.
   facts. The sign-off ask goes only in the QA thread, never in the request thread or any other.
 
 ## Outcomes to reach (a map, not an order; genuine dependencies are noted)
+Milestone ids are exact: use only these in `checkpoint(reached)`, `say` and `promise_add`. The engine
+records nothing for any other name.
 - Bump PR open for the version, and one release issue for it, linked under the parent.
-  Done: PR open, issue linked, the requester knows where it is.
+  Milestone `bump_pr_open`. Done: PR open, issue linked, the requester knows where it is.
 - PR reviewed by the owner (a GitHub approval counts) and merged. Depends on the review.
-  Done: merge commit known; the pipeline built from it identified.
+  Milestones `pr_approved`, then `merged`. Done: merge commit known; the pipeline built from it identified.
 - QA decision. Judge any Playwright failure from the evidence on this pipeline and earlier ones
   (flake, test or product problem; hand deep triage to the Playwright triage skill). Report it and
   ask the owner once per build for the QA go.
-  Done: the QA hold approved for this build after a go for this build, or the owner told what
+  Milestone `qa_go_requested`. Done: the QA hold approved for this build after a go for this build, or the owner told what
   blocks it.
-- QA ready. Depends on the QA approval. Done: the update server's QA channel serves the version.
-- Sign-off. Ask Harry once, in the QA thread only. Done: sign-off from Harry, or from the owner as
+- QA ready. Depends on the QA approval. Milestone `qa_ready`. Done: the update server's QA channel serves the version.
+- Sign-off. Ask Harry once, in the QA thread only. Milestones `signoff_requested` (the ask),
+  then `prod_alpha_approved` (the sign-off received). Done: sign-off from Harry, or from the owner as
   stand-in, for this build.
-- Live. Approve the prod alpha hold after sign-off. Done: the update server's prod alpha channel
+- Live. Approve the prod alpha hold after sign-off. Milestone `live`. Done: the update server's prod alpha channel
   serves the version.
 - Everyone owed is told once, in their own thread: the request thread, every thread that asked to
   be told, and for live also the QA thread. The briefing lists who is still owed.

@@ -848,6 +848,19 @@ export class Engine {
 
   // ---------------------------------------------------------------- milestones, deliveries, asks
 
+  /** Spec milestone ids a caller named that the job's spec does not have. With no spec milestones nothing is unknown. */
+  private unknownIds(spec: Spec | undefined, ids: string[]): string[] {
+    const known = spec?.milestones;
+    if (!known) return [];
+    const list = (Array.isArray(ids) ? ids : [ids]).filter((m): m is string => typeof m === 'string');
+    return uniq(list.filter((m) => !Object.prototype.hasOwnProperty.call(known, m)));
+  }
+
+  private unknownText(spec: Spec | undefined, unknown: string[]): string {
+    const list = Object.keys(spec?.milestones ?? {}).join(', ');
+    return unknown.map((m) => `unknown milestone ${m}; this job's milestones are: ${list}`).join('. ');
+  }
+
   private async markReached(job: Job, spec: Spec | undefined, milestone: string): Promise<boolean> {
     if (job.milestones[milestone]) return false;
     job.milestones[milestone] = { at: this.now(), source: 'tony_reported' };
@@ -1174,7 +1187,13 @@ export class Engine {
     const gate = spec?.milestones?.[a.milestone]?.opens_ask;
     const notes: string[] = [];
     if (!job.threads.includes(a.thread)) notes.push(`Note: ${a.thread} is not linked to this job; the claim is recorded, but link it with job_open if events from it should reach the job.`);
-    if (spec && !spec.milestones?.[a.milestone]) notes.push(`Note: "${a.milestone}" is not a milestone in the workflow spec; claim recorded as given.`);
+    const unknownSay = this.unknownIds(spec, [a.milestone]);
+    if (unknownSay.length) {
+      // L1: recorded and answered, not refused. Nothing is claimed, owed or reached for an id the spec does not have.
+      await this.addFlag(job, 'unknown_milestone', `say named ${a.milestone}, which is not a milestone of this job; nothing recorded for it`, 'say');
+      await this.saveJob(job);
+      return ans(true, 'unknown_milestone', `${this.unknownText(spec, unknownSay)}. Nothing was claimed or recorded for it. Say again with one of those ids.`, { job: job.id, unknown_milestones: unknownSay, milestones: Object.keys(spec?.milestones ?? {}) });
+    }
 
     // Confirm route: the agent posted and tells the engine where. Reported by the agent (L3); clears the claim.
     if (a.posted_link) {
@@ -1304,6 +1323,12 @@ export class Engine {
     const rel = await this.touchRun(job, ctx, 'adopted', true, true, own);
     if (own.state === 'home') this.ownerConfirmed(job);
     await this.sessionFlags(job, ctx, 'promise_add', rel, false); // a promise from any session is a valid record (D10)
+    const unknownAbout = this.unknownIds(spec, [a.about]);
+    if (unknownAbout.length) {
+      await this.addFlag(job, 'unknown_milestone', `promise_add named ${a.about}, which is not a milestone of this job; no promise recorded`, 'promise_add');
+      await this.saveJob(job);
+      return ans(true, 'unknown_milestone', `${this.unknownText(spec, unknownAbout)}. No promise was recorded. Add it again with one of those ids.`, { job: job.id, unknown_milestones: unknownAbout, milestones: Object.keys(spec?.milestones ?? {}) });
+    }
     const notes: string[] = [];
     let fallback: number | null = null;
     if (typeof a.fallback_time === 'number' && a.fallback_time > 1e11) fallback = a.fallback_time;
@@ -1314,7 +1339,6 @@ export class Engine {
       fallback = now + mins * MIN;
       notes.push(`No usable fallback time was given, so the default of ${mins} minutes was set.`);
     }
-    if (spec && !spec.milestones?.[a.about]) notes.push(`Note: "${a.about}" is not a milestone in the workflow spec; promise recorded as given.`);
     if (!job.threads.includes(a.thread)) notes.push(`Note: ${a.thread} is not linked to this job; link it with job_open (join) so its events reach the job.`);
     const id = `${job.id}:${a.thread}:${a.about}`;
     const p: Promise_ = { key: id, job: job.id, thread: a.thread, milestone: a.about, fallback_at: fallback, state: 'open', created_at: now };
@@ -1409,8 +1433,14 @@ export class Engine {
     }
     await this.settleCleanup(job);
     const ended = job.status === 'done' || job.status === 'cancelled';
-    if (ended && a.reached?.length && !nonHome) notes.push('The job has ended, so the reached milestones were not recorded (nothing can be owed on an ended job).');
-    for (const m of ended || nonHome ? [] : a.reached ?? []) {
+    if (ended && a.reached && !nonHome) notes.push('The job has ended, so the reached milestones were not recorded (nothing can be owed on an ended job).');
+    const unknownReached = ended || nonHome ? [] : this.unknownIds(spec, a.reached ?? []);
+    if (unknownReached.length) {
+      await this.addFlag(job, 'unknown_milestone', `checkpoint reached named ${unknownReached.join(', ')}, which are not milestones of this job; nothing recorded for them`, 'checkpoint');
+      notes.push(`${this.unknownText(spec, unknownReached)}. Nothing was recorded for ${unknownReached.length > 1 ? 'them' : 'it'}; the rest of the checkpoint was kept.`);
+    }
+    for (const m of ended || nonHome ? [] : (Array.isArray(a.reached) ? a.reached : a.reached ? [a.reached as unknown as string] : [])) {
+      if (typeof m !== 'string' || unknownReached.includes(m)) continue;
       if (await this.markReached(job, spec, m)) notes.push(`Milestone ${m} marked reached (reported by you).`);
     }
 
@@ -1497,6 +1527,7 @@ export class Engine {
     await this.saveJob(job);
     return ans(true, job.status === 'closing' ? 'closing' : job.status, `${statusText}${job.next_wake_at ? ` Next wake at ${new Date(job.next_wake_at).toISOString()}.` : ''}${notes.length ? ' ' + notes.join(' ') : ''}`, {
       job: job.id, job_status: job.status, next_wake_at: job.next_wake_at,
+      ...(unknownReached.length ? { unknown_milestones: unknownReached, milestones: Object.keys(spec?.milestones ?? {}) } : {}),
     });
   }
 
@@ -1609,6 +1640,9 @@ export class Engine {
     L.push(`Job ${job.id}: status ${job.status} (you reported "${job.reported_status}")${job.waiting_for ? `, waiting for ${job.waiting_for}` : ''}.`);
     L.push(`Next wake: ${job.next_wake_at ? `${new Date(job.next_wake_at).toISOString()} (in ${fmtAge(Math.abs(job.next_wake_at - now))}${job.next_wake_at < now ? ' ago, overdue' : ''})` : 'none (closed)'}. Work run: ${workRun === 'you' ? 'you' : workRun === 'other' ? 'another session is working on it' : 'nobody'}${run ? `, ${runBusy ? 'busy' : 'idle'}` : ''}.`);
     L.push(`Linked threads: ${job.threads.map((t) => `${t} (${job.roles[t]}${job.private_threads.includes(t) ? ', private' : ''})`).join(', ') || 'none'}.`);
+    const specIds = Object.keys(spec?.milestones ?? {});
+    const msView = specIds.map((m) => ({ id: m, reached: !!job.milestones[m] }));
+    if (specIds.length) L.push(`Milestones (use these ids): ${msView.map((m) => `${m.id} ${m.reached ? 'reached' : 'not reached'}`).join(', ')}.`);
     const ms = Object.entries(job.milestones);
     if (ms.length) L.push(`Milestones reached: ${ms.map(([m, v]) => `${m} (${v.source})`).join(', ')}.`);
     if (evView.length) L.push(`Events: ${evView.map((e) => (e.held ? `${e.age} ago, ${e.summary}` : `${e.age} ago, ${e.source}/${e.kind} from ${e.sender ?? 'n/a'}${e.thread ? ` in ${e.thread}` : ''}${e.ref ? ` ref ${e.ref}` : ''}`)).join('; ')}.`);
@@ -1648,7 +1682,7 @@ export class Engine {
         job: job.id, workflow: job.workflow, target: job.target, status: job.status, reported_status: job.reported_status,
         waiting_for: job.waiting_for, next_wake_at: job.next_wake_at, work_run: workRun, work_run_busy: runBusy,
         threads: job.threads.map((t) => ({ thread: t, role: job.roles[t], private: job.private_threads.includes(t) })),
-        milestones: job.milestones, events: evView, open_asks: openAsks, operations: opsView,
+        milestones: job.milestones, spec_milestones: msView, events: evView, open_asks: openAsks, operations: opsView,
         owed, claims: claimed, sent, promises: proms.map((p) => ({ milestone: p.milestone, thread: p.thread, state: p.state, fallback_at: p.fallback_at })),
         flags: flags.map((f) => ({ check: f.check, mode: f.mode, detail: f.detail, call: f.call })),
         inbox: inboxView, inbox_unprocessed: open.length, late: lateItems.map((i) => ({ sender: i.sender, thread: i.thread })),

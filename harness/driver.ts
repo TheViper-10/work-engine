@@ -6,7 +6,7 @@ import { buildSystemPrompt, type Block, type TonyMessage, type TonyModel } from 
 import type { EngineBinding, EngineCall, EngineEvent, Mode, RunResult, SessionRecord, WakeMsg } from './types.ts';
 import { EPOCH_MS, World } from './world.ts';
 
-export const MAX_TOOL_CALLS_PER_SESSION = 40;
+export const MAX_TOOL_CALLS_PER_SESSION = 80;
 export const MAX_SESSIONS_PER_RUN = 40;
 export const SWEEP_EVERY_MIN = 5;
 const QUIET_SWEEPS_TO_END = 8;

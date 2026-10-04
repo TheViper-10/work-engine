@@ -18,4 +18,6 @@ await w2.engine.say({ job: J, thread: 'B', milestone: 'status_update' }, { sessi
 w2.clock.advance(1000);
 await w2.engine.ingest({ source: 'slack', delivery_id: 'u1', kind: 'message', thread: 'B', sender_id: 'UBOT', attrs: { ts: w2.clock.now() } });
 const c = await w2.peek('claim', 'B'); const d = await w2.peek('delivery', `${J}:B:status_update`);
-check('the status update post is not matched to its claim', !(c.state === 'closed' && d.state === 'sent'), `claim=${c.state} delivery=${d.state}`);
+check('the status update post is not matched to its claim', (!!c || !!d) && !(c?.state === 'closed' && d?.state === 'sent'), `claim=${c?.state ?? 'none'} delivery=${d?.state ?? 'none'}`);
+// Since milestone ids became explicit, an id the spec does not have is answered as unknown and records no claim or delivery,
+// so the second check holds trivially (claim and delivery are absent); the first still guards the claimed-under-live case.

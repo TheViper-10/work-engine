@@ -8,6 +8,8 @@ schemas carry the argument lists; this page carries only meaning.
 The engine keeps the record, routes what arrives, sets wakes and recovers. It does not decide steps
 or judge your work. Its answers are in words; the words are the next move.
 
+Milestone ids come from the job briefing (`job_view` lists them); use those exact ids in `checkpoint(reached)`, `say` and `promise_add`.
+
 Each job has one home: an engine-owned DM. Only the session in the home acts. Other conversations
 (Slack threads, mention DMs) may read, link, record promises and leave inbox items.
 
@@ -19,6 +21,8 @@ Each job has one home: an engine-owned DM. Only the session in the home acts. Ot
 | `say` | claim a message before you post it yourself | `go`: post it now. `busy`: someone is posting in that thread; do not post. `already_sent`: it was posted. `already_claimed`: read the thread and post only if absent. Pass the post link to confirm a post the engine has not seen. |
 | `promise_add` | record "tell me when" for a milestone | The engine wakes the home at the fallback time if the milestone has not been told. |
 | `checkpoint` | commit status, milestones you saw, action outcomes, when to look again, and `processed: [...]` inbox items | Outcomes: done (proof read), failed (read that it did not happen), unknown (cannot tell). If anything is still owed, the job stays open and the answer says what. |
+
+`checkpoint` status is exactly one word: `working`, `waiting`, `blocked`, `done` or `cancelled`; the sentence goes in `waiting_for`. The engine closes a job only on `done` or `cancelled`, and only when nothing is owed.
 
 ## Special answers
 - `route`: you are not in the home. The action was recorded for the job owner, who will do it.

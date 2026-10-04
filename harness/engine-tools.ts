@@ -80,12 +80,12 @@ export const ENGINE_TOOLS: ToolSchema[] = [
   {
     name: 'checkpoint',
     description:
-      'Commit your state and set the next wake. operations: [{ref, action, outcome: done|failed|unknown, note}]. reached: milestone ids you saw happen.',
+      'Commit your state and set the next wake. status is one of: working, waiting, blocked, done, cancelled (exactly one of these words; put the sentence in waiting_for). operations: [{ref, action, outcome: done|failed|unknown, note}]. reached: milestone ids you saw happen.',
     input_schema: {
       type: 'object',
       properties: {
         job: { type: 'string' },
-        status: { type: 'string' },
+        status: { type: 'string', enum: ['working', 'waiting', 'blocked', 'done', 'cancelled'] },
         waiting_for: { type: 'string' },
         next_wake_in: { type: 'string', description: 'for example 5m or 2h' },
         operations: {

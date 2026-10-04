@@ -10,7 +10,7 @@ export type CheckMode = 'hold' | 'flag';
 export type FlagKind =
   | CheckName | 'missing_session' | 'unclaimed_post' | 'not_work_run' | 'job_ended'
   | 'source_unreadable' | 'ambiguous_outcome' | 'unknown_outcome'
-  | 'identity_unconfirmed' | 'ambiguous_association' | 'escalate';
+  | 'identity_unconfirmed' | 'ambiguous_association' | 'escalate' | 'unknown_milestone';
 
 export interface Clock {
   now(): number; // epoch ms
