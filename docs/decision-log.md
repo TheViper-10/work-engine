@@ -30,3 +30,13 @@ live in handoff file 28 §3 and are not repeated here. Each entry: the call, the
 ## R6. People in the mock spec: owner and Harry only
 - Evidence: `18-coordinator-design-decisions.md:6`, `21-work/B-live.md:153`. Owner is Harry's stand-in on prod alpha.
 - Alternative: add the real-release sign-off person. Left out because phase 4 is a mock release; add in the spec before a real release.
+
+## R7. Playbook gives a "usual path", not an order
+- Call: the playbook lists the usual release path and says Tony may reorder it.
+- Evidence: L1 (the engine never orders steps); a real model needs a starting plan; the spec has no order.
+- Alternative: no path at all. Rejected because a model with no path tends to re-derive v8's handshakes.
+
+## R8. Playbook keeps v2.38 Slack voice and drops Coordinator-era protocol
+- Call: reuse v2.38 voice rules (plain, four sentences, no ids); drop receipts, `report_effect` and `execution_key`.
+- Evidence: `21-work/run-data/live/tony-version-2.38.json` guidance and slack skills; v3 replaces those protocols.
+- Alternative: keep worktree notes for PR authoring. Dropped; PR authoring is unchanged Tony skill text outside this playbook.
