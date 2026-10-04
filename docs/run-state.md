@@ -22,7 +22,7 @@ Resume: read this file, then docs/decision-log.md, then handoff file 28.
 - AI gateway reachable: POST /v1/messages with model anthropic.claude-sonnet-5-5 returns 200 (auth: keychain arcus-token as Bearer + x-api-key). D14 real-model replay feasible.
 - Contract for all slices: docs/engine-design.md.
 
-| P0-gapfill | fde-agent read-only: scenario fact gaps into scenarios/gap-fill.md | running |
+| P0-gapfill | fde-agent read-only: scenario fact gaps into scenarios/gap-fill.md | done (no API calls) |
 
 ## Parked
-(none yet)
+- Run 6 pipeline id for number 395883 (needs CircleCI token; not needed for replay).

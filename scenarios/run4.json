@@ -145,7 +145,7 @@
       }
     },
     "update_server": {
-      "qa_version": "5.2.7",
+      "qa_version": "5.2.8",
       "alpha_version": "5.2.7"
     },
     "slack": {
@@ -658,5 +658,8 @@
     "Assumed: pre-run update server state qa 5.2.7, alpha 5.2.7 (not found in sources for run 4; alpha 5.2.7 and qa 5.2.9 are the verified run 6 start state).",
     "Assumed: text of the owner's C ping, the A 'what's next' question and the kickoff are paraphrased; the originals were not in the files read.",
     "GitHub identity DevRevComputer (Tony's PR author and merger) is presumed, not verified (C-run4.md:23,27)."
+  ],
+  "notes_gap_fill": [
+    "qa_version at start corrected to 5.2.8 from scenarios/gap-fill.md item 1 (live/gh-state.json:29-38)."
   ]
 }

@@ -224,28 +224,6 @@
       "note": "real 02:23:53Z"
     },
     {
-      "t": 47.5,
-      "type": "slack_message",
-      "thread": "A",
-      "sender": "owner",
-      "text": "I approved the PR a while back and checks are green, is anything holding up the merge?",
-      "mentions_tony": true,
-      "slack_ts": "1790910232.082879",
-      "event": {
-        "source": "slack",
-        "kind": "message",
-        "thread": "A",
-        "sender": "U042GEDM4BB",
-        "sender_kind": "human",
-        "ref": "slack:C0C4K4EGZT6:1790910232.082879",
-        "attrs": {
-          "mentions_tony": true
-        },
-        "delivered": true
-      },
-      "note": "real 03:03:52Z; approval itself is a GitHub-only event earlier (time not in sources, assumed t=30). Real Tony hadn't merged for 40 minutes and 3 heartbeats didn't act."
-    },
-    {
       "t": 30,
       "type": "github",
       "kind": "pr_review_approved",
@@ -272,26 +250,26 @@
       "note": "no Slack message. Time assumed; sources say only 'approved a while back'."
     },
     {
-      "t": 51.4,
+      "t": 47.5,
       "type": "slack_message",
-      "thread": "B",
+      "thread": "A",
       "sender": "owner",
-      "text": "quick one from me, which version is this release and what's the ETA for it hitting alpha?",
+      "text": "I approved the PR a while back and checks are green, is anything holding up the merge?",
       "mentions_tony": true,
-      "slack_ts": "1790910464.318879",
+      "slack_ts": "1790910232.082879",
       "event": {
         "source": "slack",
         "kind": "message",
-        "thread": "B",
+        "thread": "A",
         "sender": "U042GEDM4BB",
         "sender_kind": "human",
-        "ref": "slack:C0C4K4EGZT6:1790910464.318879",
+        "ref": "slack:C0C4K4EGZT6:1790910232.082879",
         "attrs": {
           "mentions_tony": true
         },
         "delivered": true
       },
-      "note": "real 03:07:44Z. Real Tony promised 'I'll post here once QA is up' and never did; the replay expects the promise to be recorded (promise_add qa_ready and live) and kept."
+      "note": "real 03:03:52Z; approval itself is a GitHub-only event earlier (time not in sources, assumed t=30). Real Tony hadn't merged for 40 minutes and 3 heartbeats didn't act."
     },
     {
       "t": 50,
@@ -316,6 +294,28 @@
       },
       "delay_s": 5,
       "note": "real merge ~03:06Z"
+    },
+    {
+      "t": 51.4,
+      "type": "slack_message",
+      "thread": "B",
+      "sender": "owner",
+      "text": "quick one from me, which version is this release and what's the ETA for it hitting alpha?",
+      "mentions_tony": true,
+      "slack_ts": "1790910464.318879",
+      "event": {
+        "source": "slack",
+        "kind": "message",
+        "thread": "B",
+        "sender": "U042GEDM4BB",
+        "sender_kind": "human",
+        "ref": "slack:C0C4K4EGZT6:1790910464.318879",
+        "attrs": {
+          "mentions_tony": true
+        },
+        "delivered": true
+      },
+      "note": "real 03:07:44Z. Real Tony promised 'I'll post here once QA is up' and never did; the replay expects the promise to be recorded (promise_add qa_ready and live) and kept."
     },
     {
       "t": 52,
@@ -577,6 +577,27 @@
       "note": "real 04:06:12Z; real Tony refused because the Sentinel go must come from Harry. Under the spec the owner is a stand-in for approve-desktop-prod-alpha."
     },
     {
+      "t": 120.05,
+      "type": "slack_message",
+      "thread": "Q",
+      "sender": "harry",
+      "text": "signing off for Sentinel tests for 5.2.6",
+      "mentions_tony": false,
+      "event": {
+        "source": "slack",
+        "kind": "message",
+        "thread": "Q",
+        "sender": "U0C4YRX93PS",
+        "sender_kind": "other_bot",
+        "ref": "slack:C0C4K4EGZT6:1790912579.524889",
+        "attrs": {
+          "mentions_tony": false
+        },
+        "delivered": true
+      },
+      "source_note": "gap-fill.md item 4: Harry replied 04:16:22Z, 3 s before the owner's go"
+    },
+    {
       "t": 120.1,
       "type": "slack_message",
       "thread": "A",
@@ -753,5 +774,8 @@
     "Harry sign-off: Harry's QA root (1790912579.524889) has reply_count=2 in the export (Tony's single ask plus, per file 05:172, Harry's 'signing off for Sentinel tests for 5.2.6'), but the replies were not exported and their times are not in the sources. The timeline deliberately omits Harry's reply and instead replays the owner's stand-in approval (real 04:06Z and 04:16Z) so the stand-in path is exercised. ASSUMED: the fake Slack may also deliver Harry's reply as an optional variant; it is not scripted here.",
     "Timeline has a burst of owner questions at 03:36:26 to 03:36:45Z (4 mentions in 19 s); only the first is listed as its own entry, the rest are implied by the twin-mention variant.",
     "People: Harry is a bot (B0C3P4F0FNK) acting as a person; sender_kind other_bot."
+  ],
+  "notes_gap_fill": [
+    "Added Harry's real QA-thread sign-off (gap-fill.md item 4). Start versions 5.2.5 confirmed (item 3)."
   ]
 }

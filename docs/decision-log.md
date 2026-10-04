@@ -45,3 +45,8 @@ live in handoff file 28 §3 and are not repeated here. Each entry: the call, the
 - Call: where the sources lack a fact (update-server start versions for run 4 and v2.18, run 6 pipeline id, v2.18 approval and CI timings, Harry's v2.18 replies), the scenario uses a stated assumption recorded in its `notes`. Run 4's real ending (a cancel) is kept as a cancel case elsewhere and its scenario gets a marked synthetic tail to done.
 - Evidence: the sources were read in full by the scenario worker; these facts were not exported.
 - Alternative: a read-only DevRev re-pull through fde-agent. Rejected: the missing facts are Slack replies and CircleCI timings, which DevRev does not hold, and the replay scores engine behaviour, which these values do not change.
+
+## R10. Scenario facts corrected from fde-agent read-only gap fill
+- Call: run 4 start QA version set to 5.2.8; Harry's real v2.18 sign-off reply added to Q at 04:16:22Z. Other gap-fill answers (v2.18 timings, run 6 thread B) confirm what the scenarios already assume.
+- Evidence: `scenarios/gap-fill.md` (local run collector files under `tony-mock/runs/`; no API calls were made).
+- Parked: which run 6 pipeline id is number 395883 needs a CircleCI token, which `~/.zshrc` lacks. The replay does not depend on it.
