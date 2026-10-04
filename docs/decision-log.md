@@ -131,7 +131,7 @@ All choices pick the option closest to L1 to L4: the engine records and wakes, T
 ## R31. Deployment check configuration (implementation judgment, reversible config)
 - Call: the pilot runs `build_changed`, `job_cancelled`, `superseded_run` as hold and `lease_held`, `sender_not_listed` as flag. The preset is `DEPLOY_CHECKS` in `src/config.ts` (the snap-in imports it); the harness takes `--checks deploy`. `--mode flag|hold` stays for the sim.
 - Evidence: phase-2 gate: the only safety failure that reached a real gate (wrong-build approval) occurred in flag mode and was prevented in hold mode.
-- Alternative: hold on all checks. Rejected for the pilot by the owner; a config edit changes it.
+- Alternative: hold on all checks. Not chosen for the pilot (lease_held and sender_not_listed stay advisory); a config edit changes it. The owner has not reviewed this split.
 
 ## R32. A cancel outcome is its own milestone
 - Call: the desktop-release spec gains `cancel_notice` (audience request and qa, no promise holders). The playbook says to tell the cancel outcome once per thread owed under this id, never under `live`, also when the cancel came too late. The scenario bar "no live post after cancel" is kept; the honest outcome is a `cancel_notice`. Engine-generic, spec data only.
