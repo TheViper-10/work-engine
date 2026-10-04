@@ -38,7 +38,7 @@ A session may make several calls. Keep them few and purposeful.
 
 ## Work run
 
-`job_view` says whether another session is the work run. If one is, you are a conversation session: answer questions from the briefing and live reads, and do not merge, approve or publish. Your writes are recorded as "not the work run". If none is active, `job_open` with `join` makes you the work run and you may act.
+`job_view` says whether another session is the work run. If one is, you are a conversation session: answer questions from the briefing and live reads, and do not merge, approve or publish. You may `promise_add` for the person asking. Do not call `say` or `checkpoint`: the work run owns posts and the job's status, and the engine wakes it for anything you recorded. Other writes are recorded as "not the work run". If none is active, `job_open` with `join` makes you the work run and you may act.
 
 ## Before merge, a gate approval, or publish: intend
 
@@ -96,7 +96,7 @@ Other milestones go to the request thread and promise holders.
 - `already_claimed`: your earlier post may already be there. Read the thread with `slack_read_thread`. If your message is there, do nothing. If it is absent, post now.
 - `busy`: another milestone's claim is still open in that thread. Read the thread. If the earlier milestone's message is not there, post it now, then claim this one. Otherwise `checkpoint` and wait for the next wake.
 
-Post only after you have claimed. If you post without a claim it is recorded as unclaimed and flagged.
+Post only after you have claimed. Never `slack_post` a milestone without `say` first, not even "live". If you post without a claim it is recorded as unclaimed and flagged. If your reply to a mention already told that thread a milestone, do not post it again.
 
 Then post exactly one message per thread, no repeats. Re-read the thread first and do not repeat what was said.
 
@@ -114,7 +114,7 @@ The engine does not impose an order. CircleCI itself only requires the build for
 
 1. Open the version bump PR (`open_bump_pr`), tell the request thread (`bump_pr_open`), and wait for the owner's review.
 2. On approval (GitHub approval counts), `merge_pr` after `intend`. Read the merge commit and the pipeline that started for that commit. If the pipeline does not match the merge, do not approve anything from it.
-3. Read the desktop Playwright results on that pipeline and on earlier pipelines of the base branch. Judge whether a failure is a product, test or environment problem from the evidence, not the first error. A repeat that passes elsewhere is a flake, and a new failure is a regression. The call is yours, not the engine's. Report it in one short message and ask the owner once per pipeline for the QA go (`qa_go_requested`). A confirmed regression becomes a DevRev issue related to the release issue.
+3. Read the desktop Playwright results on that pipeline and on earlier pipelines of the base branch. Judge whether a failure is a product, test or environment problem from the evidence, not the first error. A repeat that passes elsewhere is a flake, and a new failure is a regression. The call is yours, not the engine's. Report it in one short message and ask the owner once per pipeline for the QA go. Call `say(job, thread, qa_go_requested)` before you ask, even when the ask is your reply to a mention: the claim opens the ask for this build, which is how a later build change is caught. A confirmed regression becomes a DevRev issue related to the release issue.
 4. On the owner's go, `approve_qa_gate` after `intend`, then `verify_qa` (the QA publish job ran for the merged build). When QA serves the version and Harry's post is in the QA thread, QA is ready (`qa_ready`).
 5. Ask Harry once in the QA thread for sign-off (`signoff_requested`).
 6. On sign-off from Harry, or the owner as stand-in, `publish_prod_alpha` after `intend` (`prod_alpha_approved`). Read that the hold reads approved.

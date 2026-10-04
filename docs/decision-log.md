@@ -60,3 +60,8 @@ live in handoff file 28 §3 and are not repeated here. Each entry: the call, the
 - Call: `checkpoint` on a done or cancelled job records Tony's report and changes nothing else (simulator fix 5). Tony reopens work with `job_open`.
 - Evidence: the simulator found a late `working` checkpoint on a cancelled job reopening it and clearing its wake, which broke "every open job has a next wake". Cancel is the owner's authority (spec `cancel` gate); a stale session must not undo it.
 - Alternative: let a late checkpoint revive the job. Rejected: a session that missed the cancel would silently resume a release the owner stopped.
+
+## R13. Playbook edits from the first trial replays
+- Calls: (1) claim `qa_go_requested` with `say` before asking for the QA go, even inside a mention reply; (2) a conversation session may `promise_add` but does not `say` or `checkpoint`; (3) never post a milestone without a claim, and do not repost what a mention reply already told.
+- Evidence: trial replays (`harness/out/trial-1` to `trial-final`): stale-go missed `build_changed` because no ask existed; v2-18 drew `not_work_run` and `unclaimed_post` flags and two "live" posts to A.
+- Alternative: have the engine open asks without a claim. Rejected: the engine would have to guess from text that Tony asked for a go (L1, no reading text for meaning).
