@@ -1,0 +1,107 @@
+{
+  "workflow": "desktop-release",
+  "version": 1,
+  "link_roles": ["request", "side", "qa"],
+  "resources": ["alpha", "main"],
+  "people": {
+    "owner": { "slack": "U042GEDM4BB", "name": "Priyadharshan (owner)" },
+    "harry_bot": { "slack": "U0C4YRX93PS", "name": "Harry (QA sign-off; bot in the mock)" }
+  },
+  "gates": {
+    "pr_review": {
+      "responders": { "primary": ["owner"], "stand_ins": [] },
+      "notes": "Owner approves the version bump PR on GitHub (reviewer TheViper-10) or in Slack. Source: 22-tony-coordinator-call-map.md:246-255 (moment 4) and 18-coordinator-design-decisions.md:6 (review = owner, GitHub TheViper-10, Slack U042GEDM4BB). No second person is listed, so stand_ins is empty."
+    },
+    "approve-desktop-qa-latest": {
+      "responders": { "primary": ["owner"], "stand_ins": [] },
+      "notes": "Owner's go for the QA publish (for example 'go, that one is a flake'). Gate name is the CircleCI approval job in gh-config.yml:118-121, which publishes to QA through desktop-app-publish-download-page-qa (gh-config.yml:122-126). Approvers: 22-tony-coordinator-call-map.md:267-276 (moment 6); 21-work/B-live.md:153 (qa = U042GEDM4BB)."
+    },
+    "approve-desktop-prod-alpha": {
+      "responders": { "primary": ["harry_bot"], "stand_ins": ["owner"] },
+      "notes": "QA sign-off before prod alpha. Gate name is the CircleCI approval job in gh-config.yml:128-131; it only requires the build, so order is Tony's job (gh-config.yml:127). Harry primary, owner stand-in: 18-coordinator-design-decisions.md:6. The sign-off ask is allowed only in the QA thread: 22-tony-coordinator-call-map.md:289-296 (moment 8) and :425 (rule 26). Real release later: Abhay U0ANLN96KNH as primary (18-coordinator-design-decisions.md:6), not in this mock spec."
+    },
+    "cancel": {
+      "responders": { "primary": ["owner"], "stand_ins": [] },
+      "notes": "Who may say cancel. Any person on this list can cancel at any time. Source: 22-tony-coordinator-call-map.md:314-321 (moment 11) and 21-work/B-live.md:153 (cancel = U042GEDM4BB). No action uses it; it is the responder list for a cancel ask."
+    }
+  },
+  "milestones": {
+    "bump_pr_open": {
+      "audience": { "roles": ["request"], "promise_holders": true },
+      "opens_ask": "pr_review",
+      "notes": "Version bump PR is open and waiting for the owner's review. Source: 22-tony-coordinator-call-map.md:217-226 (moment 1). Audience default per 28-handoff-work-engine-build.md section 3 D3."
+    },
+    "pr_approved": {
+      "audience": { "roles": ["request"], "promise_holders": true },
+      "notes": "Owner approved the PR on GitHub, often without a Slack mention. Source: 22-tony-coordinator-call-map.md:246-255 (moment 4); 23-work/facts-brief.md:53."
+    },
+    "merged": {
+      "audience": { "roles": ["request"], "promise_holders": true },
+      "notes": "PR merged into the base branch; the CircleCI pipeline starts. Source: 22-tony-coordinator-call-map.md:257-265 (moment 5)."
+    },
+    "qa_go_requested": {
+      "audience": { "roles": ["request"], "promise_holders": true },
+      "opens_ask": "approve-desktop-qa-latest",
+      "notes": "Tony reports the Playwright results and asks the owner for the QA go. Source: 22-tony-coordinator-call-map.md:267-276 (moment 6); 23-work/facts-brief.md:54 (owner says 'go, that one is a flake')."
+    },
+    "qa_ready": {
+      "audience": { "roles": ["request"], "promise_holders": true },
+      "notes": "The build is in QA and Harry's 'New version released in QA' post was seen in the QA thread. This is the milestone thread B subscribes to ('tell me when QA is ready'). Source: 22-tony-coordinator-call-map.md:228-235 (moment 2, subscribe qa_ready) and :278-287 (moment 7)."
+    },
+    "signoff_requested": {
+      "audience": { "roles": ["qa"], "promise_holders": false },
+      "opens_ask": "approve-desktop-prod-alpha",
+      "notes": "Tony asks Harry once, in the QA thread, for sign-off. Audience is the QA thread only because the ask is allowed only there, so this departs from the D3 default. Source: 22-tony-coordinator-call-map.md:289-296 (moment 8) and :425 (rule 26); 23-work/facts-brief.md:55."
+    },
+    "prod_alpha_approved": {
+      "audience": { "roles": ["request"], "promise_holders": true },
+      "notes": "Sign-off received and the prod alpha approval recorded. Source: 22-tony-coordinator-call-map.md:289-296 (moment 8, human go for prod_alpha)."
+    },
+    "live": {
+      "audience": { "roles": ["request", "qa"], "promise_holders": true },
+      "notes": "The version is live on prod alpha and the served revision was read from the update server. One message per audience thread. Audience: 28-handoff-work-engine-build.md section 3 D3 (request thread, every thread with a promise for live, and the QA thread). Source: 22-tony-coordinator-call-map.md:298-312 (moments 9 and 10; run 6 posted twice and missed B)."
+    }
+  },
+  "actions": {
+    "open_bump_pr": {
+      "proved_by": "github_pr_opened",
+      "notes": "Tony opens the version bump PR with his GitHub token. Source: 22-tony-coordinator-call-map.md:196 and :217-226."
+    },
+    "merge_pr": {
+      "resource": "main",
+      "gate": "pr_review",
+      "proved_by": "github_pr_merged",
+      "notes": "Merge the bump PR into the base branch; takes the main lease. Source: 22-tony-coordinator-call-map.md:257-265 (moment 5). Run 6 also pushed directly to the base branch (:197), which this lease and gate are meant to make visible."
+    },
+    "approve_qa_gate": {
+      "gate": "approve-desktop-qa-latest",
+      "proved_by": "circleci_gate_approved",
+      "notes": "Tony approves the CircleCI job approve-desktop-qa-latest with his own token, after the owner's go. Source: gh-config.yml:118-126; 22-tony-coordinator-call-map.md:199 and :267-276."
+    },
+    "verify_qa": {
+      "gate": "approve-desktop-qa-latest",
+      "proved_by": "circleci_job_succeeded",
+      "notes": "Tony checks that the QA publish job desktop-app-publish-download-page-qa ran for the merged build, and that the QA pipeline matches the merge. Source: gh-config.yml:122-126; 22-tony-coordinator-call-map.md:267-276 (qa_correlation_mismatch in run 6)."
+    },
+    "publish_prod_alpha": {
+      "resource": "alpha",
+      "gate": "approve-desktop-prod-alpha",
+      "proved_by": "circleci_gate_approved",
+      "notes": "Tony approves approve-desktop-prod-alpha, which runs desktop-app-publish-download-page-prod-alpha. Takes the alpha lease so two jobs cannot publish to alpha together. Source: gh-config.yml:128-137; 22-tony-coordinator-call-map.md:298-305 (moment 9)."
+    },
+    "verify_served": {
+      "resource": "alpha",
+      "proved_by": "update_server_served",
+      "notes": "Tony reads what the update server serves on prod alpha and compares it to the version. Source: 22-tony-coordinator-call-map.md:200 and :298-305 (moment 9)."
+    },
+    "complete_release_issue": {
+      "proved_by": "devrev_issue_completed",
+      "notes": "Move the release issue (child of ISS-37) to completed. In v8 the Coordinator did this itself; in v3 Tony does it. Source: 22-tony-coordinator-call-map.md:195 and :307-312 (moment 10)."
+    }
+  },
+  "defaults": {
+    "next_wake_minutes": 30,
+    "promise_fallback_minutes": 240,
+    "operation_unknown_minutes": 30
+  }
+}

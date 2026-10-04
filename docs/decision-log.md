@@ -7,3 +7,26 @@ live in handoff file 28 §3 and are not repeated here. Each entry: the call, the
 - Call: start the engine core as soon as the spec and record shapes exist, while scenarios and the playbook are still being written.
 - Evidence: the engine is generic (D8) and depends only on the spec shape, not on scenario or playbook text. The 3-hour time box (file 28 §7.5) is tight.
 - Alternative: strictly serial phases. Rejected because it adds about 25 minutes with no quality gain; phase 0 is still completed and reviewed before phase 1 is declared done.
+
+## R2. Spec event kind names are engine-local
+- Call: `proved_by` event kinds (`github_pr_merged`, `circleci_gate_approved`, ...) are names chosen for the spec; the simulator and harness use the same names. Phase 3 adapters map real webhook payloads onto them.
+- Evidence: no source names them; the engine only matches names (D8).
+- Alternative: real webhook event names. Rejected for now because no adapter exists and CircleCI is Tony-reported until after the live test.
+
+## R3. Sign-off ask audience is the QA thread only
+- Call: milestone `signoff_requested` has audience role `qa` with no promise holders.
+- Evidence: `22-tony-coordinator-call-map.md:425` rule 26 puts the sign-off ask only in the QA thread.
+- Alternative: D3 default (request thread plus promise holders). D3 says "unless the spec says otherwise", so this is within D3.
+
+## R4. A `cancel` gate exists with responders but no action
+- Call: the spec names who may cancel (owner); `sender_not_listed` can flag a cancel from someone else. The engine does not act on it.
+- Evidence: call-map moment 11.
+- Alternative: no cancel gate. Kept because it costs one spec entry and records authority.
+
+## R5. The spec has no step order; `complete_release_issue` is a Tony action
+- Evidence: call-map rules 21 to 23 were the rigid sequencing of v8 (L1 forbids it). In v8 the Coordinator closed the issue (call map line 195); in v3 Tony acts on systems with his own tools.
+- Alternative: none faithful to L1.
+
+## R6. People in the mock spec: owner and Harry only
+- Evidence: `18-coordinator-design-decisions.md:6`, `21-work/B-live.md:153`. Owner is Harry's stand-in on prod alpha.
+- Alternative: add the real-release sign-off person. Left out because phase 4 is a mock release; add in the spec before a real release.

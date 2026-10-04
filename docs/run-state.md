@@ -7,7 +7,7 @@ Resume: read this file, then docs/decision-log.md, then handoff file 28.
 | Slice | Goal | Status |
 |---|---|---|
 | P0-skel | repo skeleton, state file, decision log | done |
-| P0-spec | spec.json + docs/record-shapes.md | running (sonnet) |
+| P0-spec | spec.json + docs/record-shapes.md | done |
 | P0-scen | scenarios from run 4, run 6, v2.18 | running (sonnet) |
 | P0-play | playbook.md | pending |
 | P0-review | docs/phase-0-review.md | pending |
