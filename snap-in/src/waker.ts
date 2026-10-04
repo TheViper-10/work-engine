@@ -1,5 +1,5 @@
 // PlatformWaker: lazy creation of the hidden job-home DM, the wake post through a clone of workflow 16 with the
-// owner keyring token, a stale-version check, and an exactly-once guard around the post.
+// owner keyring token, an advisory (never blocking) stale-version check, and an exactly-once guard around the post.
 //
 // Exactly-once by the engine's key: postWake(dm, text, key) gets key = the run id (or run id plus a notice sequence).
 // The adapter keeps a create-if-absent `wake_attempt:<sha(dm|key)>` row before any trigger. An existing attempt means
@@ -21,10 +21,10 @@ export interface WakerOptions {
   clock: Clock;
   env: string;
   bot: string;
-  /** Identity for ai-agents.get and timeline reads (service account, else caller). */
-  chat: DevRevApi;
   /**
-   * The owner keyring token. It triggers the wake workflow, and it also creates and hides the home DM: the workflow's
+   * The owner keyring token (R49: the only identity this adapter uses). Private objects (the agent, a DM) are shared with
+   * users, not with the service account, so every platform read and write here runs as the owner's user: ai-agents.get, the
+   * wake read-back on the DM timeline, chats.*, workflows.trigger. It triggers the wake workflow, and it also creates and hides the home DM: the workflow's
    * add_comment step runs as the user who triggered it and errors with 403 unless that user is a member of the DM,
    * so the DM's user must be the owner token's own user. chats.create was only proven with a user token.
    */
@@ -63,11 +63,35 @@ export class PlatformWaker implements Waker {
 
   private k(kind: string, id: string): string { return makeKey(this.o.env, this.o.bot, kind, id); }
 
+  /** Diagnostics recorded by this instance (also written, at most once an hour, as a `diag` row). */
+  readonly diagnostics: string[] = [];
+  private diagHour = -1;
+
+  /**
+   * R49: the stale-version check is advisory. A failed read of the agent (403 on a private object, timeout, a bad shape)
+   * never stops a wake: the version is unknown (null), one diagnostic is recorded per hour, and the wake proceeds.
+   */
   private async defaultVersion(): Promise<string | null> {
-    const res = await this.o.chat.call('ai-agents.get', { id: this.o.tonyAgent });
-    // ai-agents.get returns the agent under `agent` (live QA); default_version_id is a string or an object with an id.
-    const v = res?.agent?.default_version_id;
-    return typeof v === 'string' ? v : typeof v?.id === 'string' ? v.id : null;
+    try {
+      const res = await this.o.owner.call('ai-agents.get', { id: this.o.tonyAgent });
+      // ai-agents.get returns the agent under `agent` (live QA); default_version_id is a string or an object with an id.
+      const v = res?.agent?.default_version_id;
+      return typeof v === 'string' ? v : typeof v?.id === 'string' ? v.id : null;
+    } catch (e) {
+      // A missing credential (not an API answer) is not a version problem: the trigger below reports it, so it leaves no row.
+      if (!(e instanceof ApiError)) return null;
+      await this.diagnose(`ai-agents.get failed (${e.status}); agent version unknown, wake continues`);
+      return null;
+    }
+  }
+
+  private async diagnose(message: string): Promise<void> {
+    const now = this.o.clock.now();
+    const hour = Math.floor(now / 3_600_000);
+    if (this.diagHour === hour) return;
+    this.diagHour = hour;
+    this.diagnostics.push(message);
+    try { await this.o.store.putIfAbsent(this.k('diag', `version_read.${hour}`), { at: now, message }); } catch { /* a diagnostic must never block a wake */ }
   }
 
   /** R41: no I/O. Without a wake user, a wake workflow or an agent every post must fail, so the engine records it once and waits for a config change. */
@@ -109,7 +133,11 @@ export class PlatformWaker implements Waker {
   }
 
   private async timelineHas(dm: string, text: string): Promise<boolean> {
-    const res = await this.o.chat.call('timeline-entries.list', { object: dm, limit: 100 });
+    let res: any;
+    try { res = await this.o.owner.call('timeline-entries.list', { object: dm, limit: 100 }); } catch (e) {
+      if (refused(e)) throw new WakeConfigError(`the owner_identity token was refused reading the job home timeline (${(e as ApiError).status}); its user must be a member of the home`);
+      throw e;
+    }
     const entries: any[] = res?.timeline_entries ?? res?.result ?? [];
     return entries.some((e) => typeof e?.id === 'string' && e.id.includes(':comment/') && typeof e.body === 'string' && e.body.includes(text));
   }

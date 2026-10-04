@@ -51,6 +51,20 @@ export class FakePlatform {
   /** The user behind the owner_identity keyring token. */
   ownerUser = OWNER_USER;
   tonyVersion = `${TONY}:version/1`;
+  /**
+   * R49: object-level access. Private objects carry a sharing list and a call by an identity not on it is a 403 even when it holds
+   * the scope (live: ai-agents.get on ai_agent/2 as the service account, with ai_agent:read). null means "shared with the owner token's user only".
+   * A DM's list is its `users`.
+   */
+  agentShared: string[] | null = null;
+  /** The platform user behind each identity: the service account, the caller (the session user), the owner keyring token. */
+  userOf(as: Identity): string { return as === 'owner' ? this.ownerUser : as === 'service' ? `${ORG}:svcacc/9` : OWNER_USER; }
+  private canSee(as: Identity, shared: string[]): boolean { return shared.includes(this.userOf(as)); }
+  private requireAgent(as: Identity): void { if (!this.canSee(as, this.agentShared ?? [this.ownerUser])) throw new ApiError(403, 'forbidden (not shared with this identity)', 'forbidden'); }
+  private requireMember(as: Identity, dm: string): void {
+    const c = this.chats.get(dm);
+    if (c && !this.canSee(as, c.users)) throw new ApiError(403, 'forbidden (not a member of the conversation)', 'forbidden');
+  }
   listLagMs = 5000;
   triggerDelayMs = 0;
   callerCanWrite = true;
@@ -255,8 +269,10 @@ export class FakePlatform {
       case 'dev-users.self':
         return { dev_user: { id: as === 'owner' ? this.ownerUser : OWNER_USER } };
       case 'ai-agents.get':
+        this.requireAgent(as);
         return { agent: { id: b.id, default_version_id: this.versionShape === 'object' ? { id: this.tonyVersion } : this.tonyVersion } };
       case 'chats.create': {
+        this.requireAgent(as);
         const id = `${ORG}:dm/${(this.seq += 1).toString(36)}home`;
         this.chats.set(id, { id, display_state: b.display_state ?? 'global', members: (b.agent_members ?? []).map((m: any) => m.agent), users: b.users ?? [], type: b.type });
         return { chat: { id } };
@@ -264,6 +280,7 @@ export class FakePlatform {
       case 'chats.update': {
         const c = this.chats.get(b.id);
         if (!c) throw new ApiError(404, 'not_found', 'not_found');
+        this.requireMember(as, b.id);
         if (b.display_state) c.display_state = b.display_state;
         return { chat: { id: c.id, display_state: c.display_state } };
       }
@@ -282,6 +299,7 @@ export class FakePlatform {
         return { workflow_run_id: run };
       }
       case 'timeline-entries.list': {
+        this.requireMember(as, b.object);
         const now = this.clock.now();
         return { timeline_entries: (this.timeline.get(b.object) ?? []).filter((e) => e.visible_at <= now) };
       }

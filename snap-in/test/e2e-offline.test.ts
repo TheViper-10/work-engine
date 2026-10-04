@@ -101,8 +101,8 @@ test('interruption-boundary journey through the dispatcher', async () => {
   const map: any = await store.get(dmmapKey('qa', 'tony', jobRow.dm_id));
   assert.equal(map.dm, home.id);
   // nothing was written by an unexpected identity: the caller path never used the owner keyring
-  // the owner token is used for exactly four things: who it is, creating and hiding the home DM, and the wake trigger
-  assert.ok(f.log.filter((l) => l.as === 'owner').every((l) => ['workflows.trigger', 'dev-users.self', 'chats.create', 'chats.update'].includes(l.path)));
+  // R49: the owner token is used for every private-object call: who it is, the agent version, the home DM, the wake trigger and its read-back
+  assert.ok(f.log.filter((l) => l.as === 'owner').every((l) => ['workflows.trigger', 'dev-users.self', 'chats.create', 'chats.update', 'ai-agents.get', 'timeline-entries.list'].includes(l.path)));
   assert.ok(f.log.filter((l) => l.path === 'chats.create' || l.path === 'chats.update').every((l) => l.as === 'owner'), 'the service account never creates the home DM');
   // the operation path has no owner keyring: a notice attempted there is refused before any send, so sent triggers match successful owner calls
   assert.equal(f.log.filter((l) => l.as === 'owner' && l.path === 'workflows.trigger' && l.status === 200).length, f.triggers.length);
@@ -300,20 +300,42 @@ test('the admin close list is read only from the installation, never from an ope
 
 const MANIFEST = readFileSync(new URL('../manifest.yaml', import.meta.url), 'utf8');
 
-test('R47 regression: without ai_agent:read the timer path gets the live 403 before the DM exists; dmmap stays creating', async () => {
-  const f = new FakePlatform().useManifest(MANIFEST.replace(/      - scope: ai_agent:read\n        optional: false\n        reason: [^\n]*\n/, ''));
-  assert.ok(!f.scopes.service.has('ai_agent:read'), 'the edit removed the scope');
+test('R49 regression (a): the v3 failure, a service-account read of the private agent is 403 even with ai_agent:read, and the home DM and one wake still happen', async () => {
+  const f = new FakePlatform();
+  assert.ok(f.scopes.service.has('ai_agent:read'), 'the scope is held');
+  const direct = f.deps().devrev(f.timerEvent());
+  await assert.rejects(direct.call('ai-agents.get', { id: TONY }, 'service'), (e: any) => e.status === 403);
   const d = dispatcher(f);
   const mention = f.newMentionDm();
   const opened = await d.call({ call: 'job_open', workflow: WF, target: '5.2.11', thread: `${ALLOWED}:1.000001`, role: 'request', intent: 'join', requester: 'U1', agent_session_id: mention.session });
   assert.equal(opened.status, 'opened');
-  await d.tick(); f.clock.advanceMinutes(2); await d.tick();
-  const denied = f.log.filter((l) => l.path === 'ai-agents.get');
-  assert.ok(denied.length > 0 && denied.every((l) => l.status === 403 && l.as === 'service'), 'ai-agents.get was refused with 403 as the service account');
-  assert.equal(f.chats.size, 1, 'only the mention DM: no home was created');
-  const maps = [...f.rows.values()].filter((r) => r.unique_key.includes(':dmmap:') && !r.unique_key.includes('dmrev'));
-  assert.ok(maps.length > 0);
-  assert.ok(maps.every((r) => JSON.parse(String(r.custom_fields.tnt__body)).state === 'creating'), 'dmmap stays creating');
+  await d.tick(); f.clock.advanceMinutes(2); await d.tick(); f.clock.advanceMinutes(2); await d.tick();
+  assert.equal(f.chats.size, 2, 'the home DM exists next to the mention DM');
+  assert.equal(f.triggers.length, 1, 'exactly one wake');
+  const maps = [...f.rows.values()].filter((r) => r.unique_key.includes(':dmmap:'));
+  const latest = maps.sort((a, b) => Number(a.unique_key.split('@v')[1]) - Number(b.unique_key.split('@v')[1])).at(-1);
+  assert.ok(latest && JSON.parse(String(latest.custom_fields.tnt__body)).state === 'ready', 'dmmap is ready');
+  assert.ok(f.log.filter((l) => l.path === 'ai-agents.get' && l.as === 'service').length === 1, 'only my direct probe used the service account');
+});
+
+test('R49: a failed version read of any kind never stops the wake; one diagnostic per hour, version unknown', async () => {
+  for (const how of ['403', 'timeout', '500'] as const) {
+    const f = new FakePlatform(); const d = dispatcher(f);
+    if (how === '403') f.agentShared = []; // the owner token cannot see the agent either
+    else f.inject('ai-agents.get', { status: how === 'timeout' ? 0 : 500, timeout: how === 'timeout' ? 'before' : undefined, times: 50 });
+    f.installInputs.tony_agent = TONY;
+    const mention = f.newMentionDm();
+    await d.call({ call: 'job_open', workflow: WF, target: '5.2.11', thread: `${ALLOWED}:1.000001`, role: 'request', intent: 'join', requester: 'U1', agent_session_id: mention.session });
+    for (let i = 0; i < 4; i += 1) { await d.tick(); f.clock.advanceMinutes(2); }
+    // ensureHome needs chats.create, which is also gated by agent access in the fake, so only the 403 case shares that gate
+    if (how !== '403') {
+      assert.equal(f.triggers.length, 1, how);
+      const diags = [...f.rows.values()].filter((r) => r.unique_key.includes(':diag:'));
+      assert.equal(diags.length, 1, `${how}: one diagnostic row for the hour`);
+      const map = [...f.rows.values()].find((r) => r.unique_key.includes(':dmmap:'))!;
+      assert.equal(JSON.parse(String(map.custom_fields.tnt__body)).agent_version, null, 'version unknown');
+    }
+  }
 });
 
 test('R47: with the manifest as shipped the same journey creates the home (scope table comes from the parsed manifest)', async () => {

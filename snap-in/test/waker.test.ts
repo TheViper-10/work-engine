@@ -13,7 +13,7 @@ function wakerFor(f: FakePlatform, o: { keyring?: boolean } = {}) {
   if (o.keyring === false) delete ev.input_data.resources.keyrings.owner_identity;
   const api = f.deps().devrev(ev);
   const store = storeFor(f);
-  const waker = new PlatformWaker({ store, clock: f.clock, env: 'qa', bot: 'tony', chat: scoped(api, 'service'), owner: scoped(api, 'owner'), tonyAgent: TONY, wakeUser: OWNER_USER, wakeWorkflow: WAKE_WORKFLOW });
+  const waker = new PlatformWaker({ store, clock: f.clock, env: 'qa', bot: 'tony', owner: scoped(api, 'owner'), tonyAgent: TONY, wakeUser: OWNER_USER, wakeWorkflow: WAKE_WORKFLOW });
   return { waker, store, api };
 }
 const LOGICAL = 'dm:desktop-release:5.2.11';
@@ -168,7 +168,7 @@ test('R45: the home DM is created by the owner token for the owner token\'s own 
   const f = new FakePlatform(); f.ownerUser = 'don:identity:dvrv-us-1:devo/1lKlCUXYGG:devu/1';
   f.installInputs.wake_user = 'devu/1'; // short form of the same user: the cross-check accepts it
   const api = f.deps().devrev(f.timerEvent());
-  const waker = new PlatformWaker({ store: storeFor(f), clock: f.clock, env: 'qa', bot: 'tony', chat: scoped(api, 'service'), owner: scoped(api, 'owner'), tonyAgent: TONY, wakeUser: 'devu/1', wakeWorkflow: WAKE_WORKFLOW });
+  const waker = new PlatformWaker({ store: storeFor(f), clock: f.clock, env: 'qa', bot: 'tony', owner: scoped(api, 'owner'), tonyAgent: TONY, wakeUser: 'devu/1', wakeWorkflow: WAKE_WORKFLOW });
   await waker.postWake(LOGICAL, 'a', 'k1');
   await waker.postWake('dm:desktop-release:other', 'b', 'k2');
   const chats = [...f.chats.values()];
@@ -181,7 +181,7 @@ test('R45: the home DM is created by the owner token for the owner token\'s own 
 test('R45: a wake_user that is not the owner token\'s user is a config error before any DM exists', async () => {
   const f = new FakePlatform(); f.ownerUser = 'don:identity:dvrv-us-1:devo/1lKlCUXYGG:devu/1';
   const api = f.deps().devrev(f.timerEvent());
-  const waker = new PlatformWaker({ store: storeFor(f), clock: f.clock, env: 'qa', bot: 'tony', chat: scoped(api, 'service'), owner: scoped(api, 'owner'), tonyAgent: TONY, wakeUser: 'don:identity:dvrv-us-1:devo/1lKlCUXYGG:devu/2', wakeWorkflow: WAKE_WORKFLOW });
+  const waker = new PlatformWaker({ store: storeFor(f), clock: f.clock, env: 'qa', bot: 'tony', owner: scoped(api, 'owner'), tonyAgent: TONY, wakeUser: 'don:identity:dvrv-us-1:devo/1lKlCUXYGG:devu/2', wakeWorkflow: WAKE_WORKFLOW });
   await assert.rejects(waker.postWake(LOGICAL, 'x', 'k'), (e: Error) => e instanceof WakeConfigError && /must be the same user/.test(e.message));
   assert.equal(f.chats.size, 0); assert.equal(f.triggers.length, 0);
   assert.equal([...f.rows.keys()].filter((k) => /:dmmap:/.test(k)).length, 0, 'no dmmap row is left at "creating"');
@@ -235,5 +235,39 @@ test('R47: the fake enforces scopes per identity; a missing one is a 403 and the
   assert.equal(await status(api.call('objects.list', { dql_query: { filter: { operands: [{ field: 'x.leaf_type', value: ['work_record'] }, { field: 'x.unique_key', value: ['k'] }] } } }, 'service')), 403);
   assert.equal(await status(api.call('custom-objects.get', { unique_key: 'ev:1:2:event:x' }, 'service')), 404, 'work_event scope is still held');
   assert.equal(await status(api.call('dev-users.self', {}, 'owner')), 200);
-  assert.equal(await status(api.call('ai-agents.get', { id: TONY }, 'service')), 200);
+  assert.equal(await status(api.call('ai-agents.get', { id: TONY }, 'service')), 403, 'R49: scope held, object not shared with the service account');
+});
+
+test('R49 (b): a service account reading the DM timeline gets 403, so the waker reads it with the owner token', async () => {
+  const f = new FakePlatform(); const { waker, api } = wakerFor(f);
+  await waker.postWake(LOGICAL, 'first', 'k1');
+  const dm = [...f.chats.keys()][0];
+  assert.ok(f.scopes.service.has('conversation:write'), 'the scope is held');
+  await assert.rejects(api.call('timeline-entries.list', { object: dm }, 'service'), (e: ApiError) => e.status === 403);
+  f.clock.advanceMinutes(10);
+  await waker.postWake(LOGICAL, 'first', 'k1'); // existing attempt: reads the timeline back
+  const reads = f.log.filter((l) => l.path === 'timeline-entries.list' && l.as !== 'service');
+  assert.ok(reads.length > 0 && reads.every((l) => l.as === 'owner' && l.status === 200));
+  assert.equal(f.log.filter((l) => l.as === 'service' && !/^(custom-objects|objects\.|snap-ins)/.test(l.path) && l.status === 200).length, 0, 'no private read by the service account succeeded');
+});
+
+test('R49 (c): an owner token that is not a member of the DM gets 403, which is a config error', async () => {
+  const f = new FakePlatform(); f.triggerDelayMs = 20_000; const { waker } = wakerFor(f);
+  await waker.postWake(LOGICAL, 'first', 'k1'); // not yet visible, so the next call must read the timeline
+  const dm = [...f.chats.keys()][0];
+  f.chats.get(dm)!.users = ['someone-else'];
+  f.clock.advanceMinutes(10);
+  await assert.rejects(waker.postWake(LOGICAL, 'first', 'k1'), (e: Error) => e instanceof WakeConfigError && /timeline \(403\)/.test(e.message));
+  await assert.rejects(waker.postWake(LOGICAL, 'second', 'k2'), (e: Error) => e instanceof WakeConfigError && /\(403\)/.test(e.message));
+  assert.equal(f.triggers.length, 1);
+});
+
+test('R49: the stale-version check still works when the owner can read the agent', async () => {
+  const f = new FakePlatform(); const { waker } = wakerFor(f);
+  await waker.postWake(LOGICAL, 'v1', 'v1');
+  f.tonyVersion = `${TONY}:version/2`; f.clock.advanceMinutes(10);
+  assert.deepEqual(await waker.postWake(LOGICAL, 'v2', 'v2'), { stale_version: true });
+  f.agentShared = []; f.clock.advanceMinutes(10);
+  await waker.postWake(LOGICAL, 'v3', 'v3'); // unknown version: the wake goes
+  assert.equal(f.triggers.length, 2); assert.equal(waker.diagnostics.length, 1);
 });

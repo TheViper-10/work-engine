@@ -38,9 +38,10 @@ export async function buildRuntime(event: any, deps: Deps, as: Identity, snapInI
   const snap = await api.call('snap-ins.get', { id }, as);
   const inputs = readInputs(snap?.snap_in?.inputs_values ?? {});
   const store = new PlatformStore({ api: scoped(api, as), sleep: deps.sleep });
-  const directory = new PlatformSessionDirectory({ api: scoped(api, as), store, env: inputs.env, bot: inputs.bot });
+  // ai-agent.sessions.get: the caller token on the operation path (proven live); the owner token on the timer path (not proven live, not called there today).
+  const directory = new PlatformSessionDirectory({ api: scoped(api, as === 'caller' ? 'caller' : 'owner'), store, env: inputs.env, bot: inputs.bot });
   const waker = new PlatformWaker({
-    store, clock: deps.clock, env: inputs.env, bot: inputs.bot, chat: scoped(api, as), owner: scoped(api, 'owner'),
+    store, clock: deps.clock, env: inputs.env, bot: inputs.bot, owner: scoped(api, 'owner'),
     tonyAgent: inputs.tony_agent, wakeUser: inputs.wake_user, wakeWorkflow: inputs.wake_workflow,
   });
   const slackApi = deps.slack(event);
