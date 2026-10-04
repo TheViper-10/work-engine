@@ -14,7 +14,7 @@ Resume: read this file, then docs/decision-log.md, then handoff file 28.
 | P1-core | engine core + memory store + six calls + lint | done: lint ok, 33 unit tests pass |
 | P1-sim | simulator: 1,000 random orders + named cases | running (sonnet) |
 | P1-red | Opus red-team, fix confirmed | pending |
-| P2-harness | replay harness, real model via gateway | running (sonnet): world, driver, model loop, scorer; engine binding later |
+| P2-harness | replay harness, real model via gateway | world/driver/model/scorer done (smoke ok on real model); engine binding + trials running (sonnet) |
 | P2-runs | replays under flag and hold, scored vs D7 | pending |
 | Report | 29-work-engine-run-report.md + /tmp copy | pending |
 
