@@ -248,12 +248,18 @@ test('say: go, already_claimed, busy, already_sent', async () => {
   assert.match(g.say_to_tony, /ask for g1 on build b1/);
   e.clock.advance(2 * MIN);
   const again = await e.engine.say({ job, thread: 'A', milestone: 'm1' }, S1);
-  assert.equal(again.status, 'already_claimed');
-  assert.match(again.say_to_tony, /Not seen yet: check the thread; if your post is absent, post now/);
+  assert.equal(again.status, 'go', 'the owner gets go again');
+  const other = await e.engine.say({ job, thread: 'A', milestone: 'm1' }, S2);
+  assert.equal(other.status, 'busy', 'a second session is told not to post while the claim is fresh');
+  assert.match(other.say_to_tony, /Do not post/);
   const busy = await e.engine.say({ job, thread: 'A', milestone: 'm_final' }, S1);
   assert.equal(busy.status, 'busy');
-  assert.match(busy.say_to_tony, /busy: claim for m1 still open/);
-  await e.engine.ingest({ source: 'slack', delivery_id: 'p1', kind: 'message', thread: 'A', sender_id: BOT, attrs: { link: 'https://x/p1' } });
+  assert.match(busy.say_to_tony, /a claim for m1 is open/);
+  e.clock.advance(11 * MIN);
+  const stale = await e.engine.say({ job, thread: 'A', milestone: 'm1' }, S2);
+  assert.equal(stale.status, 'already_claimed', 'a stale claim is handed over with a read-the-thread instruction');
+  assert.match(stale.say_to_tony, /post only if the message is absent/);
+  await e.engine.ingest({ source: 'slack', delivery_id: 'p1', kind: 'message', thread: 'A', sender_id: BOT, attrs: { link: 'https://x/p1', ts: e.clock.now() } });
   const sent = await e.engine.say({ job, thread: 'A', milestone: 'm1' }, S1);
   assert.equal(sent.status, 'already_sent');
   assert.equal(sent.link, 'https://x/p1');
@@ -276,7 +282,8 @@ test('ingest: own-bot post matches the claim, fulfils the promise; duplicate is 
   await e.engine.jobOpen({ workflow: 'wf-test', target: 't1', thread: 'B', role: 'role2' }, S1);
   await e.engine.promiseAdd({ job, thread: 'B', about: 'm1', fallback_time: 60 }, S1);
   await e.engine.say({ job, thread: 'B', milestone: 'm1' }, S1);
-  const ev = { source: 'slack', delivery_id: 'post1', kind: 'message', thread: 'B', sender_id: BOT };
+  e.clock.advance(1000);
+  const ev = { source: 'slack', delivery_id: 'post1', kind: 'message', thread: 'B', sender_id: BOT, attrs: { ts: e.clock.now() } };
   const r = await e.engine.ingest(ev);
   assert.match(r.say_to_tony, /matched the m1 claim/);
   const dup = await e.engine.ingest(ev);
@@ -325,7 +332,7 @@ test('ingest: proved_by event verifies the operation and releases the lease', as
   const e = setup();
   const job = await open(e);
   await e.engine.intend({ job, action: 'a1', ref: 'pr1' }, S1);
-  await e.engine.ingest({ source: 'ext', delivery_id: 'd1', kind: 'ev_a1', ref: 'pr1' });
+  await e.engine.ingest({ source: 'ext', delivery_id: 'd1', kind: 'ev_a1', ref: 'pr1', attrs: { gate: 'g1' } });
   const j = (await e.engine.jobView({ job })).jobs as any[];
   assert.equal(j[0].operations[0].outcome, 'done');
   assert.equal(j[0].operations[0].source, 'webhook_verified');
@@ -397,7 +404,7 @@ test('checkpoint done while deliveries are owed => closing; closes when the post
   // deliver it
   const s = await e.engine.say({ job, thread: 'A', milestone: 'm_final' }, S2);
   assert.equal(s.status, 'go');
-  await e.engine.ingest({ source: 'slack', delivery_id: 'fin', kind: 'message', thread: 'A', sender_id: BOT });
+  await e.engine.ingest({ source: 'slack', delivery_id: 'fin', kind: 'message', thread: 'A', sender_id: BOT, attrs: { ts: e.clock.now() } });
   const v = (await e.engine.jobView({ job })).jobs as any[];
   assert.equal(v[0].status, 'done');
   await ok(e, [job]);
@@ -484,7 +491,7 @@ test('sweep: unseen claim is reconciled through the Slack reader; missed post ne
   const again = await e.engine.say({ job, thread: 'A', milestone: 'm1' }, S1);
   assert.equal(again.status, 'already_sent');
   // the connector then shows up late: still sent once
-  await e.engine.ingest({ source: 'slack', delivery_id: 'late', kind: 'message', thread: 'A', sender_id: BOT });
+  await e.engine.ingest({ source: 'slack', delivery_id: 'late', kind: 'message', thread: 'A', sender_id: BOT, attrs: { ts: e.clock.now() } });
   await ok(e, [job]);
 });
 
@@ -504,7 +511,7 @@ test('private evidence from one thread is shown to another thread as held', asyn
 test('run: a session that is not the work run is flagged on writes, and takes over after the run times out', async () => {
   const e = setup();
   const job = await open(e, 't1', 'A', S1);
-  await e.engine.promiseAdd({ job, thread: 'B', about: 'm1', fallback_time: 30 }, S2);
+  await e.engine.checkpoint({ job, status: 'note' }, S2);
   assert.ok(flagsOf(await e.engine.jobView({ job })).includes('not_work_run'));
   e.clock.advance(21 * MIN);
   const r = await e.engine.intend({ job, action: 'a4', ref: 'x' }, S2);

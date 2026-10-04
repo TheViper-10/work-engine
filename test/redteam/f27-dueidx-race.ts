@@ -12,4 +12,4 @@ await Promise.all([
 ]);
 const woke = new Set<string>();
 for (let i = 0; i < 5; i++) { clock.advance(5 * MIN); for (const j of (await e1.engine.sweep()).woke as string[]) woke.add(j); }
-check('concurrent schedule() into one due bucket: one job id lost, its 7-min wake missed until an older entry fires', woke.size < 2 || true, `woken within 26 min: ${JSON.stringify([...woke])}`);
+check('concurrent schedule() into one due bucket: one job id lost, its 7-min wake missed until an older entry fires', woke.size < 2, `woken within 26 min: ${JSON.stringify([...woke])}`);

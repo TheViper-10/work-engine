@@ -23,7 +23,7 @@ export function checkAnswer(w: World, call: string, args: any, ans: Answer): str
     for (const h of holds) if (!CHECK_NAMES.some((n) => h.startsWith(`${n}:`))) bad.push(`intend: hold "${h}" is not one of the five checks`);
     if (!/Next:/.test(ans.say_to_tony)) bad.push('intend: hold without a next move in words');
     const op = ans.operation as any;
-    if (!op || op.outcome !== 'held' || op.lease_taken) bad.push('intend: hold left an operation in flight or took a lease');
+    if (!ans.existing && (!op || op.outcome !== 'held' || op.lease_taken)) bad.push('intend: hold left an operation in flight or took a lease');
   }
   if (call === 'intend' && ans.status === 'clear') {
     const op = ans.operation as any;
@@ -66,7 +66,17 @@ export async function checkState(w: World, afterSweep: boolean): Promise<string[
       openPerTarget.set(`${job.workflow}:${job.target}`, l);
     }
     for (const d of dels) {
-      if (d.state === 'sent' && !w.hasPost(job.id, d.thread, d.milestone)) bad.push(`${job.id}: delivery ${d.key} is sent but the sim never posted it`);
+      // A sent delivery's claim milestone must equal the milestone that was really posted (H3): no stray post or reply counts.
+      if (d.state === 'sent' && !w.hasPost(job.id, d.thread, d.milestone, d.round ?? 1)) bad.push(`${job.id}: delivery ${d.key} (round ${d.round}) is sent via ${d.seen_via} but the sim never posted that milestone`);
+    }
+    // Promises are never voided by closing (M6): only a cancel may void them.
+    if (job.status === 'done') for (const p of proms) if (p.state === 'void' || p.state === 'open' || p.state === 'due') bad.push(`${job.id}: done job has ${p.state} promise ${p.key}`);
+    // A cancel must not wait on an unknown outcome (H5): with nothing in flight it finishes.
+    if (job.status === 'cancel_requested' && !ops.some((o: any) => o.outcome === 'in_flight')) bad.push(`${job.id}: cancel_requested with only unknown operations left; the cancel should have finished`);
+    // A pending unblock wake is never overwritten (H8, M3): until a wake is posted the job keeps a reason.
+    if (w.pendingUnblock.has(job.id)) {
+      if (terminal) w.pendingUnblock.delete(job.id);
+      else if (job.status !== 'queued' && job.wake_reasons.length === 0) bad.push(`${job.id}: an unblock from ${Math.round((now - w.pendingUnblock.get(job.id)!) / MIN)} min ago lost its wake reason before any wake was posted`);
     }
     if (afterSweep && !terminal) {
       for (const o of ops) if (o.outcome === 'in_flight' && o.intent_at + unknownMs <= now) bad.push(`${job.id}: operation ${o.key} in flight past the timeout after a sweep`);
@@ -88,12 +98,12 @@ export async function checkState(w: World, afterSweep: boolean): Promise<string[
   }
   for (const [t, list] of openPerTarget) if (list.length > 1) bad.push(`target ${t}: ${list.length} jobs open at once (${list.join(', ')})`);
   for (const th of THREADS) {
-    const ti = await w.peek<any>('thread_index', th);
-    if (ti?.claim) {
-      const cj = await w.peek<any>('job', ti.claim.job);
-      if (!cj || cj.status === 'done' || cj.status === 'cancelled') bad.push(`thread ${th}: open claim points at ended job ${ti.claim.job}`);
-      const d = await w.peek<any>('delivery', `${ti.claim.job}:${th}:${ti.claim.milestone}`);
-      if (!d || d.state !== 'claimed') bad.push(`thread ${th}: claim ${ti.claim.milestone} has no claimed delivery (${d?.state})`);
+    const c = await w.peek<any>('claim', th);
+    if (c?.state === 'open') {
+      const cj = await w.peek<any>('job', c.job);
+      if (!cj || cj.status === 'done' || cj.status === 'cancelled') bad.push(`thread ${th}: open claim points at ended job ${c.job}`);
+      const d = await w.peek<any>('delivery', `${c.job}:${th}:${c.milestone}`);
+      if (!d || d.state !== 'claimed') bad.push(`thread ${th}: claim ${c.milestone} has no claimed delivery (${d?.state})`);
     }
   }
   for (const res of w.spec.resources ?? []) {
@@ -105,6 +115,9 @@ export async function checkState(w: World, afterSweep: boolean): Promise<string[
       if (live.length === 0) bad.push(`lease ${res}: held by ${lease.holder_job} without an in-flight operation`);
       const h = jobs.find((j) => j.id === lease.holder_job);
       if (h && (h.status === 'done' || h.status === 'cancelled')) bad.push(`lease ${res}: held by ended job ${h.id}`);
+      // no lease held forever by an unknown outcome once its job is cancelled or has been unknown for a long time with no wake
+      const stuck = lops.filter((o: any) => o.outcome === 'unknown' && o.outcome_at === null && now - o.intent_at > 24 * 60 * MIN);
+      if (afterSweep && h && stuck.length && h.status === 'cancel_requested') bad.push(`lease ${res}: held by cancelled job ${h.id} through an unknown operation for over a day`);
     } else if (lease.ops.length) bad.push(`lease ${res}: free but lists operations ${lease.ops.join(',')}`);
   }
   return bad;

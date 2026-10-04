@@ -1,4 +1,4 @@
-import { world, J, WF, check, MIN } from './h.ts';
+import { world, J, WF, check, MIN } from '../h.ts';
 const { MemoryStore } = await import('/Users/priyadharshanravichandran/DevRev/Github_Repos/work-engine/src/store.ts');
 const { ManualClock } = await import('/Users/priyadharshanravichandran/DevRev/Github_Repos/work-engine/src/clock.ts');
 const store = new MemoryStore(); const t = Date.UTC(2026, 0, 1, 1);
