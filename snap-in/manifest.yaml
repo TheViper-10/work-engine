@@ -1,0 +1,226 @@
+version: '2'
+name: Work Engine QA
+description: QA job-home work engine. One function serves Tony's six job calls and a per-minute timer that polls allowlisted Slack threads and sweeps overdue jobs.
+
+service_account:
+  display_name: Work Engine QA
+  scopes:
+    self:
+      - scope: custom_object:work_record:all
+        optional: false
+        reason: Read and create engine job, run, ask, operation and index records.
+      - scope: custom_object:work_event:all
+        optional: false
+        reason: Create and read engine event records.
+      - scope: ai_agent_session:read
+        optional: false
+        reason: Look up the conversation a calling session lives in.
+      - scope: snap_in:read
+        optional: false
+        reason: Read this installation's inputs.
+      - scope: event_source:read
+        optional: false
+        reason: Validate this installation's timer source.
+      - scope: conversation:write
+        optional: false
+        reason: Create and hide the job-home conversation and read its timeline.
+
+keyrings:
+  organization:
+    - name: owner_identity
+      display_name: Owner execution identity
+      description: QA owner token used only to trigger the wake workflow clone in the job-home DM.
+      types: [snap_in_secret]
+    - name: tony_slack_token
+      display_name: Tony Slack bot token
+      description: Tony bot token (TONY_SLACK_BOT_TOKEN) used to read allowlisted Slack threads.
+      types: [snap_in_secret]
+    - name: github_read
+      display_name: GitHub read token
+      description: Read-only GitHub token (GITHUB_TOKEN). The adapter only reads one repository and one branch.
+      types: [snap_in_secret]
+
+inputs:
+  organization:
+    - name: env
+      field_type: text
+      default_value: 'qa'
+      is_required: false
+      ui: { display_name: 'Environment' }
+    - name: bot
+      field_type: text
+      default_value: 'tony'
+      is_required: false
+      ui: { display_name: 'Bot name' }
+    - name: own_bot_user
+      field_type: text
+      default_value: 'U0C4FFYJGE6'
+      is_required: false
+      ui: { display_name: 'Tony Slack bot user id' }
+    - name: tony_agent
+      field_type: text
+      default_value: 'don:core:dvrv-us-1:devo/1lKlCUXYGG:ai_agent/2'
+      is_required: false
+      ui: { display_name: 'Tony agent' }
+    - name: wake_user
+      field_type: text
+      default_value: ''
+      is_required: false
+      ui: { display_name: 'Wake user (devu id)' }
+    - name: wake_workflow
+      field_type: text
+      default_value: ''
+      is_required: false
+      ui: { display_name: 'Wake workflow (clone of workflow 16)' }
+    - name: slack_channel_allowlist
+      field_type: text
+      default_value: 'C0C4K4EGZT6'
+      is_required: false
+      ui: { display_name: 'Slack channel allowlist (comma separated)' }
+    - name: github_repo
+      field_type: text
+      default_value: 'devrev/devrev-web'
+      is_required: false
+      ui: { display_name: 'GitHub repository' }
+    - name: mock_branch
+      field_type: text
+      default_value: 'mock/tony-desktop-release'
+      is_required: false
+      ui: { display_name: 'Mock release branch' }
+    - name: state_path
+      field_type: text
+      default_value: 'mock-release/state.json'
+      is_required: false
+      ui: { display_name: 'Served state file path' }
+    - name: guidance_version
+      field_type: text
+      default_value: ''
+      is_required: false
+      ui: { display_name: 'Guidance version (sha of playbook and references)' }
+
+event_sources:
+  organization:
+    - name: engine_timer
+      display_name: Work engine timer
+      description: Fires every minute to poll watched Slack threads and sweep overdue jobs.
+      type: timer-events
+      config: { cron: '* * * * *' }
+
+functions:
+  - name: work_engine
+    description: Serve the six engine calls and the per-minute poll and sweep.
+    supports_synchronization: true
+    config:
+      runtime: { max_retries: 3, min_interval: 30, max_execution_time: 120000 }
+
+automations:
+  - name: work-engine-tick
+    source: engine_timer
+    event_types: [timer.tick]
+    function: work_engine
+
+operations:
+  - name: work_engine_call
+    slug: work_engine_call
+    description: Run one engine call (job_open, job_view, intend, say, promise_add, checkpoint) and return the engine answer.
+    function: work_engine
+    type: action
+    static_scopes:
+      self:
+        - scope: snap_in:read
+        - scope: ai_agent_session:read
+        - scope: custom_object:work_record:all
+        - scope: custom_object:work_event:all
+        - scope: conversation:write
+    inputs:
+      fields:
+        - name: call
+          field_type: enum
+          allowed_values: [job_open, job_view, intend, say, promise_add, checkpoint]
+          is_required: true
+          description: "Which engine call to run."
+        - name: request_id
+          field_type: text
+          description: "Workflow invocation id retained across retries."
+          ui: { is_hidden: true }
+        - name: snap_in_id
+          field_type: id
+          id_type: [snap_in]
+          description: "Installation."
+          ui: { is_hidden: true }
+        - name: agent_session_id
+          field_type: id
+          id_type: [ai_agent_session]
+          description: "Platform session id; the DM is looked up from it, never passed."
+          ui: { is_hidden: true }
+        - name: workflow
+          field_type: text
+          description: "job_open: workflow id, for example desktop-release."
+        - name: target
+          field_type: text
+          description: "job_open: the target, for example the version being released."
+        - name: thread
+          field_type: text
+          description: "job_open, job_view, say, promise_add: the Slack thread as <channel>:<ts>."
+        - name: role
+          field_type: text
+          description: "job_open: thread role (request, side or qa)."
+        - name: private
+          field_type: bool
+          description: "job_open: keep this thread private."
+        - name: intent
+          field_type: enum
+          allowed_values: [join, replace, queue]
+          description: "job_open: join, replace or queue."
+        - name: requester
+          field_type: text
+          description: "job_open: who asked."
+        - name: job
+          field_type: text
+          description: "Job id for every call except job_open."
+        - name: action
+          field_type: text
+          description: "intend: the action name."
+        - name: ref
+          field_type: text
+          description: "intend: the reference the action works on."
+        - name: because
+          field_type: text
+          description: "intend: the event or inbox id of the go."
+        - name: milestone
+          field_type: text
+          description: "say: the milestone claimed."
+        - name: posted_link
+          field_type: text
+          description: "say: link to the message you posted."
+        - name: about
+          field_type: text
+          description: "promise_add: the milestone promised."
+        - name: fallback_time
+          field_type: text
+          description: "promise_add: ISO time or a duration such as 4h."
+        - name: status
+          field_type: text
+          description: "checkpoint: the status to commit."
+        - name: waiting_for
+          field_type: text
+          description: "checkpoint: what the job waits for."
+        - name: next_wake_in
+          field_type: text
+          description: "checkpoint: for example 5m or 2h."
+        - name: operations
+          field_type: array
+          base_type: text
+          description: "checkpoint: operation outcomes [{ref, action, outcome, note}] as JSON objects."
+        - name: reached
+          field_type: array
+          base_type: text
+          description: "checkpoint: milestone ids seen."
+        - name: processed
+          field_type: array
+          base_type: text
+          description: "checkpoint: inbox items handled."
+    outputs:
+      fields:
+        - name: result
+          field_type: struct

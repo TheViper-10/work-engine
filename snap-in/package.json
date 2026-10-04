@@ -1,0 +1,8 @@
+{
+  "name": "work-engine-qa",
+  "version": "1.0.0",
+  "private": true,
+  "main": "dist/index.js",
+  "engines": { "node": ">=18" },
+  "dependencies": { "@devrev/typescript-sdk": "1.1.74" }
+}
