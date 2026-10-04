@@ -65,7 +65,8 @@ export class PlatformWaker implements Waker {
 
   private async defaultVersion(): Promise<string | null> {
     const res = await this.o.chat.call('ai-agents.get', { id: this.o.tonyAgent });
-    const v = res?.ai_agent?.default_version_id;
+    // ai-agents.get returns the agent under `agent` (live QA); default_version_id is a string or an object with an id.
+    const v = res?.agent?.default_version_id;
     return typeof v === 'string' ? v : typeof v?.id === 'string' ? v.id : null;
   }
 

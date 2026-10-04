@@ -9,6 +9,7 @@ import { dispatcher, HARRY, OWNER_SLACK } from './helpers.ts';
 import { dmmapKey } from '../src/directory.ts';
 import { storeFor } from './helpers.ts';
 import { createWorkEngine } from '../src/index.ts';
+import { readFileSync } from 'node:fs';
 
 const WF = 'desktop-release';
 /** Rows created by the interruption-boundary journey. Lower it when a change removes writes; never raise it without a decision-log entry. */
@@ -295,4 +296,31 @@ test('the admin close list is read only from the installation, never from an ope
   const m = (await import('node:fs')).readFileSync(new URL('../manifest.yaml', import.meta.url), 'utf8');
   const opBlock = m.slice(m.indexOf('operations:'));
   assert.doesNotMatch(opBlock, /admin_close|admin_token|maintenance/);
+});
+
+const MANIFEST = readFileSync(new URL('../manifest.yaml', import.meta.url), 'utf8');
+
+test('R47 regression: without ai_agent:read the timer path gets the live 403 before the DM exists; dmmap stays creating', async () => {
+  const f = new FakePlatform().useManifest(MANIFEST.replace(/      - scope: ai_agent:read\n        optional: false\n        reason: [^\n]*\n/, ''));
+  assert.ok(!f.scopes.service.has('ai_agent:read'), 'the edit removed the scope');
+  const d = dispatcher(f);
+  const mention = f.newMentionDm();
+  const opened = await d.call({ call: 'job_open', workflow: WF, target: '5.2.11', thread: `${ALLOWED}:1.000001`, role: 'request', intent: 'join', requester: 'U1', agent_session_id: mention.session });
+  assert.equal(opened.status, 'opened');
+  await d.tick(); f.clock.advanceMinutes(2); await d.tick();
+  const denied = f.log.filter((l) => l.path === 'ai-agents.get');
+  assert.ok(denied.length > 0 && denied.every((l) => l.status === 403 && l.as === 'service'), 'ai-agents.get was refused with 403 as the service account');
+  assert.equal(f.chats.size, 1, 'only the mention DM: no home was created');
+  const maps = [...f.rows.values()].filter((r) => r.unique_key.includes(':dmmap:') && !r.unique_key.includes('dmrev'));
+  assert.ok(maps.length > 0);
+  assert.ok(maps.every((r) => JSON.parse(String(r.custom_fields.tnt__body)).state === 'creating'), 'dmmap stays creating');
+});
+
+test('R47: with the manifest as shipped the same journey creates the home (scope table comes from the parsed manifest)', async () => {
+  const f = new FakePlatform(); const d = dispatcher(f);
+  const mention = f.newMentionDm();
+  await d.call({ call: 'job_open', workflow: WF, target: '5.2.11', thread: `${ALLOWED}:1.000001`, role: 'request', intent: 'join', requester: 'U1', agent_session_id: mention.session });
+  await d.tick(); f.clock.advanceMinutes(2); await d.tick();
+  assert.equal(f.chats.size, 2);
+  assert.ok(f.log.filter((l) => l.path === 'ai-agents.get').every((l) => l.status === 200));
 });

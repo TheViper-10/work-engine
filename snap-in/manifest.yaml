@@ -24,6 +24,9 @@ service_account:
       - scope: conversation:write
         optional: false
         reason: Create and hide the job-home conversation and read its timeline.
+      - scope: ai_agent:read
+        optional: false
+        reason: Read Tony's default version so a job home is replaced when the agent version changes.
 
 keyrings:
   organization:
@@ -101,7 +104,7 @@ inputs:
       field_type: text
       default_value: ''
       is_required: false
-      ui: { display_name: 'Operator cleanup: jobs to close as cancelled (job-id=reason; job-id=reason)' }
+      ui: { display_name: 'Admin close jobs (job-id=reason; job-id=reason)' }
 
 event_sources:
   organization:

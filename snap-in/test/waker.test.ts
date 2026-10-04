@@ -214,3 +214,26 @@ test('R45: through the dispatcher a 403 from the wake workflow is flagged once a
 test('R45: a wake is not called failed before 5 minutes (a reply can take about 3)', () => {
   assert.ok(WAKE_GRACE_MS >= 5 * 60_000);
 });
+
+test('R47: ai-agents.get returns the agent under `agent`; default_version_id is read as a string or as an object with an id', async () => {
+  for (const shape of ['string', 'object'] as const) {
+    const f = new FakePlatform(); f.versionShape = shape; const { waker, store } = wakerFor(f);
+    await waker.postWake(LOGICAL, 'shape', 'shape');
+    const map: any = await store.get(dmmapKey('qa', 'tony', LOGICAL));
+    assert.equal(map.agent_version, f.tonyVersion, shape);
+  }
+});
+
+test('R47: the fake enforces scopes per identity; a missing one is a 403 and the owner token needs none', async () => {
+  const f = new FakePlatform();
+  f.scopes.service.delete('conversation:write'); f.scopes.caller.delete('ai_agent_session:read'); f.scopes.service.delete('custom_object:work_record:all');
+  const api = f.deps().devrev(f.timerEvent()); const op = f.deps().devrev(f.opEvent({}));
+  const status = async (p: Promise<unknown>) => { try { await p; return 200; } catch (e) { return (e as ApiError).status; } };
+  assert.equal(await status(api.call('timeline-entries.list', { object: 'x' }, 'service')), 403);
+  assert.equal(await status(op.call('ai-agent.sessions.get', { id: 'x' }, 'caller')), 403);
+  assert.equal(await status(api.call('custom-objects.get', { unique_key: 'a:b:c:job:x' }, 'service')), 403);
+  assert.equal(await status(api.call('objects.list', { dql_query: { filter: { operands: [{ field: 'x.leaf_type', value: ['work_record'] }, { field: 'x.unique_key', value: ['k'] }] } } }, 'service')), 403);
+  assert.equal(await status(api.call('custom-objects.get', { unique_key: 'ev:1:2:event:x' }, 'service')), 404, 'work_event scope is still held');
+  assert.equal(await status(api.call('dev-users.self', {}, 'owner')), 200);
+  assert.equal(await status(api.call('ai-agents.get', { id: TONY }, 'service')), 200);
+});

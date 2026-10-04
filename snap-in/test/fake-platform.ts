@@ -1,6 +1,7 @@
 // In-memory fake of the DevRev, Slack and GitHub APIs, faithful to the platform behaviours the adapters rely on.
 // No network, no sockets, no real tokens. Shared clock: everything that is time-based reads the ManualClock.
 import { ManualClock } from '../../src/clock.ts';
+import { readFileSync } from 'node:fs';
 import { ApiError, type Deps, type DevRevApi, type GithubApi, type Identity, type SlackApi } from '../src/platform.ts';
 
 export const ORG = 'don:core:dvrv-us-1:devo/1lKlCUXYGG';
@@ -17,6 +18,17 @@ export const CHAN_FIELDS: Record<string, string[]> = {
   work_event: ['tnt__kind', 'tnt__job_key', 'tnt__state', 'tnt__version', 'tnt__body', 'tnt__source'],
 };
 export const BODY_LIMIT = 131072;
+
+const MANIFEST = readFileSync(new URL('../manifest.yaml', import.meta.url), 'utf8');
+/** Scope names listed under one manifest section (`- scope: <name>`), between two markers. */
+export function manifestScopes(text: string, from: string, to: string): string[] {
+  const start = text.indexOf(from); const end = text.indexOf(to, start + from.length);
+  if (start < 0) throw new Error(`manifest has no ${from}`);
+  return [...text.slice(start, end < 0 ? undefined : end).matchAll(/- scope: (\S+)/g)].map((m) => m[1]);
+}
+export const serviceScopesOf = (text: string): string[] => manifestScopes(text, 'service_account:', 'keyrings:');
+export const operationScopesOf = (text: string): string[] => manifestScopes(text, 'static_scopes:', '    inputs:');
+export const leafFromKey = (uk: string): string => (uk.split(':')[3] === 'event' ? 'work_event' : 'work_record');
 
 export class Crash extends Error { constructor() { super('process crashed'); this.name = 'Crash'; } }
 
@@ -42,6 +54,12 @@ export class FakePlatform {
   listLagMs = 5000;
   triggerDelayMs = 0;
   callerCanWrite = true;
+  /** R47: scopes per identity, taken from the parsed manifest (service account scopes for the timer path, operation static scopes for the operation path). The owner keyring token is a user token and carries no scope here. */
+  scopes: { service: Set<string>; caller: Set<string> } = { service: new Set(serviceScopesOf(MANIFEST)), caller: new Set(operationScopesOf(MANIFEST)) };
+  /** Build the scope table from manifest text (tests edit the manifest text to prove a missing scope fails offline). */
+  useManifest(text: string): this { this.scopes = { service: new Set(serviceScopesOf(text)), caller: new Set(operationScopesOf(text)) }; return this; }
+  /** How ai-agents.get renders default_version_id. */
+  versionShape: 'string' | 'object' = 'string';
   installInputs: Record<string, unknown> = {
     env: 'qa', bot: 'tony', own_bot_user: OWN_BOT, tony_agent: TONY, wake_user: OWNER_USER, wake_workflow: WAKE_WORKFLOW,
     slack_channel_allowlist: ALLOWED, github_repo: 'devrev/devrev-web', mock_branch: 'mock/tony-desktop-release', state_path: 'mock-release/state.json', guidance_version: 'g-test',
@@ -131,6 +149,24 @@ export class FakePlatform {
     return `${as}:${tok}`;
   }
 
+  /** The scope an endpoint needs, or null when none applies. */
+  private requiredScope(path: string, b: any): string | null {
+    switch (path) {
+      case 'ai-agents.get': return 'ai_agent:read';
+      case 'ai-agent.sessions.get': return 'ai_agent_session:read';
+      case 'snap-ins.get': return 'snap_in:read';
+      case 'chats.create': case 'chats.update': case 'timeline-entries.list': return 'conversation:write';
+      case 'custom-objects.create': return `custom_object:${b?.leaf_type}:all`;
+      case 'custom-objects.get': return `custom_object:${this.rows.get(b?.unique_key)?.leaf_type ?? leafFromKey(String(b?.unique_key ?? ''))}:all`;
+      case 'custom-objects.delete': return `custom_object:${[...this.rows.values()].find((x) => x.id === b?.id)?.leaf_type ?? 'work_record'}:all`;
+      case 'objects.list': {
+        const ops: any[] = b?.dql_query?.filter?.operands ?? [];
+        return `custom_object:${ops.find((o) => String(o.field).endsWith('.leaf_type'))?.value?.[0]}:all`;
+      }
+      default: return null; // dev-users.self and workflows.trigger run with the owner keyring user token
+    }
+  }
+
   private insert(leaf: string, uk: string, fields: Record<string, unknown>, by: string): Row {
     const row: Row = { id: `${ORG}:custom_object/${this.seq += 1}`, leaf_type: leaf, unique_key: uk, title: uk, custom_fields: fields, created_at: this.clock.now(), created_by: by };
     this.rows.set(uk, row);
@@ -141,6 +177,10 @@ export class FakePlatform {
 
   private async handle(path: string, body: any, as: Identity, event: any): Promise<any> {
     const principal = this.authorize(path, as, event);
+    if (as !== 'owner') {
+      const need = this.requiredScope(path, body);
+      if (need && !this.scopes[as].has(need)) throw new ApiError(403, 'forbidden', 'forbidden');
+    }
     const rule = this.fire(path, body);
     if (rule?.timeout === 'before') throw new ApiError(0, `${path} unavailable`, 'timeout');
     if (rule?.status && !rule.timeout) throw new ApiError(rule.status, rule.message ?? `${path} failed (${rule.status})`, rule.type);
@@ -215,7 +255,7 @@ export class FakePlatform {
       case 'dev-users.self':
         return { dev_user: { id: as === 'owner' ? this.ownerUser : OWNER_USER } };
       case 'ai-agents.get':
-        return { ai_agent: { id: b.id, default_version_id: this.tonyVersion } };
+        return { agent: { id: b.id, default_version_id: this.versionShape === 'object' ? { id: this.tonyVersion } : this.tonyVersion } };
       case 'chats.create': {
         const id = `${ORG}:dm/${(this.seq += 1).toString(36)}home`;
         this.chats.set(id, { id, display_state: b.display_state ?? 'global', members: (b.agent_members ?? []).map((m: any) => m.agent), users: b.users ?? [], type: b.type });

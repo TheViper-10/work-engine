@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { engineConfig, readInputs, SPECS } from '../src/specs.ts';
 import { CALLS, shapeArgs } from '../src/index.ts';
+import { operationScopesOf, serviceScopesOf } from './fake-platform.ts';
 
 const root = join(fileURLToPath(import.meta.url), '../..');
 const m = readFileSync(join(root, 'manifest.yaml'), 'utf8');
@@ -67,4 +68,29 @@ test('checkpoint operations arrive as objects, JSON strings or one JSON array st
     assert.deepEqual(shapeArgs('checkpoint', { job: 'j', status: 's', operations: input }).operations, [op]);
   }
   assert.equal(shapeArgs('checkpoint', { job: 'j', status: 's' }).operations, undefined);
+});
+
+/** R47: scope names seen working in the v8 snap-ins or the connector manifests. A name outside this list is a guess and fails the lint. */
+const SCOPE_ALLOWLIST = new Set([
+  'ai_agent:read', 'ai_agent:execute', 'ai_agent_session:read', 'ai_agent_session:write', 'snap_in:read', 'event_source:read', 'conversation:write',
+  'custom_object:work_record:all', 'custom_object:work_event:all', 'custom_object:slack_connector_state:all', 'custom_object:slack_connector_receipt:all',
+  'app_fragment:write', 'tenant_fragment:write', 'role:read', 'artifact:read', 'artifact:create', 'dev_org:read', 'dev_user:read',
+]);
+
+test('R47 lint: every ui.display_name is at most 50 characters (the platform rejects longer with a 400 on version create)', () => {
+  const labels = [...m.matchAll(/display_name: '([^']*)'/g)].map((x) => x[1]).concat([...m.matchAll(/display_name: ([^'\n][^\n]*)/g)].map((x) => x[1].trim()));
+  assert.ok(labels.length > 10, 'labels were found');
+  for (const l of labels) assert.ok(l.length <= 50, `${l.length} chars: ${l}`);
+  assert.ok(labels.includes('Admin close jobs (job-id=reason; job-id=reason)'));
+});
+
+test('R47 lint: every scope name is on the allowlist of names seen working', () => {
+  const all = [...m.matchAll(/- scope: (\S+)/g)].map((x) => x[1]);
+  assert.ok(all.length >= 10);
+  for (const s of all) assert.ok(SCOPE_ALLOWLIST.has(s), `scope ${s} is not on the allowlist`);
+});
+
+test('R47: the service account holds ai_agent:read (ai-agents.get on the timer path), and the operation scopes stay as proven', () => {
+  assert.ok(serviceScopesOf(m).includes('ai_agent:read'));
+  assert.deepEqual(operationScopesOf(m).sort(), ['ai_agent_session:read', 'conversation:write', 'custom_object:work_event:all', 'custom_object:work_record:all', 'snap_in:read']);
 });
