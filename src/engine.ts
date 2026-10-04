@@ -681,6 +681,7 @@ export class Engine {
     };
     if (existing?.outcome === 'failed') { op.note = ''; op.outcome_at = null; op.source = 'tony_reported'; } // a retry after failed is a new attempt
     op.because = a.because ?? op.because;
+    op.resource = act?.resource ?? op.resource; // an operation first seen through a checkpoint has no resource yet
     op.session = ctx.session_id ?? op.session;
     if (!existing && !job.op_keys.includes(opId)) job.op_keys.push(opId);
 
@@ -713,7 +714,7 @@ export class Engine {
       await this.addFlag(job, 'job_ended', `${a.action} on ${a.ref} was announced after the job was done; recorded, no lease, nothing in flight`, 'intend');
       await this.save('operation', opId, op);
       await this.saveJob(job);
-      return ans(true, 'recorded', `Recorded: ${job.id} is already done, so ${a.action} on ${a.ref} is noted and flagged (job_ended) but not tracked: no lease, nothing in flight. Reopen the release with job_open (replace) if more work is needed.`, { job: job.id, operation: op, flags, holds: [] });
+      return ans(true, 'recorded', `Recorded: ${job.id} is already done, so ${a.action} on ${a.ref} is noted and flagged (job_ended) but not tracked: no lease, nothing in flight. Reopen the work with job_open (replace) if more work is needed.`, { job: job.id, operation: op, flags, holds: [] });
     }
 
     op.outcome = 'in_flight';
@@ -793,7 +794,7 @@ export class Engine {
     if (!job.threads.includes(a.thread)) notes.push(`Note: ${a.thread} is not linked to this job; the claim is recorded, but link it with job_open if events from it should reach the job.`);
     if (spec && !spec.milestones?.[a.milestone]) notes.push(`Note: "${a.milestone}" is not a milestone in the workflow spec; claim recorded as given.`);
 
-    // Confirm route: Tony posted and tells the engine where. Reported by Tony (L3); clears the claim.
+    // Confirm route: the agent posted and tells the engine where. Reported by the agent (L3); clears the claim.
     if (a.posted_link) {
       await this.markReached(job, spec, a.milestone);
       const d = await this.ensureDelivery(job, a.thread, a.milestone, 'claimed');
@@ -802,7 +803,7 @@ export class Engine {
         return ans(true, 'already_sent', `Already sent: ${a.milestone} was delivered to ${a.thread}${d.message_link ? ` (${d.message_link})` : ''}. Nothing more to do.`, { job: job.id, delivery: d, link: d.message_link });
       }
       d.claimed_at = d.claimed_at ?? now;
-      await this.markSent(job, d, 'tony', a.posted_link);
+      await this.markSent(job, d, 'agent', a.posted_link);
       if (gate && spec && !job.latest_ask[gate]) await this.openAsk(job, spec, gate, a.thread);
       const closed = await this.maybeClose(job);
       if (!closed) await this.saveJob(job);
@@ -873,8 +874,10 @@ export class Engine {
     await this.markReached(job, spec, a.milestone);
     const cur = d && d.state !== 'sent' ? d : await this.ensureDelivery(job, a.thread, a.milestone, 'claimed');
     if (cur.state === 'sent') { cur.state = 'claimed'; cur.sent_count = 0; cur.sent_at = null; cur.message_link = null; cur.seen_via = null; cur.round = round; }
+    // A delivery voided by a cancel while it was claimed may have been posted: treat it like a stale unseen claim (read first).
+    if (cur.state === 'void' && cur.claimed_at !== null) { cur.prior_claim_at = cur.claimed_at; cur.claimed_at = null; }
     const priorUnseen = kind === 'go' && typeof cur.prior_claim_at === 'number';
-    if (priorUnseen) kind = 'handoff'; // the earlier post may exist: Tony reads the thread first; the sweep still matches only from this claim
+    if (priorUnseen) kind = 'handoff'; // the earlier post may exist: the agent reads the thread first; the sweep still matches only from this claim
     if (kind !== 'handoff' || cur.claimed_at === null) cur.claimed_at = claim.at;
     cur.state = 'claimed';
     cur.next_check_at = now + this.config.sweepMinutes * MIN;
@@ -1333,13 +1336,21 @@ export class Engine {
     const ids = new Set<string>();
     const buckets: string[] = [];
     for (let b = from; b <= nowB; b++) buckets.push(String(b));
-    for (const r of await this.manyPresent<IdList>('due_index', buckets)) for (const j of r.ids) ids.add(j);
     const summary = { jobs_checked: 0, woke: [] as string[], operations_unknown: 0, promises_due: 0, claims_reconciled: 0, claims_not_seen: 0, closed: [] as string[], wakes_skipped: [] as string[] };
-    for (const id of ids) {
-      const job = await this.get<Job>('job', id);
-      if (!job || job.status === 'done' || job.status === 'cancelled') continue;
-      summary.jobs_checked += 1;
-      await this.processJob(job, summary);
+    // Processing a job can make another one due now (a queued job promoted when its blocker ends), so re-read the due index a bounded number of times.
+    const seen = new Set<string>();
+    for (let pass = 0; pass < 4; pass++) {
+      for (const r of await this.manyPresent<IdList>('due_index', buckets)) for (const j of r.ids) ids.add(j);
+      const todo = [...ids].filter((j) => !seen.has(j));
+      if (todo.length === 0) break;
+      for (const id of todo) {
+        seen.add(id);
+        const job = await this.get<Job>('job', id);
+        if (!job || job.status === 'done' || job.status === 'cancelled') continue;
+        summary.jobs_checked += 1;
+        await this.processJob(job, summary);
+        if (job.status === 'queued') seen.delete(id); // may be promoted by a later job in this sweep: look again
+      }
     }
     await this.put('sweep_cursor', 'main', { bucket: nowB });
     return ans(true, 'swept', `Sweep checked ${summary.jobs_checked} job(s): woke ${summary.woke.length}, ${summary.operations_unknown} operation(s) turned unknown, ${summary.promises_due} promise(s) due, ${summary.claims_reconciled} claim(s) reconciled.`, summary);
@@ -1422,7 +1433,7 @@ export class Engine {
     for (const r of reasons) this.addReason(job, r);
     if (reasons.length) job.next_wake_at = Math.min(job.next_wake_at ?? now, now);
     const wakeDue = job.next_wake_at !== null && job.next_wake_at <= now;
-    // Standing things Tony must look at are added to the wake text when a wake is due, not stored.
+    // Standing things the agent must look at are added to the wake text when a wake is due, not stored.
     const extra: string[] = [];
     if (wakeDue) {
       if (job.status === 'closing') for (const d of await this.owedDeliveries(job)) extra.push(`still owed: ${d.milestone} to ${d.thread}`);

@@ -158,7 +158,7 @@ export interface Delivery {
   sent_at: number | null;
   sent_count: number;
   message_link: string | null;
-  seen_via: 'connector' | 'sweep' | 'relay' | 'tony' | null;
+  seen_via: 'connector' | 'sweep' | 'relay' | 'agent' | null;
   /** Starts at 1; a re-ask for a new build starts another round. */
   round: number;
   /** Set when a claim for this message went stale unseen: the post may exist, so the next say must say read first. */

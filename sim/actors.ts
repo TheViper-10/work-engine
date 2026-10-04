@@ -211,6 +211,9 @@ export class Sim {
     if (!s) return;
     const { job, thread, milestone, at, round } = s.pendingPost!;
     s.pendingPost = null;
+    // Playbook: a go is for a job. If that job was ended or replaced since, the go is void (say would now answer job_ended); do not post.
+    const pj = await this.w.peek<any>('job', job);
+    if (!pj || pj.status === 'done' || pj.status === 'cancelled') return;
     // Playbook: a go is good for the stale window (10 minutes); after that, say again before posting.
     if (this.w.now() - at < 10 * MIN) {
       await this.afterPost(s, this.w.post(job, thread, milestone, false, round));

@@ -1,6 +1,6 @@
 import { world, J, WF, check, MIN } from './h.ts';
-const { MemoryStore } = await import('/Users/priyadharshanravichandran/DevRev/Github_Repos/work-engine/src/store.ts');
-const { ManualClock } = await import('/Users/priyadharshanravichandran/DevRev/Github_Repos/work-engine/src/clock.ts');
+const { MemoryStore } = await import(new URL('../../src/store.ts', import.meta.url).href);
+const { ManualClock } = await import(new URL('../../src/clock.ts', import.meta.url).href);
 // (a) clock skew: writer instance 6 min behind the sweeper
 const store = new MemoryStore(); const ca = new ManualClock(Date.UTC(2026, 0, 1, 1)); const cb = new ManualClock(Date.UTC(2026, 0, 1, 1) - 6 * MIN);
 const sweeper = world('flag', { store, clock: ca }), writer = world('flag', { store, clock: cb });
