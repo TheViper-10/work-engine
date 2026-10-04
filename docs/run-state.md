@@ -15,7 +15,8 @@ Resume: read this file, then docs/decision-log.md, then handoff file 28.
 | P1-sim | simulator: 1,000 random orders + named cases | done: flag 1000 + hold 1000 orders, 16 named cases, 0 violations; 7 engine bugs fixed |
 | P1-red | Opus red-team, fix confirmed | review done: 21 findings (8 high, 9 med, 4 low; 20 confirmed), repros in test/redteam; fix design R17; fixes running (sonnet) |
 | P2-harness | replay harness, real model via gateway | done: engine binding wired; trials flag: run6 PASS, v2-18 and stale-go FAIL (playbook gaps, fixed R13-R15) |
-| P2-score | scoring R16, scripted Tony, hold trials | running (sonnet) |
+| P2-score | scoring R16, scripted Tony | done: scripted 8/9 pass both modes; stale-go hold fails on H7 (fix in R17 pass); real-model hold trials deferred until R17 lands |
+| P2-runs-plan | after R17: scripted-all both modes, then real model flag and hold, 10 in a row per mode on a scenario rotation | pending |
 | P2-runs | replays under flag and hold, scored vs D7 | pending |
 | Report | 29-work-engine-run-report.md + /tmp copy | pending |
 
