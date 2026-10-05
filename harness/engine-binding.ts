@@ -133,6 +133,8 @@ export class RealEngineBinding implements EngineBinding {
           const p = this.world?.findOwnPostAfter(thread, ts);
           return p ? { link: `slack:${this.world!.channel}:${p.ts}` } : null;
         },
+        // Faithful scenarios: a thread exists when a message with its ts was posted; scenarios with labels cannot tell (null: taken as given).
+        threadExists: async (t: string) => (this.faithful ? this.world?.threadRoot(t) ?? null : null),
         threadOfLink: async (l: string) => {
           const ts = l.split(':').pop() ?? '';
           const label = Object.entries<any>(this.world?.data.slack.threads ?? {}).find(([, t]) => (t.messages ?? []).some((m: any) => m.ts === ts))?.[0];

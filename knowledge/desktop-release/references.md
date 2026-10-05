@@ -29,7 +29,10 @@ A thread is written `<channel>:<ts>` (for a Slack mention, the comment's `extern
 `bad_thread` and nothing is recorded. In a Slack conversation the engine can also read the thread from the platform when you omit it
 or pass something wrong. A `job_open` with a placeholder target (`next`, empty) joins the job already running, or answers `bad_target`
 when none runs; another version joins the running job with a flag unless you say `queue` (after it) or `replace` (the owner's call).
-`say` with a post link from another thread answers `wrong_thread`: post in the owed thread and send that message's link. `say` for an
+The engine checks that a thread exists in Slack before it records it; one that does not answers `bad_thread`. A `promise_add` from a
+Slack conversation is kept for that conversation's own thread. `say` answers `go` with `post_to` (`channel`, `thread_ts`): post with
+exactly that target, as a reply. A post of yours at the top level of the channel is flagged `unthreaded_post` and is never counted as
+an update. A private thread is told only what it asked for. `say` with a post link from another thread answers `wrong_thread`: post in the owed thread and send that message's link. `say` for an
 outcome milestone answers `not_reached` until `checkpoint(reached)` recorded it after you read the source.
 
 ## Special answers

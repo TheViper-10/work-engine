@@ -686,6 +686,37 @@ export class Engine {
     try { return (await this.slackReader.threadOfLink(`${m.channel}:${m.ts}`)) ?? null; } catch { return null; }
   }
 
+  /**
+   * R61: a thread the engine is about to record must exist. The Slack reader says so with one cheap read; a thread Slack does not know
+   * (a made-up or derived timestamp) is refused with bad_thread and nothing is recorded. A reply's ts becomes its thread's root.
+   */
+  private async verifyThread(thread: string, call: string): Promise<{ thread: string; note?: string } | { answer: Answer }> {
+    if (!this.slackReader.threadExists) return { thread };
+    let r: string | false | null;
+    try { r = await this.slackReader.threadExists(thread); } catch { r = null; }
+    if (r === false) {
+      return { answer: ans(false, 'bad_thread', `${call}: ${thread} is not a thread that exists in Slack (no message has that timestamp), so nothing was recorded. Never make up or derive a timestamp. ${THREAD_HELP}`) };
+    }
+    if (typeof r === 'string' && r !== thread) return { thread: r, note: `${thread} is a reply inside the thread ${r}, so ${r} was used.` };
+    return { thread };
+  }
+
+  /** R61: the Slack thread of the caller's own conversation, when the platform holds one (a mention session); null for the job home. */
+  private async callerThread(ctx: Ctx): Promise<string | null> {
+    if (!ctx.session_id || !this.directory.threadOf) return null;
+    try { const r = await this.directory.threadOf(ctx.session_id); return 'thread' in r ? normalizeThread(r.thread) : null; } catch { return null; }
+  }
+
+  /** R61: where to post for a thread: the exact channel and thread_ts, so a reply never becomes a new top-level message. */
+  private postTo(thread: string): { thread: string; channel: string | null; thread_ts: string | null } {
+    const m = /^([A-Z][A-Z0-9]{8,12}):(\d+\.\d+)$/.exec(thread);
+    return { thread, channel: m ? m[1] : null, thread_ts: m ? m[2] : null };
+  }
+  private postWords(thread: string): string {
+    const t = this.postTo(thread);
+    return `Post it with slack_post as a reply in thread ${thread}${t.channel ? ` (channel ${t.channel}, thread_ts ${t.thread_ts})` : ''}, never as a new top-level message.`;
+  }
+
   // ---------------------------------------------------------------- 1. job_open
 
   private async doJobOpen(
@@ -699,12 +730,15 @@ export class Engine {
     if (!a0.target && !spec.one_open_job) {
       return ans(false, 'bad_input', 'job_open: target is missing, so nothing was recorded. Give both a target and the thread you are in.');
     }
-    const rt = await this.resolveThread(a0.thread, ctx, 'job_open');
-    if ('answer' in rt) return rt.answer;
-    const a = { ...a0, thread: rt.thread! };
+    const rt0 = await this.resolveThread(a0.thread, ctx, 'job_open');
+    if ('answer' in rt0) return rt0.answer;
+    const rv = await this.verifyThread(rt0.thread!, 'job_open');
+    if ('answer' in rv) return rv.answer;
+    const rt = { thread: rv.thread, note: [rt0.note, rv.note].filter(Boolean).join(' ') || undefined };
+    const a = { ...a0, thread: rt.thread };
     const now = this.now();
     const intent = a.intent ?? 'join';
-    const role = a.role ?? spec.link_roles[0] ?? 'request';
+    let role = a.role ?? spec.link_roles[0] ?? 'request';
     const notes: string[] = [];
     if (rt.note) notes.push(rt.note);
     if (!spec.link_roles.includes(role)) notes.push(`Role "${role}" is not in the workflow's link roles (${spec.link_roles.join(', ')}); recorded anyway.`);
@@ -779,6 +813,11 @@ export class Engine {
       await this.openJobsIndex((ids) => uniq([...ids, job.id]));
     }
     if (idx.primary === null && !opened) idx.primary = job.id;
+    // R61: a thread linked without a role joins as a side thread once the job has a request thread; it is told only what it asked for (a promise).
+    if (!a.role && joined && !job.threads.includes(a.thread) && spec.link_roles.includes('side') && job.threads.some((t) => job.roles[t] === spec.link_roles[0])) {
+      role = 'side';
+      notes.push(`No role was given, so ${a.thread} joined as a side thread: it is told what it asks about (promise_add), not every milestone.`);
+    }
     const linked = await this.linkThread(job, a.thread, role, !!a.private);
     if (mismatch) await this.addFlag(job, 'target_mismatch', `${a.thread} asked for ${a.target}; joined ${job.id}`, 'job_open');
     const own = await this.ownership(job, ctx);
@@ -962,7 +1001,8 @@ export class Engine {
     if (!entry) return true;
     const promises = await this.manyPresent<Promise_>('promise', job.promise_keys);
     const holders = entry.audience.promise_holders ? promises.filter((p) => p.milestone === milestone && p.state !== 'void').map((p) => p.thread) : [];
-    const roleThreads = job.threads.filter((t) => entry.audience.roles.includes(job.roles[t]));
+    // R61: a private thread is never in a role audience; it is told only what it asked for (a promise).
+    const roleThreads = job.threads.filter((t) => entry.audience.roles.includes(job.roles[t]) && (!job.private_threads.includes(t) || t === job.threads[0]));
     for (const thread of uniq([...roleThreads, ...holders])) await this.ensureDelivery(job, thread, milestone, 'owed');
     return true;
   }
@@ -1276,7 +1316,13 @@ export class Engine {
     }
     const rt = await this.resolveThread(a0.thread, ctx, 'say');
     if ('answer' in rt) return rt.answer;
-    const a = { ...a0, thread: rt.thread! };
+    let sayThread = rt.thread!;
+    if (!job.threads.includes(sayThread)) {
+      const rv = await this.verifyThread(sayThread, 'say');
+      if ('answer' in rv) return rv.answer;
+      sayThread = rv.thread;
+    }
+    const a = { ...a0, thread: sayThread };
     if (job.status === 'done' || job.status === 'cancelled') {
       await this.addFlag(job, 'job_ended', `say ${a.milestone} in ${a.thread} arrived after the job was ${job.status}; recorded, no claim`, 'say');
       await this.saveJob(job);
@@ -1427,13 +1473,13 @@ export class Engine {
     await this.saveJob(job);
     await this.schedule(job.id, cur.next_check_at);
     const tail = `${askText}${notes.length ? ' ' + notes.join(' ') : ''}`;
-    const extra = { job: job.id, claimed_at: claim.at, round: cur.round, repeat: kind === 'own' };
+    const extra = { job: job.id, claimed_at: claim.at, round: cur.round, repeat: kind === 'own', post_to: this.postTo(a.thread) };
     if (kind === 'handoff') {
-      return ans(true, 'already_claimed', `Already claimed: another session claimed ${a.milestone} for ${a.thread} ${fmtAge(now - claim.at)} ago and the post was never seen. The claim is yours now. Read the thread with slack_read_thread; post only if the message is absent. If it is there, call say again with posted_link.${tail}`, extra);
+      return ans(true, 'already_claimed', `Already claimed: another session claimed ${a.milestone} for ${a.thread} ${fmtAge(now - claim.at)} ago and the post was never seen. The claim is yours now. Read the thread with slack_read_thread; post only if the message is absent. ${this.postWords(a.thread)} If it is there, call say again with posted_link.${tail}`, extra);
     }
     return ans(true, 'go', kind === 'own'
-      ? `Go: you already hold this claim. Post ${a.milestone} in ${a.thread} yourself now unless it is already there (if it is, call say again with posted_link). The engine will match your post to this claim.${tail}`
-      : `Go: post ${a.milestone} in ${a.thread} yourself now. The engine will match your post to this claim. This go is good for ${Math.round(this.staleMs(spec) / MIN)} minutes; after that, say again before posting.${tail}`, extra);
+      ? `Go: you already hold this claim. Post ${a.milestone} in ${a.thread} yourself now unless it is already there (if it is, call say again with posted_link). ${this.postWords(a.thread)} The engine will match your post to this claim.${tail}`
+      : `Go: post ${a.milestone} in ${a.thread} yourself now. ${this.postWords(a.thread)} The engine will match your post to this claim. This go is good for ${Math.round(this.staleMs(spec) / MIN)} minutes; after that, say again before posting.${tail}`, extra);
   }
 
   // ---------------------------------------------------------------- 5. promise_add
@@ -1447,7 +1493,20 @@ export class Engine {
     }
     const rt = await this.resolveThread(a0.thread, ctx, 'promise_add');
     if ('answer' in rt) return rt.answer;
-    const a = { ...a0, thread: rt.thread! };
+    // R61: a promise belongs to the conversation that asked for it: the caller's own Slack thread wins over any thread it named.
+    const pre: string[] = [];
+    let promiseThread = rt.thread!;
+    const mine = await this.callerThread(ctx);
+    if (mine && mine !== promiseThread) {
+      pre.push(`${promiseThread} is not the thread of this conversation; the promise is for this conversation's thread ${mine}.`);
+      promiseThread = mine;
+    }
+    if (!job.threads.includes(promiseThread)) {
+      const rv = await this.verifyThread(promiseThread, 'promise_add');
+      if ('answer' in rv) return rv.answer;
+      promiseThread = rv.thread;
+    }
+    const a = { ...a0, thread: promiseThread };
     if (job.status === 'done' || job.status === 'cancelled') {
       await this.addFlag(job, 'job_ended', `promise_add for ${a.about} in ${a.thread} arrived after the job was ${job.status}; recorded, no promise`, 'promise_add');
       await this.saveJob(job);
@@ -1467,7 +1526,7 @@ export class Engine {
       await this.saveJob(job);
       return ans(true, 'unknown_milestone', `${this.unknownText(spec, unknownAbout)}. No promise was recorded. Add it again with one of those ids.`, { job: job.id, unknown_milestones: unknownAbout, milestones: Object.keys(spec?.milestones ?? {}) });
     }
-    const notes: string[] = [];
+    const notes: string[] = [...pre];
     let fallback: number | null = null;
     if (typeof a.fallback_time === 'number' && a.fallback_time > 1e11) fallback = a.fallback_time;
     else if (typeof a.fallback_time === 'string') fallback = parseDuration(a.fallback_time) !== null && /^\s*\d+(\.\d+)?\s*[smhd]?\s*$/i.test(a.fallback_time) ? now + parseDuration(a.fallback_time)! : parseTime(a.fallback_time);
@@ -1831,7 +1890,7 @@ export class Engine {
       data: {
         job: job.id, workflow: job.workflow, target: job.target, status: job.status, reported_status: job.reported_status,
         waiting_for: job.waiting_for, next_wake_at: job.next_wake_at, work_run: workRun, work_run_busy: runBusy,
-        threads: job.threads.map((t) => ({ thread: t, role: job.roles[t], private: job.private_threads.includes(t) })),
+        threads: job.threads.map((t) => ({ thread: t, role: job.roles[t], private: job.private_threads.includes(t), channel: this.postTo(t).channel, thread_ts: this.postTo(t).thread_ts })),
         milestones: job.milestones, spec_milestones: msView, events: evView, open_asks: openAsks, operations: opsView,
         owed, claims: claimed, sent, promises: proms.map((p) => ({ milestone: p.milestone, thread: p.thread, state: p.state, fallback_at: p.fallback_at })),
         flags: flags.map((f) => ({ check: f.check, mode: f.mode, detail: f.detail, call: f.call })),
@@ -1866,6 +1925,28 @@ export class Engine {
     const r = await this.create('event', id, fresh);
     const rec = r.value;
     if (!r.created && rec.state !== 'received') return ans(true, 'duplicate', `Event ${id} was already recorded; ignored.`, { event: id, duplicate: true });
+
+    // R61: our own bot posted at the top level of a channel (not in any thread). It is never a delivery; while a job has a linked thread
+    // in that channel it is flagged, so the home is told that the news belongs in the thread where its audience reads.
+    if (senderKind === 'own_bot' && !ev.thread && ev.attrs?.top_level === true) {
+      const channel = typeof ev.attrs?.channel === 'string' ? ev.attrs.channel : '';
+      const openIds = (await this.get<IdList>('open_jobs', 'all'))?.ids ?? [];
+      const flagged: string[] = [];
+      for (const job of await this.manyPresent<Job>('job', openIds.slice(0, MAX_BATCH))) {
+        if (job.status === 'done' || job.status === 'cancelled' || job.status === 'queued') continue;
+        const inChannel = job.threads.filter((t) => t.startsWith(`${channel}:`));
+        if (!inChannel.length) continue;
+        if (!job.event_ids.includes(id)) job.event_ids.push(id);
+        await this.addFlag(job, 'unthreaded_post', `your bot posted at the top level of ${channel} (event ${id}) while this job has linked thread(s) ${inChannel.join(', ')}; it is not a delivery. Updates belong in the thread where the person asked or waits`, 'ingest');
+        this.addReason(job, 'an unthreaded post was recorded');
+        await this.saveJob(job);
+        flagged.push(job.id);
+      }
+      rec.matched_jobs = flagged;
+      rec.state = 'done';
+      await this.save('event', id, rec);
+      return ans(true, 'unthreaded_post', flagged.length ? `Recorded: a top-level own post in ${channel}; flagged on ${flagged.join(', ')}; not a delivery.` : `Recorded: a top-level own post in ${channel}; no open job has a thread there.`, { event: id, flagged });
+    }
 
     const ti = ev.thread ? await this.get<ThreadIndex>('thread_index', ev.thread) : null;
     const claim = ev.thread ? await this.get<Claim>('claim', ev.thread) : null;

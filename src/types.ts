@@ -12,7 +12,7 @@ export type FlagKind =
   | CheckName | 'missing_session' | 'unclaimed_post' | 'not_work_run' | 'job_ended'
   | 'source_unreadable' | 'ambiguous_outcome' | 'unknown_outcome'
   | 'identity_unconfirmed' | 'ambiguous_association' | 'escalate' | 'unknown_milestone' | 'unknown_action'
-  | 'wake_failed' | 'admin_close' | 'target_mismatch';
+  | 'wake_failed' | 'admin_close' | 'target_mismatch' | 'unthreaded_post';
 
 export interface Clock {
   now(): number; // epoch ms
@@ -61,6 +61,11 @@ export interface SlackReader {
   findOwnPostAfter(thread: string, ts: number): Promise<{ link?: string; ts?: number; relay?: boolean } | null>;
   /** R54: the thread a posted message belongs to, from its link. null means it could not be told. Optional: without it links are taken as reported. */
   threadOfLink?(link: string): Promise<string | null>;
+  /**
+   * R61: does this thread exist? The canonical `<channel>:<root ts>` when it does (a reply's ts gives its root), false when Slack has no such
+   * message, null when it could not be told (then the engine takes the thread as given). Optional: without it threads are taken as given.
+   */
+  threadExists?(thread: string): Promise<string | false | null>;
 }
 export interface Waker {
   /** May report `stale_version` when the home session is pinned to an old agent version (A3): the engine then replaces the home. */

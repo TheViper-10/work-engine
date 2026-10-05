@@ -46,3 +46,8 @@ Done when the job-home work engine is fully deployed to QA and a live Slack mock
 - Live probe on v6: all steps PASS (`live-probe-pass.out` in that dir).
 - Live run 2: release 5.2.12, run dir `~/.agents/memory/agents/fde-agent/artifacts/tony-mock/runs/engine-5.2.12-20261005T015229Z/`. At 02:38Z: PR #58061 merged, QA gate approved after the owner's go, QA 5.2.12 published, Harry's QA post up; sign-off and prod alpha pending. Handoff: `/tmp/work-engine-handoff-2026-10-05.md`.
 - Live run 2 RESULT: 5.2.12 live at 02:51:21Z, job done, 0 interventions. PASS: external outcome, ownership, privacy, autonomy. FAIL: authorization (free-text because, asks not answered), communication (made-up linked thread gave top-level double posts; B's promises never delivered; private C got updates). Report: tony-shared-state/31-work-engine-live-qa-release-run2.md. Next: communication repair slice (handoff §2a), v7, live run 3 (5.2.13).
+
+## Thread continuity slice (2026-10-05, offline, R61)
+- Fixes F1, F2, F3, F8 of live run 2 in engine, snap-in reader, harness world/scorer and the general playbook. Not deployed; the next step is one real-model run each of run1-replay-shaped `thread-continuity-run2` and `thread-continuity-variation` (`--checks deploy`), then redeploy with a probe first.
+- Still open from run 2: F4 (`because` as go event id, ask answered on approval), F5 (sender classification), F7 (voice, requester identity), F9/F10 (grader), F6.
+

@@ -50,6 +50,26 @@ export class PlatformSlackReader implements SlackReader {
     return null;
   }
 
+  /**
+   * R61: does the thread exist? One conversations.replies read (limit 1). The canonical `<channel>:<root ts>` when a message has that ts,
+   * false when Slack has none (thread_not_found, or an empty answer), null when Slack could not say (the engine then takes the thread as given).
+   */
+  async threadExists(thread: string): Promise<string | false | null> {
+    const t = parseThread(thread);
+    if (!t) return null;
+    assertAllowed(this.o.allow, t.channel);
+    let res: any;
+    try { res = await this.o.api.get('conversations.replies', { channel: t.channel, ts: t.ts, limit: 1 }); }
+    catch (e) {
+      const type = String((e as { type?: string }).type ?? '') + ' ' + String((e as Error).message ?? '');
+      return /thread_not_found|message_not_found/.test(type) ? false : null;
+    }
+    const m = (res?.messages ?? [])[0];
+    if (!m) return false;
+    const root = typeof m.thread_ts === 'string' && m.thread_ts ? m.thread_ts : typeof m.ts === 'string' ? m.ts : null;
+    return root ? `${t.channel}:${root}` : null;
+  }
+
   /** R54: the thread a message belongs to, `<channel>:<thread ts>`. null when Slack cannot say (the engine then takes the link as reported). */
   async threadOfLink(link: string): Promise<string | null> {
     const t = parseThread(link);

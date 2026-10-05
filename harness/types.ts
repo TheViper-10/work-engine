@@ -100,6 +100,10 @@ export interface OwnPost {
   claimed?: boolean;
   /** The connector never emitted an event for this post (fault). */
   dropped: boolean;
+  /** The post is a new top-level message in the channel, not a reply in any thread (thread is then ''). */
+  top_level?: boolean;
+  /** For a top-level post: the thread the call asked for, when there was one (a thread Slack does not know posts top-level). */
+  requested_thread?: string;
 }
 
 export interface SessionRecord {

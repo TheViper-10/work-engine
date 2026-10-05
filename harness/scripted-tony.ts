@@ -50,7 +50,7 @@ class Play {
   private canonOf: Record<string, string> = {};
   private labelOf: Record<string, string> = {};
 
-  constructor(private sys: string, private trigger: string, private slips = false) {
+  constructor(private sys: string, private trigger: string, private slips = false, private threadSlips: readonly string[] = []) {
     for (const m of sys.matchAll(/^- (\w+) = ([A-Z0-9]+:\d+\.\d+)/gm)) { this.canonOf[m[1]!] = m[2]!; this.labelOf[m[2]!] = m[1]!; }
     this.owner = /\(owner\): <@(\w+)>/.exec(sys)?.[1] ?? this.owner;
     this.harry = /Harry[^\n]*?: <@(\w+)>/.exec(sys)?.[1] ?? this.harry;
@@ -109,6 +109,10 @@ class Play {
         target = /\d+\.\d+\.\d+/.exec(String(is?.title ?? ''))?.[0] ?? '0.0.0';
       }
       if (after && open.length) { intent = 'queue'; queuedBehind = open[0]!; }
+      if (this.threadSlips.includes('fabricated_thread') && open.length) {
+        // Live run 2: a timestamp made up to look like a thread. The engine must refuse it (bad_thread) and record nothing.
+        yield [{ name: 'job_open', input: { workflow: 'desktop-release', target: open[0]!.split(':')[1]!.split('#')[0]!, thread: `${(this.canonOf[label] ?? '').split(':')[0] || 'C0C4K4EGZT6'}:1759651539.000000`, role: 'request', intent: 'join' } }];
+      }
       let [o] = yield [{ name: 'job_open', input: { workflow: 'desktop-release', target: slip && !open.length ? 'next' : target, thread, role: this.roleOf(label), private: this.privateLabels.has(label) || undefined, intent } }];
       if (o?.status === 'bad_target') {
         // The engine refused the placeholder. Read the release issue for the exact version and open with it.
@@ -130,7 +134,7 @@ class Play {
     const wantsPromise = /tell me when|let me know when|ping me when/i.test(text);
     if (wantsPromise && this.jobId) {
       const about = /\blive|alpha done|on alpha\b/i.test(text) && !/QA/i.test(text) ? 'live' : 'qa_ready';
-      yield [{ name: 'promise_add', input: { job: this.jobId, thread: slip ? dm : label, about, fallback_time: '4h' } }];
+      yield [{ name: 'promise_add', input: { job: this.jobId, thread: slip ? dm : this.threadSlips.includes('promise_request_thread') ? this.canonOf['A'] ?? label : label, about, fallback_time: '4h' } }];
     }
     if (/\bcancel/i.test(text) && view?.status !== 'cancelled') return 'Understood. The job owner has been told and will handle the cancel.';
     return this.answer({ view: view ?? {} }, text, null);
@@ -296,7 +300,10 @@ class Play {
     if (s?.status === 'go') {
       this.told.add(`${m}|${thread}`);
       if (viaReply) return { sent: true, reply: body };
-      const [p] = yield [{ name: 'slack_post', input: { thread, text: body } }];
+      if (this.threadSlips.includes('top_level_progress')) yield [{ name: 'slack_post', input: { text: body } }]; // negative control: the run 2 double post
+      // The post target comes from the engine's answer: the exact channel and thread_ts to reply in.
+      const to = s?.post_to;
+      const [p] = yield [{ name: 'slack_post', input: to?.channel && to?.thread_ts ? { channel: to.channel, thread_ts: to.thread_ts, text: body } : { thread, text: body } }];
       if (p?.ok === false) { this.retrySoon = true; return { sent: false }; }
       return { sent: true };
     }
@@ -499,7 +506,7 @@ class Play {
 const THREAD_TOOLS = new Set(['job_open', 'job_view', 'say', 'promise_add']);
 
 export class ScriptedTony implements TonyModel {
-  constructor(private slips = false) {}
+  constructor(private slips = false, private threadSlips: readonly string[] = []) {}
   readonly name = 'scripted';
   readonly usage = { input_tokens: 0, output_tokens: 0, requests: 0 };
   private plays = new WeakMap<object, { gen: G<string>; n: number; play: Play }>();
@@ -511,7 +518,7 @@ export class ScriptedTony implements TonyModel {
     let step: IteratorResult<Call[], string>;
     if (!s) {
       const trigger = typeof key.content === 'string' ? key.content : '';
-      const play = new Play(req.system, trigger, this.slips);
+      const play = new Play(req.system, trigger, this.slips, this.threadSlips);
       s = { gen: play.main(), n: 0, play };
       this.plays.set(key, s);
       step = await s.gen.next();

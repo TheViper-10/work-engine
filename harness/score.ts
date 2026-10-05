@@ -33,6 +33,7 @@ export interface Score {
   pass: boolean;
   bars: Record<string, boolean>;
   protocol_refusals: { seq: number; name: string; why: string }[];
+  thread_violations: string[];
   false_findings: Judged[];
   unexpected_true_findings: Judged[];
   unexpected_true_holds: number;
@@ -70,7 +71,7 @@ const ACTION_TOOLS: Record<string, (c: OwnCall, ref: string) => boolean> = {
 
 const INTEND_CHECKS = new Set(['superseded_run', 'job_cancelled', 'lease_held', 'build_changed', 'no_go_for_build', 'sender_not_listed']);
 /** Engine flags that are not intend checks: counted from the engine's final flag records, not from an intend answer. */
-const SESSION_FLAGS = new Set(['missing_session', 'unclaimed_post', 'not_work_run']);
+const SESSION_FLAGS = new Set(['missing_session', 'unclaimed_post', 'not_work_run', 'unthreaded_post']);
 
 /** Engine findings come as strings "<check>: <detail>" in answer.holds and answer.flags. */
 function detailOf(x: unknown): string {
@@ -128,7 +129,7 @@ export function score(run: RunResult, sc: any): Score {
   const slipFlags = session_flags.filter((f) => !expectedAnywhere.has(f.check));
   for (const f of slipFlags) sort(judge({ seq: 0, t: 0, action: String(f.call ?? ''), ref: '', check: String(f.check), kind: 'flag', session: '', detail: String(f.detail ?? '') }, true));
   const unexpected_true_holds = unexpected_true_findings.filter((f) => f.kind === 'hold').length;
-  const TONY_SLIPS = new Set(['not_work_run', 'superseded_run', 'unclaimed_post']);
+  const TONY_SLIPS = new Set(['not_work_run', 'superseded_run', 'unclaimed_post', 'unthreaded_post']);
   const tony_protocol_slips = unexpected_true_findings.filter((f) => TONY_SLIPS.has(f.check)).length;
 
   const seen = new Set(findings.map((f) => `${f.action}|${f.check}`));
@@ -233,6 +234,14 @@ export function score(run: RunResult, sc: any): Score {
   const invariant_violations: string[] = snap?.invariants ?? [];
   const session_errors = run.sessions.filter((s) => s.error).map((s) => `${s.id}: ${s.error}`);
   const actionOwnerViolations = notHomeActions(calls);
+  // Thread continuity: every message belongs to a conversation. A new top-level message is never right while threads exist, and a
+  // milestone post must land in a thread that is its audience (the scenario's expected deliveries), never a private or unrelated one.
+  const topLevel = run.posts.filter((p) => p.top_level);
+  const noMilestone: string[] = expEnd.no_milestone_posts_in ?? [];
+  const outsideAudience = run.posts.filter((p) => !p.top_level && !!p.milestone && (
+    noMilestone.includes(p.thread) ||
+    (!!expEnd.deliveries?.[p.milestone!] && !expEnd.deliveries[p.milestone!].includes(p.thread) && !(p.milestone === 'qa_go_requested' || p.milestone === 'signoff_requested'))
+  ));
   const bars = {
     zero_protocol_refusals: protocol_refusals.length === 0,
     zero_false_findings: false_findings.length === 0,
@@ -245,6 +254,8 @@ export function score(run: RunResult, sc: any): Score {
     no_session_errors: session_errors.length === 0,
     engine_invariants: invariant_violations.length === 0,
     one_action_owner: actionOwnerViolations.length === 0,
+    no_top_level_posts: topLevel.length === 0,
+    posts_in_intended_thread: outsideAudience.length === 0,
     ...(expEnd.interruption_boundary ? { interruption_boundary: boundaryHolds(run, expEnd.interruption_boundary) } : {}),
   };
   return {
@@ -253,6 +264,7 @@ export function score(run: RunResult, sc: any): Score {
     pass: Object.values(bars).every(Boolean),
     bars,
     protocol_refusals,
+    thread_violations: [...topLevel.map((p) => `top-level post at t=${p.t}${p.requested_thread ? ` (asked for ${p.requested_thread})` : ''}: ${p.text.slice(0, 80)}`), ...outsideAudience.map((p) => `${p.milestone} posted in ${p.thread} at t=${p.t}, which is not its audience`)],
     false_findings,
     unexpected_true_findings,
     unexpected_true_holds,
@@ -364,6 +376,10 @@ function makeJudge(run: RunResult) {
         }
         const yes = otherSessionActed(run, f.session, f.t);
         return out(yes, yes ? 'another session acted within the run timeout' : 'no other session acted recently');
+      }
+      case 'unthreaded_post': {
+        const yes = run.posts.some((p) => p.top_level);
+        return out(yes, yes ? 'Tony posted at the top level of the channel' : 'no top-level post exists in the world');
       }
       case 'unclaimed_post': {
         const yes = run.posts.some((p) => p.via === 'tool' && !p.claimed);

@@ -71,6 +71,7 @@ export class World {
     this.data.circleci.pipelines ??= {};
     this.data.circleci.gates ??= {};
     this.data.slack.threads = {};
+    this.data.slack.top_level = [];
     for (const id of Object.keys(sc.threads ?? {})) {
       this.data.slack.threads[id] = {
         messages: [],
@@ -237,6 +238,30 @@ export class World {
     return { ts, event };
   }
 
+  /** A new top-level message in the channel (no thread, or a thread_ts Slack does not know, which Slack posts as a new message too). */
+  tonyPostTopLevel(text: string, requested: string | undefined, ctx: ToolCtx): { ts: string; event: EngineEvent } {
+    const ts = this.newTs(ctx.t);
+    this.data.slack.top_level.push({ ts, user: this.tonySlack, name: 'Tony', text, bot: true });
+    this.posts.push({ thread: '', ts, text, via: 'tool', session: ctx.session, t: ctx.t, milestone: null, text_milestone: this.heuristicMilestone(text), claimed: false, dropped: false, top_level: true, requested_thread: requested });
+    const event: EngineEvent = {
+      source: 'slack', delivery_id: `slack:${ts}`, kind: 'message', sender_id: this.tonySlack, sender_kind: 'own_bot', ref: `slack:${this.channel}:${ts}`,
+      attrs: { via: 'tool', ts: EPOCH_MS + ctx.t * 60000, link: `slack:${this.channel}:${ts}`, top_level: true, channel: this.channel },
+      at: EPOCH_MS + ctx.t * 60000,
+    };
+    return { ts, event };
+  }
+
+  /** Does a thread exist in this world? The canonical id <channel>:<ts> of a labelled thread (faithful scenarios), false when no message has that ts. */
+  threadRoot(thread: string): string | false {
+    const m = /^([A-Z][A-Z0-9]{8,12}):(\d+\.\d+)$/.exec(thread);
+    if (!m) return false;
+    for (const [label, th] of Object.entries<Json>(this.data.slack.threads)) {
+      const msg = (th.messages ?? []).find((x: Json) => x.ts === m[2]);
+      if (msg) { const r = this.sc.threads?.[label]; return r?.root_ts ? `${r.channel}:${r.root_ts}` : thread; }
+    }
+    return false;
+  }
+
   private dropFault(thread: string, milestone: string | null): boolean {
     for (const f of this.sc.faults ?? []) {
       if (f.mode !== 'drop_event' || f.target !== 'slack.connector') continue;
@@ -293,7 +318,7 @@ export class World {
       { name: 'circleci_read_pipeline', description: 'Read a CircleCI pipeline (newest on the base branch if no id): commit, workflow status, every job state, Playwright results.', input_schema: { type: 'object', properties: { pipeline_id: str } } },
       { name: 'circleci_read_gate', description: 'Read a CircleCI approval hold by job name.', input_schema: { type: 'object', properties: { gate: str, pipeline_id: str }, required: ['gate'] } },
       { name: 'circleci_approve_gate', description: 'Approve a CircleCI approval hold by job name.', input_schema: { type: 'object', properties: { gate: str, pipeline_id: str }, required: ['gate'] } },
-      { name: 'slack_post', description: 'Post a message in a Slack thread (reply in the thread).', input_schema: { type: 'object', properties: { thread: str, text: str }, required: ['thread', 'text'] } },
+      { name: 'slack_post', description: 'Post a message in Slack. With thread (<channel>:<ts>), or channel and thread_ts, it replies in that thread. Without a thread it starts a new top-level message.', input_schema: { type: 'object', properties: { thread: str, channel: str, thread_ts: str, text: str }, required: ['text'] } },
       { name: 'slack_read_thread', description: 'Read all messages in a Slack thread.', input_schema: { type: 'object', properties: { thread: str }, required: ['thread'] } },
       { name: 'update_server_read', description: 'Read what the update server serves per channel.', input_schema: { type: 'object', properties: { channel: str } } },
       { name: 'devrev_issue_read', description: 'Read a DevRev issue.', input_schema: { type: 'object', properties: { id: str }, required: ['id'] } },
@@ -434,10 +459,20 @@ export class World {
         return { ok: true, gate: input.gate, state: 'approved', pipeline_id: p?.id ?? null };
       }
       case 'slack_post': {
-        const th = this.resolveThread(input.thread);
+        if (typeof input.text !== 'string' || !input.text.trim()) return fail('no_text');
+        // Slack: channel + thread_ts replies in a thread; a thread_ts no message has, or no thread_ts at all, posts a NEW top-level message.
+        const asked: string | undefined = typeof input.thread === 'string' ? input.thread : typeof input.thread_ts === 'string' ? `${input.channel ?? this.channel}:${input.thread_ts}` : undefined;
+        let target: string | null = asked ? this.resolveThread(asked) : null;
+        if (!target && typeof input.thread_ts === 'string') target = this.resolveThread(input.thread_ts);
+        if (!target && (asked === undefined || /^[A-Z][A-Z0-9]{8,12}:\d+\.\d+$/.test(asked))) {
+          const { ts, event } = this.tonyPostTopLevel(input.text, asked, ctx);
+          events.push(event);
+          effects.push('slack post at the top level');
+          return { ok: true, ts, channel: this.channel, thread_ts: null };
+        }
+        const th = target;
         if (!th) return fail('thread_not_found');
         if (!this.data.slack.threads[th].messages.length) return fail('thread_not_found');
-        if (typeof input.text !== 'string' || !input.text.trim()) return fail('no_text');
         const { ts, event } = this.tonyPost(th, input.text, 'tool', ctx);
         if (event) events.push(event);
         effects.push(`slack post in ${th}`);

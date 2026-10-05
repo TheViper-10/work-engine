@@ -145,3 +145,17 @@ test('MemoryStore also works with the poller (store interface only)', async () =
   const poller = new SlackPoller({ api: f.deps().slack(f.timerEvent()), store: new MemoryStore(), clock: f.clock, env: 'qa', bot: 'tony', allow: [ALLOWED], ownBotUserId: OWN_BOT, ingest: async () => ({ ok: true }) });
   assert.equal(await poller.watch(`${ALLOWED}:1700000000.000100`, 'j'), true);
 });
+
+test('R61 SlackReader.threadExists: a real thread gives its root, a reply gives the root, an unknown ts is false, Slack errors are null', async () => {
+  const f = new FakePlatform();
+  const reader = new PlatformSlackReader({ api: f.deps().slack(f.timerEvent()), allow: [ALLOWED], ownBotUserId: OWN_BOT });
+  const root = f.root(ALLOWED, OWNER_SLACK, 'r');
+  const reply = f.postSlack(ALLOWED, root, { user: OWNER_SLACK, text: 'reply' });
+  assert.equal(await reader.threadExists(`${ALLOWED}:${root}`), `${ALLOWED}:${root}`);
+  assert.equal(await reader.threadExists(`${ALLOWED}:${reply}`), `${ALLOWED}:${root}`);
+  assert.equal(await reader.threadExists(`${ALLOWED}:1759651539.000000`), false);
+  assert.equal(await reader.threadExists('not a thread'), null);
+  await assert.rejects(() => reader.threadExists(`${PROTECTED}:${root}`), ChannelDeniedError);
+  f.slackRules.push({ times: 1, status: 'timeout' } as any);
+  assert.equal(await reader.threadExists(`${ALLOWED}:${root}`), null);
+});
