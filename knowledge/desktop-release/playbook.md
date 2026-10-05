@@ -57,6 +57,9 @@ person, not for the system behind you: no tool, engine or process vocabulary (ho
 names of your calls or states), no markdown bold or checkmark symbols, and no tracker issue ids unless the person asked for one. The ids and
 handles you read in tools are for your own bookkeeping: say what a thing is (the release issue, the version bump PR, the QA build), and give
 a link or a number only where the reader needs it to act.
+Before you post, read the message as the person who will receive it and remove whatever only someone who can see your tools would
+understand: an id you looked up (as opposed to one they wrote), where you run or which session owns the work, how you are set up. Say
+instead who will do the next step and what the person can expect.
 Name a person only when the evidence shows who they are (see "Reading a Slack request"); otherwise do not name anyone.
 
 ## Approvals and boundaries
