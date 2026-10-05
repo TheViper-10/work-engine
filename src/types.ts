@@ -33,7 +33,7 @@ export interface Spec {
   /** R52: regular expression a target must match to name a job of its own. A target that does not match is never a job. */
   target_pattern?: string;
   resources?: string[];
-  people?: Record<string, { slack?: string; name?: string }>;
+  people?: Record<string, { slack?: string; name?: string; /** R70: a bot account; its posts are other_bot even when the read looks like an app post. */ bot?: boolean }>;
   gates?: Record<string, { responders: { primary: string[]; stand_ins?: string[] } }>;
   milestones?: Record<
     string,

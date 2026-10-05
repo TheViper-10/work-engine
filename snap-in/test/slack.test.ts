@@ -7,9 +7,9 @@ import { ALLOWED, FakePlatform, OWN_BOT, PROTECTED } from './fake-platform.ts';
 import { storeFor } from './helpers.ts';
 import { HARRY, OWNER_SLACK } from './helpers.ts';
 
-function pollerFor(f: FakePlatform, allow: string[] = [ALLOWED]) {
+function pollerFor(f: FakePlatform, allow: string[] = [ALLOWED], botUsers: string[] = [HARRY]) {
   const events: IngestEvent[] = [];
-  const poller = new SlackPoller({ api: f.deps().slack(f.timerEvent()), store: storeFor(f), clock: f.clock, env: 'qa', bot: 'tony', allow, ownBotUserId: OWN_BOT, ingest: async (e) => { events.push(e); return { ok: true, status: 'ok' }; } });
+  const poller = new SlackPoller({ api: f.deps().slack(f.timerEvent()), store: storeFor(f), clock: f.clock, env: 'qa', bot: 'tony', allow, ownBotUserId: OWN_BOT, botUsers, ingest: async (e) => { events.push(e); return { ok: true, status: 'ok' }; } });
   return { poller, events };
 }
 
@@ -64,6 +64,21 @@ test('an owner user-token post that carries bot_id/app_id is human; real bot mes
   const r = await poller.poll();
   assert.equal(r.ingested, 5);
   assert.deepEqual(events.map((e) => [e.sender_id, e.sender_kind]), [['U042GEDM4BB', 'human'], [HARRY, 'other_bot'], [HARRY, 'other_bot'], ['B4', 'other_bot'], [OWN_BOT, 'human']]);
+});
+
+// R70 (run 3 F5): the real read of an app-mediated user-token post carries bot_profile. The person is still the person; listed bots stay bots.
+test('R70: a user-token post whose read carries bot_profile is human; listed bots and unlisted-user bot messages stay other_bot', async () => {
+  for (const botUsers of [[HARRY], [HARRY, 'U0SOMEOTHER']]) {
+    const f = new FakePlatform(); const { poller, events } = pollerFor(f, [ALLOWED], botUsers);
+    const root = f.root(ALLOWED, OWNER_SLACK, 'request'); await poller.watch(`${ALLOWED}:${root}`, 'j');
+    f.postSlack(ALLOWED, root, { user: OWNER_SLACK, bot_id: 'B0APPMED1', app_id: 'A0APPMED1', bot_profile: { id: 'B0APPMED1', name: 'some-app' }, text: 'go for 5.2.13' });
+    f.postSlack(ALLOWED, root, { user: 'U0ANOTHERPERSON', bot_id: 'B0APPMED2', bot_profile: { id: 'B0APPMED2', name: 'other-app' }, text: 'a second person through an app' });
+    f.postSlack(ALLOWED, root, { user: HARRY, bot_id: 'B2', bot_profile: { id: 'B2', name: 'harry' }, text: 'signoff' });
+    f.postSlack(ALLOWED, root, { user: HARRY, bot_id: 'B3', subtype: 'bot_message', bot_profile: { id: 'B3', name: 'harry' }, text: 'subtype' });
+    f.postSlack(ALLOWED, root, { bot_id: 'B4', subtype: 'bot_message', bot_profile: { id: 'B4', name: 'hook' }, text: 'webhook, no user' });
+    await poller.poll();
+    assert.deepEqual(events.map((e) => [e.sender_id, e.sender_kind]), [[OWNER_SLACK, 'human'], ['U0ANOTHERPERSON', 'human'], [HARRY, 'other_bot'], [HARRY, 'other_bot'], ['B4', 'other_bot']]);
+  }
 });
 
 test('the cursor does not advance past a failed ingest, so the message is retried', async () => {

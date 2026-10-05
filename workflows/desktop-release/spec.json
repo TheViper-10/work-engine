@@ -7,7 +7,7 @@
   "resources": ["alpha", "main"],
   "people": {
     "owner": { "slack": "U042GEDM4BB", "name": "Priyadharshan (owner)" },
-    "harry_bot": { "slack": "U0C4YRX93PS", "name": "Harry (QA sign-off; bot in the mock)" }
+    "harry_bot": { "slack": "U0C4YRX93PS", "name": "Harry (QA sign-off; bot in the mock)", "bot": true }
   },
   "gates": {
     "pr_review": {

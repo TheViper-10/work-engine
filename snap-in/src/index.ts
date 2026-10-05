@@ -23,6 +23,9 @@ export const PR_GATES = ['pr_review'] as const;
 export const SOURCE_GATES = [...new Set(SPECS.flatMap((sp) => Object.values(sp.milestones ?? {}).map((m) => m.opens_ask).filter((g): g is string => !!g)))];
 export const TICK_BUDGET_MS = 100_000;
 
+/** R70: Slack ids of the people a spec marks as bots (the sign-off bot). */
+export const listedBots = (): string[] => [...new Set(SPECS.flatMap((sp) => Object.values(sp.people ?? {}).filter((p) => p.bot && p.slack).map((p) => p.slack as string)))];
+
 export interface Runtime {
   engine: Engine;
   poller: SlackPoller;
@@ -71,7 +74,7 @@ export function assembleRuntime(event: any, deps: Deps, as: Identity, inputs: In
   });
   const poller = new SlackPoller({
     api: slackApi, store, clock: deps.clock, env: inputs.env, bot: inputs.bot, allow: inputs.slack_channel_allowlist,
-    ownBotUserId: inputs.own_bot_user, ingest: (ev) => engine.ingest(ev),
+    ownBotUserId: inputs.own_bot_user, botUsers: listedBots(), ingest: (ev) => engine.ingest(ev),
   });
   return { engine, poller, inputs, store, directory, waker, source };
 }

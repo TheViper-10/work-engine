@@ -105,6 +105,8 @@ export const MAX_THREADS_PER_TICK = 20;
 export class SlackPoller {
   constructor(private readonly o: {
     api: SlackApi; store: Store; clock: Clock; env: string; bot: string; allow: readonly string[]; ownBotUserId: string;
+    /** R70: Slack user ids of bots the workflow lists (for example the QA sign-off bot). A post by one of them is a bot's even though its read looks like an app post. */
+    botUsers?: readonly string[];
     ingest: (ev: IngestEvent) => Promise<unknown>;
   }) {}
 
@@ -143,9 +145,9 @@ export class SlackPoller {
       let cursor = w.last_ts;
       for (const m of msgs) {
         const isOwn = m.user === this.o.ownBotUserId;
-        // A post is a bot's only if Slack says so (bot_profile / bot_message subtype) or it has no user at all. A person's xoxp user-token post made through an app
-        // carries `user` plus bot_id/app_id but no bot_profile; that is still the person.
-        const isBotMsg = !!m.bot_profile || m.subtype === 'bot_message' || (!m.user && !!m.bot_id);
+        // R70: a post is a bot's when Slack says it is a bot_message, when it has no user at all, or when its user is a listed bot. The read of a person's
+        // user-token post made through an app carries `user` plus bot_id/app_id and (on the bot-token read) a bot_profile; that is still the person.
+        const isBotMsg = m.subtype === 'bot_message' || (!m.user && !!m.bot_id) || (!!m.bot_profile && !!m.user && (this.o.botUsers ?? []).includes(m.user));
         const other = isBotMsg && !isOwn;
         const r: any = await this.o.ingest({
           source: 'slack', delivery_id: `${w.channel}:${m.ts}`, kind: 'message', thread: `${w.channel}:${w.thread_ts}`,
