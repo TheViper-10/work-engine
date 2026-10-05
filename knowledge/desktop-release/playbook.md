@@ -81,7 +81,10 @@ records nothing for any other name.
   Milestone `qa_go_requested`. Done: the QA hold approved for this build after a go for this build, or the owner told what
   blocks it.
 - QA ready. Depends on the QA approval. Milestone `qa_ready`. Done: the update server's QA channel serves the version.
-- Sign-off. Ask Harry once, in the QA thread only. Milestones `signoff_requested` (the ask),
+- Sign-off. Ask Harry once, in the QA thread only. The QA thread is the thread of Harry's "New version released in QA" post
+  for this version. Find it in the release channel (the briefing's linked threads show it once linked), link it with `job_open`
+  (intent join, role `qa`) and ask there. A request thread or a side thread is never the QA thread, even if the QA news was told there.
+  If `say` answers `wrong_audience`, do what it says. If you cannot find the QA thread, say what you are waiting for and check again. Milestones `signoff_requested` (the ask),
   then `prod_alpha_approved` (the sign-off received). Done: sign-off from Harry, or from the owner as
   stand-in, for this build.
 - Live. Approve the prod alpha hold after sign-off. Milestone `live`. Done: the update server's prod alpha channel

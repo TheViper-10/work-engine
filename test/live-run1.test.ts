@@ -19,6 +19,7 @@ const SPEC: Spec = {
   milestones: {
     started: { audience: { roles: ['request'], promise_holders: true } },
     ready: { audience: { roles: ['request'], promise_holders: true }, outcome: true },
+    ask: { audience: { roles: ['qa'], promise_holders: false }, audience_only: true },
   },
   actions: {},
   defaults: { next_wake_minutes: 30, promise_fallback_minutes: 240, operation_unknown_minutes: 30 },
@@ -184,4 +185,23 @@ test('F4: a home first wake nobody answers is re-woken after 5 minutes, bounded;
   await e2.engine.sweep();
   assert.equal(e2.wakes.length, 1);
   void j;
+});
+
+test('R58: a milestone addressed to the qa thread only is never claimed in another thread; it is claimed once a qa thread is linked', async () => {
+  const e = env();
+  const j = (await open(e, {})).job as string;
+  await e.engine.jobOpen({ workflow: 'wf', target: '5.2.11', thread: B, role: 'side', intent: 'join' } as any, H);
+  const r = await e.engine.say({ job: j, thread: B, milestone: 'ask' }, H);
+  assert.equal(r.status, 'wrong_audience');
+  assert.match(r.say_to_tony, /qa thread/);
+  assert.match(r.say_to_tony, /job_open/);
+  assert.equal((await e.engine.say({ job: j, thread: A, milestone: 'ask' }, H)).status, 'wrong_audience');
+  const v: any = await e.engine.jobView({ job: j }, H);
+  assert.deepEqual(Object.keys(v.jobs[0].milestones ?? {}), [], 'nothing reached by the refused claims');
+  const Q = `${CH}:1791156130.270059`;
+  await e.engine.jobOpen({ workflow: 'wf', target: '5.2.11', thread: Q, role: 'qa', intent: 'join' } as any, H);
+  const r2 = await e.engine.say({ job: j, thread: B, milestone: 'ask' }, H);
+  assert.equal(r2.status, 'wrong_audience');
+  assert.match(r2.say_to_tony, new RegExp(Q));
+  assert.equal((await e.engine.say({ job: j, thread: Q, milestone: 'ask' }, H)).status, 'go');
 });

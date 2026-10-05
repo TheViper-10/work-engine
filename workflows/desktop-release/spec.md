@@ -25,7 +25,7 @@ Audience is the request thread plus everyone holding a promise for that mileston
 | `merged` | PR merged, pipeline started | request, promise holders | none | CALLMAP moment 5 |
 | `qa_go_requested` | Tony asks the owner for the QA go after triaging Playwright | request, promise holders | `approve-desktop-qa-latest` | CALLMAP moment 6 |
 | `qa_ready` | Build is in QA and Harry's "released in QA" post was seen. This is what thread B's "tell me when QA is ready" promise waits on | request, promise holders | none | CALLMAP moments 2 and 7 |
-| `signoff_requested` | Tony asked Harry, once, in the QA thread | qa thread only (judgment call, see below) | `approve-desktop-prod-alpha` | CALLMAP moment 8 and rule 26 |
+| `signoff_requested` | Tony asked Harry, once, in the QA thread | qa thread only (judgment call, see below; `audience_only`, R58) | `approve-desktop-prod-alpha` | CALLMAP moment 8 and rule 26 |
 | `prod_alpha_approved` | Sign-off received | request, promise holders | none | CALLMAP moment 8 |
 | `live` | Live on prod alpha, served revision read from the update server | request, qa thread, promise holders | none | HANDOFF D3; CALLMAP moments 9 and 10 |
 

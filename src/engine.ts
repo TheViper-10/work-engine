@@ -1311,6 +1311,16 @@ export class Engine {
       return ans(true, 'not_reached', `${a.milestone} is not reached yet, so nothing was claimed and nothing is owed. Read the source; when it shows ${a.milestone}, record it with checkpoint(reached: ["${a.milestone}"]), then say it. If the source shows it has not happened, tell the person the real state in your own words.`, { job: job.id });
     }
 
+    // R58: a milestone that is addressed only to some thread roles (the sign-off ask: the QA thread only) is never claimed anywhere else.
+    const entry0 = spec?.milestones?.[a.milestone];
+    if (entry0?.audience_only && !entry0.audience.roles.includes(job.roles[a.thread] ?? '')) {
+      await this.saveJob(job);
+      const roles = entry0.audience.roles.join(' or ');
+      const linked = job.threads.filter((t) => entry0.audience.roles.includes(job.roles[t]));
+      const where = job.threads.includes(a.thread) ? `${a.thread} is linked as ${job.roles[a.thread]}` : `${a.thread} is not linked to this job`;
+      return ans(true, 'wrong_audience', `wrong_audience: ${a.milestone} goes only to the ${roles} thread, and ${where}. Nothing was claimed. ${linked.length ? `Post it in ${linked.join(', ')}.` : `No ${roles} thread is linked yet: find that thread in the channel, link it with job_open (intent join, role ${entry0.audience.roles[0]}), then say again there. If you cannot find it, wait and say what you are waiting for; do not ask anywhere else.`}`, { job: job.id, roles: entry0.audience.roles, linked });
+    }
+
     // Confirm route: the agent posted and tells the engine where. Reported by the agent (L3); clears the claim.
     if (a.posted_link) {
       // R54: the link must be a message in this delivery's thread (same channel and thread ts); a link from another thread is not this delivery.

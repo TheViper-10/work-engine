@@ -53,6 +53,7 @@
     },
     "signoff_requested": {
       "audience": { "roles": ["qa"], "promise_holders": false },
+      "audience_only": true,
       "opens_ask": "approve-desktop-prod-alpha",
       "notes": "Tony asks Harry once, in the QA thread, for sign-off. Audience is the QA thread only because the ask is allowed only there, so this departs from the D3 default. Source: 22-tony-coordinator-call-map.md:289-296 (moment 8) and :425 (rule 26); 23-work/facts-brief.md:55."
     },

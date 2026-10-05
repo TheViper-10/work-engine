@@ -174,5 +174,28 @@ Each defect from live run 1 (`30-work-engine-live-qa-release.md`) has an offline
 Results. Engine checks green: lint, unit, sim (2x1000 + named), red-team repros, snapin:test, grader tests. Scripted (--checks deploy): interruption-boundary PASS, run1-replay PASS (with the DM-id and `next` slips, recovered by the engine).
 
 Real model (Sonnet 5.5, gateway, --checks deploy, 1 run each):
-- run1-replay: score PASS, outcome FAIL on one bar: the first relay addressed "Rashmi" (the DevRev comment author), reproducing F6. The connector body names nobody, so the playbook now tells the model to read the thread and address its author. NOT RERUN (call budget spent).
-- interruption-boundary: FAIL (6/8 milestones, 18 sessions). The home waited for Harry's sign-off that never came, and the run looped on 5 minute wakes. Not yet diagnosed; the first candidate is that the model never asked Harry in the QA thread (the scenario's sign-off fires on Tony's post there). It needs a trace read, then one rerun of this scenario. The connector-faithful interruption-boundary smoke is therefore NOT green.
+- run1-replay: score PASS, outcome FAIL on one bar: the first relay addressed "Rashmi" (the DevRev comment author), reproducing F6. The connector body names nobody, so the playbook now tells the model to read the thread and address its author. Rerun in round 2 below: PASS.
+- interruption-boundary: FAIL (6/8 milestones, 18 sessions). The home waited for Harry's sign-off that never came, and the run looped on 5 minute wakes. Diagnosed and fixed in round 2 below (R58, R59): PASS.
+
+## Live run 1 repros, round 2 (R58 to R60)
+Date: 2026-10-05. Base: main c7c514c. Real model: Sonnet 5.5 through the gateway, `--checks deploy`, engine binding, 1 run per cell. Fix rounds: interruption-boundary 2 (engine and playbook, then harness), run1-replay 0 (rerun only).
+
+### interruption-boundary diagnosis (saved run `v6-real-interruption-boundary`)
+- F10 ruled out. In s7 the model read the update server, approved the QA hold, called `checkpoint(reached: qa_ready)` and then `say qa_ready`; the engine answered `go`. No `not_reached` answer anywhere in the run.
+- F4 ruled out. All 17 wakes after the first were ordinary "next wake time reached" wakes; the run shows no steer into an active session and no unanswered wake. Each session called `job_view` within 2 minutes, so the 5 minute reply window never applied. The home kept setting `next_wake_in` 5 to 15 minutes, so 18 sessions is the cadence of a home polling for an answer; the harness simulated 4 hours.
+- Cause. Harry was never asked in the QA thread. Q (the thread of Harry's "New version released in QA" post) was never linked, the model read only A and B, and it did `say signoff_requested` in B and posted the ask to Harry there. The engine accepted it (`signoff_requested` reached, `audience` for `qa` role unchecked). The scenario's Harry reply fires on a Tony post in Q, so nothing came. The model said "I asked Harry in the QA thread" in its summaries, which was false in the strict sense: it was B. Milestones 6 of 8, alpha stayed 5.2.9.
+- Class: missing policy (the playbook did not say what the QA thread is nor to link it) plus an engine gap (a milestone addressed to the QA thread only could be claimed in any thread). Not model judgment alone: the one place the sign-off ask is restricted was not enforced and not explained.
+- Fix (layers): engine, one generic spec field `audience_only` and a `wrong_audience` answer in words (R58); spec data on `signoff_requested`; playbook text on finding and linking the QA thread; harness prompt lists each thread's first message (R59).
+- Second cause found on the first rerun (`v7-real-interruption-boundary`, FAIL on `end_job_status` and `deliveries_once`): the model linked Q by `<channel>:<ts>` in a labelled scenario, giving the engine two ids for one thread. Harness aliasing defect (evaluation), fixed in the engine binding (R59). The model's behavior in that run was correct (it found Q, linked it, asked Harry there and went live).
+
+### Real-model results after the fixes
+| scenario | run | strict (D7) | outcome | engine calls | model requests | note |
+|---|---|---|---|---|---|---|
+| run1-replay | v7 | PASS | PASS | 37 | 57 | 8/8 milestones, no Rashmi, one job, no acting from a mention, all bars met |
+| interruption-boundary | v7 | FAIL | FAIL | 70 | 97 | 8/8 milestones; thread aliasing in the harness (R59) left Q delivery claimed and the job closing |
+| interruption-boundary | v7b | PASS | PASS | 43 | 63 | 8/8 milestones, 7 sessions, all bars met |
+
+Scripted replay with `--checks deploy` (stale-go, cancel-mid-publish, interruption-boundary, twin-mention, private-evidence, run1-replay): 6 of 6 strict and outcome PASS. The engine change touches only `signoff_requested`, so stale-go and cancel-mid-publish were run scripted only, not with the real model. Caveat: 1 real run per cell.
+
+### Checks
+lint ok; 71 unit tests; sim 1,000 + 1,000 orders and 48 named cases; 28 repros clear (2 parked still reproduce as before); 132 snap-in tests; snap-in build and pack ok. Tarball `snap-in/dist-tarballs/work-engine-qa-v6.tgz` repacked under the same name (nothing deployed yet), secret scan no matches, sha256 `e80fb8fa8211fed95070ed707e672649ad2c144f758b0c9cc452aeedcf5279f4`.

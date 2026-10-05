@@ -94,8 +94,9 @@ export class GatewayTony implements TonyModel {
 
 /** System prompt = playbook text + a short replay context. Nothing from expected_end or expected_checks. */
 export function buildSystemPrompt(playbook: string, sc: any, dmId: string): string {
+  const first = (t: any) => (t.root_text ? `, first message: "${String(t.root_text).replace(/\s+/g, ' ').slice(0, 90)}"` : '');
   const threads = Object.entries<any>(sc.threads ?? {})
-    .map(([id, t]) => `- ${id}: channel ${t.channel}${t.root_ts ? `, thread ts ${t.root_ts}` : ''}${t.private ? ', PRIVATE thread' : ''}`)
+    .map(([id, t]) => `- ${id}: channel ${t.channel}${t.root_ts ? `, thread ts ${t.root_ts}` : ''}${t.private ? ', PRIVATE thread' : ''}${first(t)}`)
     .join('\n');
   const people = Object.entries<any>(sc.people ?? {})
     .filter(([, p]) => p.slack)
@@ -103,7 +104,7 @@ export function buildSystemPrompt(playbook: string, sc: any, dmId: string): stri
     .join('\n');
   const faith = !!sc.faithful;
   const threadLines = faith
-    ? Object.entries<any>(sc.threads ?? {}).map(([id, t]) => `- ${id} = ${t.channel}:${t.root_ts ?? '(not posted yet)'}${t.private ? ' (PRIVATE thread)' : ''}`).join('\n')
+    ? Object.entries<any>(sc.threads ?? {}).map(([id, t]) => `- ${id} = ${t.channel}:${t.root_ts ?? '(not posted yet)'}${t.private ? ' (PRIVATE thread)' : ''}${first(t)}`).join('\n')
     : threads;
   const threadRule = faith
     ? '- Slack threads are identified as <channel>:<ts> (the request comment\'s external_ref without the slack: prefix). Use that as the `thread` argument in every engine call and in `slack_post` and `slack_read_thread`. Labels (A, B, Q) are for the people reading the report only.'

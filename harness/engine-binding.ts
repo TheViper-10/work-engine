@@ -249,6 +249,11 @@ export class RealEngineBinding implements EngineBinding {
     this.sync(ctx.now);
     const m = METHOD[name];
     if (!m) throw new Error(`unknown engine tool ${name}`);
+    // Labelled scenarios: a model that names a thread by <channel>:<ts> (as the real connector does) means the labelled thread; one thread, one engine id.
+    if (!this.faithful && typeof input?.thread === 'string') {
+      const label = this.world?.resolveThread(input.thread);
+      if (label && label !== input.thread) input = { ...input, thread: label };
+    }
     const out = await (this.engine[m] as (a: any, c: any) => Promise<any>).call(this.engine, input ?? {}, { session_id: ctx.session_id });
     if (name === 'job_open' && out?.job && !this.jobs.includes(out.job)) this.jobs.push(out.job);
     return out;

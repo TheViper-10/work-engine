@@ -39,7 +39,9 @@ export interface Spec {
     string,
     { audience: { roles: string[]; promise_holders?: boolean }; opens_ask?: string;
       /** R55: an outcome milestone is reached only through checkpoint(reached), after the source was read. `say` claims it only once reached. */
-      outcome?: boolean }
+      outcome?: boolean;
+      /** R58: the milestone may be claimed only in a thread linked with one of the audience roles; anywhere else `say` answers wrong_audience. */
+      audience_only?: boolean }
   >;
   actions?: Record<string, { resource?: string; gate?: string; proved_by?: string }>;
   defaults?: {
