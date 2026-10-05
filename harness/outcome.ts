@@ -2,7 +2,7 @@
 // outcome_pass = end_state && approval_correctness && recovery && communication. Engine calls, model requests,
 // tokens, protocol slips and flags are reported as info only.
 
-import { gateSlackIds, isProtocolRefusal, voiceViolations, type Score } from './score.ts';
+import { gateSlackIds, humanIdsOf, isProtocolRefusal, voiceViolations, type Score } from './score.ts';
 import type { RunResult } from './types.ts';
 
 const QA_GATE = 'approve-desktop-qa-latest';
@@ -234,7 +234,7 @@ function communication(run: RunResult, sc: any): Section {
     for (const c of run.own_calls) if (mentionIds.has(c.session) && ACT.includes(c.name) && !c.error && c.effects.length) d.push(`mention session ${c.session} acted from Slack: ${c.name}`);
     for (const p of run.posts) {
       if (p.dropped) continue;
-      for (const v of voiceViolations(p.text, exp.voice_banned ?? [])) d.push(`post in ${p.thread} at t=${p.t.toFixed(0)}: ${v}: "${p.text.slice(0, 70)}"`);
+      for (const v of voiceViolations(p.text, exp.voice_banned ?? [], humanIdsOf(sc))) d.push(`post in ${p.thread} at t=${p.t.toFixed(0)}: ${v}: "${p.text.slice(0, 70)}"`);
     }
   }
   const maxLive = exp.max_live_posts_per_thread ?? 1;
