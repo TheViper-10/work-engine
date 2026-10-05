@@ -156,7 +156,7 @@ test('R61 SlackReader.threadExists: a real thread gives its root, a reply gives 
   assert.equal(await reader.threadExists(`${ALLOWED}:1759651539.000000`), false);
   assert.equal(await reader.threadExists('not a thread'), null);
   await assert.rejects(() => reader.threadExists(`${PROTECTED}:${root}`), ChannelDeniedError);
-  f.slackRules.push({ times: 1, status: 'timeout' } as any);
+  f.failSlack('timeout', 1);
   assert.equal(await reader.threadExists(`${ALLOWED}:${root}`), null);
 });
 

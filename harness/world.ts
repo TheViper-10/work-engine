@@ -144,6 +144,10 @@ export class World {
     const threads = this.sc.threads ?? {};
     if (threads[x]) return x;
     for (const [id, th] of Object.entries<Json>(threads)) if (th.root_ts && x.endsWith(th.root_ts)) return id;
+    // A ts the world itself handed out (slack_read_thread shows every message ts): a message's ts, bare or as <channel>:<ts>, names the thread that holds it,
+    // as in Slack where a reply's ts resolves to its thread. Only a ts no message has is unknown (and posts top-level).
+    const m = /^(?:[A-Z][A-Z0-9]{8,12}:)?(\d+\.\d+)$/.exec(x);
+    if (m) for (const id of Object.keys(threads)) if ((this.data.slack.threads[id]?.messages ?? []).some((msg: Json) => msg.ts === m[1])) return id;
     return null;
   }
   noteClaim(thread: string, milestone: string): void {

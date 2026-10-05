@@ -23,7 +23,7 @@ const SPEC: Spec = {
 };
 const H = { session_id: 'h1' };
 
-function env(o: { merged?: Set<string>; author?: string | null; build?: string } = {}) {
+function env(o: { merged?: Set<string>; author?: string | null; build?: string | null } = {}) {
   const clock = new ManualClock(T0);
   const dir: SessionDirectory = {
     cacheable: false,
@@ -32,7 +32,7 @@ function env(o: { merged?: Set<string>; author?: string | null; build?: string }
   };
   const engine = new Engine({
     store: new MemoryStore(), clock,
-    sourceReader: { currentBuild: async () => o.build ?? 'b1', operationOutcome: async (kind, ref) => (kind === 'pr_merged' && o.merged?.has(ref) ? 'done' : null) },
+    sourceReader: { currentBuild: async () => (o.build === null ? null : o.build ?? 'b1'), operationOutcome: async (kind, ref) => (kind === 'pr_merged' && o.merged?.has(ref) ? 'done' : null) },
     slackReader: { findOwnPostAfter: async () => null, authorOf: async () => (o.author === undefined ? 'U042GEDM4BB' : o.author) },
     waker: { postWake: async () => {} },
     config: defineConfig({ env: 't', bot: 'b', ownBotUserId: 'UBOT', checks: { ...DEPLOY_CHECKS } }),
@@ -136,4 +136,18 @@ test('R63: a merge nobody reported is settled from the source after the timeout;
   await e2.engine.intend({ job: j2, action: 'merge', ref: '7' }, H);
   e2.clock.advance(31 * MIN); await e2.engine.sweep();
   assert.equal((await view(e2, j2)).operations[0].outcome, 'unknown');
+});
+
+// Real-model smoke (thread-continuity-run2, interruption-boundary): a review the engine cannot read (the ask names no build) cannot have a go event tied
+// to it; an honest reason in words must not stall the action, while a gate that names a build stays strict.
+test('R62: on an ask that names no build, a reason in words clears (flagged); on a named build it is still held', async () => {
+  const e = env({ build: null });
+  const j = await asked(e);
+  const r: any = await e.engine.intend({ job: j, action: 'approve', ref: 'p1', because: 'approved on GitHub by the reviewer' }, H);
+  assert.equal(r.status, 'clear');
+  assert.match(String(r.say_to_tony), /reason_in_words/);
+  const e2 = env();
+  const j2 = await asked(e2);
+  const r2: any = await e2.engine.intend({ job: j2, action: 'approve', ref: 'p1', because: 'approved on GitHub by the reviewer' }, H);
+  assert.equal(r2.status, 'hold');
 });

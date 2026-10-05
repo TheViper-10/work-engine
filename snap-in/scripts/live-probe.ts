@@ -21,7 +21,6 @@ const WAKE_WORKFLOW = 'don:integration:dvrv-us-1:devo/1lKlCUXYGG:workflow/58';
 const OWNER_DON = 'don:identity:dvrv-us-1:devo/1lKlCUXYGG:devu/1';
 const NON_HOME_SESSION = `${ORG}:ai_agent_session/474`;
 const NON_HOME_DM = `${ORG}:dm/nHH9Wn2Z`;
-const THREAD = 'C0C4K4EGZT6:0000000005.000005';
 const WORKFLOW = 'desktop-release';
 const TARGET = '0.0.1'; // version-shaped (R52 target rule); never a real release
 const PREFIX = 'work-engine:probe:';
@@ -41,6 +40,11 @@ let githubToken = process.env.GITHUB_TOKEN || '';
 if (!githubToken) { try { githubToken = execFileSync('gh', ['auth', 'token'], { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim(); } catch { /* reported below */ } }
 const missing = [['AGENTCORE_RUNTIME_INSTANCE_ORG_TOKEN', devrevToken], ['TONY_SLACK_BOT_TOKEN', slackToken], ['GITHUB_TOKEN', githubToken]].filter(([, v]) => !v).map(([n]) => n);
 if (missing.length) { console.error(`missing credentials: ${missing.join(', ')}`); process.exit(2); }
+
+// R61: job_open verifies the thread exists, so the probe links a REAL thread: the newest message of the allowlisted channel (read only, nothing is posted).
+const histTop = await fetch('https://slack.com/api/conversations.history?channel=C0C4K4EGZT6&limit=1', { headers: { Authorization: `Bearer ${slackToken}` } }).then((r) => r.json()).catch(() => ({})) as any;
+const THREAD = `C0C4K4EGZT6:${String(histTop?.messages?.[0]?.thread_ts ?? histTop?.messages?.[0]?.ts ?? '')}`;
+if (!/^C0C4K4EGZT6:\d+\.\d+$/.test(THREAD)) { console.error('cannot read a real thread from C0C4K4EGZT6 (conversations.history)'); process.exit(2); }
 
 // One event carries the local tokens in every slot the real adapters read: caller, service and owner are all devu/1 here.
 const event = {
@@ -193,6 +197,28 @@ async function journey(): Promise<void> {
   const branchHead = await gh.currentBuild({ id: job, workflow: WORKFLOW, target: TARGET }, 'approve-desktop-qa-latest');
   record('i', 'slack conversations.replies + github contents/pulls/commits (read only)', slackOk && !!served && !!branchHead,
     `${slackNote}; contents=${served ? `ok keys=${Object.keys(served).join(',')}` : 'null'}; pulls=${prHead ?? 'none open (null is a valid answer)'}; commits=${branchHead ?? 'null'} ${Date.now() - t}ms`);
+
+  // (j) R61-R63 live-dependent reads, read only. threadExists on a real thread and a fabricated ts, authorOf, and the pulls/<n> read for a known PR.
+  t = Date.now();
+  const fabricated = 'C0C4K4EGZT6:1759651539.000000';
+  let jOk = false; let jNote = 'no live ts (history unreadable)';
+  if (liveTs) {
+    const real = `C0C4K4EGZT6:${liveTs}`;
+    const exists = await slackReader.threadExists(real).catch((e) => `error ${(e as Error).message.slice(0, 60)}`);
+    const fake = await slackReader.threadExists(fabricated).catch((e) => `error ${(e as Error).message.slice(0, 60)}`);
+    const author = await slackReader.authorOf(real).catch((e) => `error ${(e as Error).message.slice(0, 60)}`);
+    jOk = exists === real && fake === false && typeof author === 'string' && /^[UW][A-Z0-9]+$/.test(author);
+    jNote = `threadExists(real)=${exists === real ? 'same thread' : String(exists)} threadExists(fabricated)=${String(fake)} authorOf(root)=${typeof author === 'string' && /^[UW]/.test(author) ? 'user id' : String(author)}`;
+  }
+  const prNumber = process.env.PROBE_PR || '58061';
+  let prNote: string; let prOk = false;
+  try {
+    const pr = await httpDeps.github(event).get(`/repos/${inputs.github_repo}/pulls/${prNumber}`) as any;
+    const settled = await gh.operationOutcome('github_pr_merged', prNumber);
+    prOk = typeof pr?.merged === 'boolean' && typeof pr?.base?.ref === 'string';
+    prNote = `pulls/${prNumber} merged=${pr?.merged} base=${pr?.base?.ref}; operationOutcome=${settled ?? 'null'} (done only for a merged PR into ${inputs.mock_branch})`;
+  } catch (e) { prNote = `pulls/${prNumber} failed (${(e as Error).message.slice(0, 80)})`; }
+  record('j', 'threadExists, authorOf and pulls/<n> (read only)', jOk && prOk, `${jNote}; ${prNote} ${Date.now() - t}ms`);
 }
 
 async function cleanup(): Promise<void> {

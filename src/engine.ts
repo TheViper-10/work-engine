@@ -1171,7 +1171,11 @@ export class Engine {
       if (!(a.because && (await this.get<EventRecord>('event', a.because)))) {
         const go = await this.listedGo(job, ask, act.gate, spec);
         if (go) { goNote = `${a.because ? `"${a.because}" is not an event id, so` : 'No reason was given, so'} the go from ${go.sender ?? 'a listed responder'} (${go.event}) was recorded as the reason. Pass the event id (or its #n) from job_view as because next time.`; a = { ...a, because: go.event }; }
-        else if (a.because && !findings.some((f) => f.check === 'no_go_for_build')) findings.push({ check: 'no_go_for_build', detail: `because "${a.because}" is not an event of this job, and no go from a listed responder is on record for ${act.gate}; the authorization could not be tied to a go event`, next: `Pass the id (or #n) of the go event shown in job_view as because. If nobody listed has said go yet, wait for the go, then call intend again.` });
+        else if (a.because && live && live.build === 'unknown') {
+          // The ask names no build (a review the engine cannot read, such as a GitHub approval): no go event can be tied to it, so a reason given in
+          // words is kept as the operation's note, exactly as if none were given (that path clears on the ask). Gates that name a build stay strict.
+          extraFlags.push(`reason_in_words: "${a.because.slice(0, 120)}" is not an event; the ${act.gate} ask names no build, so no go event could be tied to it`);
+        } else if (a.because && !findings.some((f) => f.check === 'no_go_for_build')) findings.push({ check: 'no_go_for_build', detail: `because "${a.because}" is not an event of this job, and no go from a listed responder is on record for ${act.gate}; the authorization could not be tied to a go event`, next: `Pass the id (or #n) of the go event shown in job_view as because. If nobody listed has said go yet, wait for the go, then call intend again.` });
       }
       if (a.because) {
         const ev = await this.get<EventRecord>('event', a.because);
