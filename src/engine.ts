@@ -1132,6 +1132,7 @@ export class Engine {
       return ans(true, 'unknown_action', `unknown action ${a.action}; this job's actions are: ${ids.join(', ')}. Nothing was recorded as in flight and no lease was taken. Call intend again with one of those ids.`, { job: job.id, unknown_actions: [a.action], actions: ids });
     }
     const extraFlags: string[] = [];
+    let goNote = '';
 
     const findings: Array<{ check: CheckName; detail: string; next: string }> = [];
     if (ctx.session_id && rel === 'other') {
@@ -1164,6 +1165,13 @@ export class Engine {
           const who = gr ? uniq([...gr.primary, ...(gr.stand_ins ?? [])]).join(', ') : 'the gate responders';
           findings.push({ check: 'no_go_for_build', detail: `no go recorded for build ${fresh} on ${act.gate}; ask ${who} for build ${fresh}`, next: `Claim and post the ask for ${act.gate} naming build ${fresh} (call say for the milestone that asks), wait for the go, then call intend again.` });
         }
+      }
+      // R62: the reason for a consequential action is the event that authorized it. Free text is resolved against the listed go
+      // (the newest approval item from a listed responder after the ask), else it is refused as "no go on record".
+      if (!(a.because && (await this.get<EventRecord>('event', a.because)))) {
+        const go = await this.listedGo(job, ask, act.gate, spec);
+        if (go) { goNote = `${a.because ? `"${a.because}" is not an event id, so` : 'No reason was given, so'} the go from ${go.sender ?? 'a listed responder'} (${go.event}) was recorded as the reason. Pass the event id (or its #n) from job_view as because next time.`; a = { ...a, because: go.event }; }
+        else if (a.because && !findings.some((f) => f.check === 'no_go_for_build')) findings.push({ check: 'no_go_for_build', detail: `because "${a.because}" is not an event of this job, and no go from a listed responder is on record for ${act.gate}; the authorization could not be tied to a go event`, next: `Pass the id (or #n) of the go event shown in job_view as because. If nobody listed has said go yet, wait for the go, then call intend again.` });
       }
       if (a.because) {
         const ev = await this.get<EventRecord>('event', a.because);
@@ -1266,14 +1274,17 @@ export class Engine {
       await this.moveToWinding(job);
       await this.schedule(job.id, job.next_wake_at);
     }
+    let goEvent: string | null = null;
     if (act?.gate) {
-      const askKey = job.latest_ask[act.gate];
-      const ask = askKey ? await this.get<Ask>('ask', askKey) : null;
-      if (ask && ask.state === 'open') {
+      // R62: the approval answers every open ask of the gate (not only the latest), and records the go event that authorized it.
+      const ev = a.because ? await this.get<EventRecord>('event', a.because) : null;
+      goEvent = ev ? ev.id : null;
+      for (const ask of await this.manyPresent<Ask>('ask', job.ask_keys)) {
+        if (ask.gate !== act.gate || ask.state !== 'open') continue;
         ask.state = 'answered';
         ask.answered_at = this.now();
-        const ev = a.because ? await this.get<EventRecord>('event', a.because) : null;
         ask.answered_by = ev?.sender_id ?? null;
+        ask.answered_event = goEvent;
         await this.save('ask', ask.key, ask);
       }
     }
@@ -1282,8 +1293,16 @@ export class Engine {
     await this.saveJob(job);
     await this.schedule(job.id, op.intent_at + this.unknownMs(spec));
     return ans(true, 'clear',
-      `Clear: ${a.action} on ${a.ref} is recorded as in flight${op.lease_taken ? ` and the ${act?.resource} lease is yours` : ''}.${flags.length ? ` Flagged (not blocking): ${flags.join('; ')}.` : ''} Report the outcome with checkpoint.`,
-      { job: job.id, operation: op, flags, holds: [] });
+      `Clear: ${a.action} on ${a.ref} is recorded as in flight${op.lease_taken ? ` and the ${act?.resource} lease is yours` : ''}.${flags.length ? ` Flagged (not blocking): ${flags.join('; ')}.` : ''}${goNote ? ` ${goNote}` : ''} Report the outcome with checkpoint.`,
+      { job: job.id, operation: op, flags, holds: [], go_event: goEvent, because_resolved_by_engine: !!goNote });
+  }
+
+  /** R62: the newest approval item from a listed responder of the gate, received after the gate's latest ask opened. Null when there is none. */
+  private async listedGo(job: Job, ask: Ask | null, gate: string, spec: Spec | undefined): Promise<InboxItem | null> {
+    const ok = ask ? ask.responder_slack : this.gateSlack(spec, gate);
+    const since = ask ? ask.opened_at : 0;
+    const items = (await this.inboxItems(job)).filter((i) => i.kind === 'approval' && !i.private && !!i.sender && ok.includes(i.sender) && i.received_at >= since);
+    return items.length ? items[items.length - 1] : null;
   }
 
   private gateSlack(spec: Spec | undefined, gate: string): string[] {
@@ -1776,8 +1795,10 @@ export class Engine {
       const open = await this.get<IdList>('open_jobs', 'all');
       const list = await this.manyPresent<Job>('job', (open?.ids ?? []).slice(0, MAX_BATCH));
       const line = list.length ? `Open jobs: ${list.map((j) => `${j.id} (${j.status}, ${j.reported_status})`).join('; ')}.` : 'There are no open jobs.';
-      return ans(true, 'no_job_here', `No job is linked to this thread. ${line} Judge which one fits (or ask), then call job_open with intent join.`, { jobs: [], open_jobs: list.map((j) => j.id) });
+      const who = await this.askedBy(ctx);
+      return ans(true, 'no_job_here', `${who ? who.text + '\n' : ''}No job is linked to this thread. ${line} Judge which one fits (or ask), then call job_open with intent join.`, { jobs: [], open_jobs: list.map((j) => j.id), ...(who ? { asked_by: who.data } : {}) });
     }
+    const asked = await this.askedBy(ctx);
     const views = [];
     const texts = [];
     for (const job of jobs) {
@@ -1805,7 +1826,24 @@ export class Engine {
       texts.push(v.text);
     }
     const head = jobs.length > 1 ? `This thread is linked to ${jobs.length} jobs; you judge which one a message is about.\n` : '';
-    return ans(true, 'view', head + texts.join('\n\n'), { jobs: views });
+    return ans(true, 'view', head + (asked ? asked.text + '\n' : '') + texts.join('\n\n'), { jobs: views, ...(asked ? { asked_by: asked.data } : {}) });
+  }
+
+  /**
+   * R62: who asked, as evidence. A session that lives in a Slack conversation (a mention) is asked by the Slack author of the message that
+   * mentioned the agent, read from Slack; the DevRev comment that carries the request is written by the connector, so its author is not it.
+   */
+  private async askedBy(ctx: Ctx): Promise<{ text: string; data: { user: string; thread: string } } | null> {
+    if (!ctx.session_id || !this.directory.threadOf || !this.slackReader.authorOf) return null;
+    try {
+      const r = await this.directory.threadOf(ctx.session_id);
+      if (!('thread' in r)) return null;
+      const thread = normalizeThread(r.thread);
+      if (!thread) return null;
+      const user = (await this.slackReader.authorOf(thread, r.prompt_ts)) ?? null;
+      if (!user) return null;
+      return { data: { user, thread }, text: `Asked by: <@${user}> (${user}), the Slack author of the message that mentioned you in ${thread}. Address that person; the author shown on the DevRev comment is not the requester.` };
+    } catch { return null; }
   }
 
   private async buildView(job: Job, viewerThread: string | null, workRunOverride?: 'you' | 'other' | 'none', _homeSession?: string): Promise<{ text: string; data: Record<string, unknown>; shown: string[] }> {
@@ -1836,6 +1874,7 @@ export class Engine {
     const owed = dels.filter((d) => d.state === 'owed').map((d) => ({ milestone: d.milestone, thread: d.thread }));
     const claimed = dels.filter((d) => d.state === 'claimed').map((d) => ({ milestone: d.milestone, thread: d.thread, age: fmtAge(now - (d.claimed_at ?? now)) }));
     const sent = dels.filter((d) => d.state === 'sent').map((d) => ({ milestone: d.milestone, thread: d.thread, link: d.message_link }));
+    const answeredAsks = asks.filter((x) => x.state === 'answered').map((x) => ({ gate: x.gate, build: x.build, answered_by: x.answered_by, answered_event: x.answered_event ?? null }));
     const openAsks = asks.filter((x) => x.state === 'open').map((x) => ({ gate: x.gate, build: x.build, responders: x.responders, thread: x.thread }));
     const workRun = workRunOverride ?? (runBusy ? 'other' : 'none');
 
@@ -1891,7 +1930,7 @@ export class Engine {
         job: job.id, workflow: job.workflow, target: job.target, status: job.status, reported_status: job.reported_status,
         waiting_for: job.waiting_for, next_wake_at: job.next_wake_at, work_run: workRun, work_run_busy: runBusy,
         threads: job.threads.map((t) => ({ thread: t, role: job.roles[t], private: job.private_threads.includes(t), channel: this.postTo(t).channel, thread_ts: this.postTo(t).thread_ts })),
-        milestones: job.milestones, spec_milestones: msView, events: evView, open_asks: openAsks, operations: opsView,
+        milestones: job.milestones, spec_milestones: msView, events: evView, open_asks: openAsks, answered_asks: answeredAsks, operations: opsView,
         owed, claims: claimed, sent, promises: proms.map((p) => ({ milestone: p.milestone, thread: p.thread, state: p.state, fallback_at: p.fallback_at })),
         flags: flags.map((f) => ({ check: f.check, mode: f.mode, detail: f.detail, call: f.call })),
         inbox: inboxView, inbox_unprocessed: open.length, late: lateItems.map((i) => ({ sender: i.sender, thread: i.thread })),
@@ -2153,6 +2192,23 @@ export class Engine {
     // operations past the timeout become unknown
     const ops = await this.manyPresent<Operation>('operation', job.op_keys);
     for (const o of ops) {
+      // R63: an action the source can prove is settled from the source, also when it already went unknown (a merge nobody reported).
+      if ((o.outcome === 'in_flight' || o.outcome === 'unknown') && this.sourceReader.operationOutcome) {
+        const proved = spec?.actions?.[o.action]?.proved_by;
+        const due0 = o.intent_at + this.unknownMs(spec);
+        if (proved && (o.outcome === 'unknown' || due0 <= now)) {
+          let r: 'done' | null = null;
+          try { r = await this.sourceReader.operationOutcome(proved, o.ref); } catch { r = null; }
+          if (r === 'done') {
+            o.outcome = 'done'; o.outcome_at = now; o.source = 'webhook_verified';
+            o.note = o.note || 'read back from the source by the engine';
+            await this.releaseLease(o);
+            await this.save('operation', o.key, o);
+            reasons.push(`operation ${o.action} ${o.ref} was read back from its source as done`);
+            continue;
+          }
+        }
+      }
       if (o.outcome !== 'in_flight') continue;
       const due = o.intent_at + this.unknownMs(spec);
       if (due <= now) {

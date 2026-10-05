@@ -38,6 +38,8 @@ interface Trigger {
   text: string;
   at: number;
   dm?: string;
+  /** Slack ts of the message that mentioned Tony. */
+  ts?: string;
 }
 
 const isoAt = (tMin: number) => new Date(EPOCH_MS + tMin * 60000).toISOString();
@@ -130,7 +132,7 @@ export class Driver {
     if (r.type === 'slack_message' || r.type === 'bot_post') {
       const p = this.sc.people?.[r.sender] ?? {};
       const senderId = ev?.sender ?? p.slack ?? r.sender;
-      this.world.addMessage(r.thread, { user: senderId, name: p.name ?? r.sender, text: r.text, ts: r.slack_ts, bot: r.type === 'bot_post', tMin: this.now });
+      this.lastMsgTs = this.world.addMessage(r.thread, { user: senderId, name: p.name ?? r.sender, text: r.text, ts: r.slack_ts, bot: r.type === 'bot_post', tMin: this.now });
       this.world.noteHumanMessage(r.thread, r.sender, r.text, this.now);
       desc.push(`${r.sender} in ${r.thread}: ${String(r.text).slice(0, 60)}`);
     } else if (r.type === 'timer') {
@@ -162,6 +164,7 @@ export class Driver {
         sender: r.sender,
         text: r.text,
         at: this.now,
+        ts: this.lastMsgTs,
       });
     }
     this.updatePredicates();
@@ -202,7 +205,7 @@ export class Driver {
           ? `[${isoAt(this.now)}] Slack message in thread ${tr.thread} from ${sender?.name ?? tr.sender} (<@${sender?.slack ?? tr.sender}>) mentioning you:\n\n${tr.text}`
           : `[${isoAt(this.now)}] The work engine woke you in ${tr.dm ?? 'the job DM'}:\n\n${tr.text}`;
       const dm = tr.kind === 'wake' ? tr.dm ?? 'dm:unknown' : dmId ?? `mention:${tr.thread}:${mentionSeq}`;
-      this.o.binding.registerSession?.(id, dm, tr.kind === 'mention' && this.sc.faithful ? tr.thread : undefined);
+      this.o.binding.registerSession?.(id, dm, tr.kind === 'mention' && this.sc.faithful ? tr.thread : undefined, tr.kind === 'mention' ? tr.ts : undefined);
       const rec: SessionRecord = {
         id,
         dm,
@@ -230,6 +233,7 @@ export class Driver {
    * not a Slack thread id. What the platform shows besides the body is not known, so the header below shows the comment author, DM id and
    * external_ref, which is the least the model can rely on.
    */
+  private lastMsgTs: string | undefined;
   private connectorComment(tr: Trigger, dm: string, canonThread: string | undefined): string {
     const author = this.sc.connector_user ?? { id: 'devu/2', name: 'Rashmi' };
     const th = this.world.data.slack.threads[tr.thread ?? ''];

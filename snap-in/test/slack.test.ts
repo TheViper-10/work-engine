@@ -159,3 +159,14 @@ test('R61 SlackReader.threadExists: a real thread gives its root, a reply gives 
   f.slackRules.push({ times: 1, status: 'timeout' } as any);
   assert.equal(await reader.threadExists(`${ALLOWED}:${root}`), null);
 });
+
+test('R62: authorOf returns the Slack author of the thread root or of a given message, null when unknown', async () => {
+  const f = new FakePlatform();
+  const root = f.postSlack(ALLOWED, null, { user: HARRY, text: 'release?' });
+  const reply = f.postSlack(ALLOWED, root, { user: OWNER_SLACK, text: 'hi' });
+  const r = new PlatformSlackReader({ api: f.deps().slack(f.timerEvent()), allow: [ALLOWED], ownBotUserId: OWN_BOT });
+  assert.equal(await r.authorOf(`${ALLOWED}:${root}`), HARRY);
+  assert.equal(await r.authorOf(`${ALLOWED}:${root}`, reply), OWNER_SLACK);
+  assert.equal(await r.authorOf(`${ALLOWED}:${root}`, '1.1'), null);
+  assert.equal(await r.authorOf('not-a-thread'), null);
+});

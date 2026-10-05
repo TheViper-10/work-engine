@@ -15,9 +15,9 @@ Each job has one home: an engine-owned DM. Only the session in the home acts. Ot
 
 | Call | Use it to | What its answer means to you |
 |---|---|---|
-| `job_view` | read the briefing: commitments, open asks, actions in flight, who is owed, the inbox | Read-only; reading never consumes inbox items. Start here. |
+| `job_view` | read the briefing: commitments, open asks, actions in flight, who is owed, the inbox | Read-only; reading never consumes inbox items. Start here. In a Slack conversation it also says who asked (`asked_by`, the Slack author); that is the only source for naming the requester. |
 | `job_open` | start a job, link a thread to one, or replace or queue the home | Says whether the job already existed. Linking a thread never makes it the actor. |
-| `intend` | declare a merge, gate approval or publish before you do it | `clear` (maybe with flags to weigh) or `hold` (do not do it; the reason says what to do instead). Same job, action and ref is the same operation. |
+| `intend` | declare a merge, gate approval or publish before you do it | `clear` (maybe with flags to weigh) or `hold` (do not do it; the reason says what to do instead). Same job, action and ref is the same operation. `because` is the id (or `#n`) of the go event from the briefing; a sentence is matched against the listed go, or held when there is none. The approval marks the ask answered by that event. |
 | `say` | claim a message before you post it yourself | `go`: post it now. `busy`: someone is posting in that thread; do not post. `already_sent`: it was posted. `already_claimed`: read the thread and post only if absent. Pass the post link to confirm a post the engine has not seen. |
 | `promise_add` | record "tell me when" for a milestone | The engine wakes the home at the fallback time if the milestone has not been told. |
 | `checkpoint` | commit status, milestones you saw, action outcomes, when to look again, and `processed: [...]` inbox items | Outcomes: done (proof read), failed (read that it did not happen), unknown (cannot tell). If anything is still owed, the job stays open and the answer says what. |

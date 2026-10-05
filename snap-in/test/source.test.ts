@@ -95,3 +95,21 @@ test('F7 end to end: say on the operation path names the build from the tick sna
   assert.doesNotMatch(s.say_to_tony, /unknown/);
   void OWN_BOT;
 });
+
+test('R63: operationOutcome is done only for a merged PR into the mock base; everything else is null', async () => {
+  const f = new FakePlatform();
+  f.prs = [
+    { number: 7, merged: true, head: { sha: 'abcdef0123456789' }, base: { ref: BRANCH } } as any,
+    { number: 8, merged: false, head: { sha: 'abcdef0123456789' }, base: { ref: BRANCH } } as any,
+    { number: 9, merged: true, head: { sha: 'abcdef0123456789' }, base: { ref: 'main' } } as any,
+  ];
+  const r = readerFor(f);
+  assert.equal(await r.operationOutcome('github_pr_merged', '7'), 'done');
+  assert.equal(await r.operationOutcome('github_pr_merged', '8'), null, 'open: never a failure');
+  assert.equal(await r.operationOutcome('github_pr_merged', '9'), null, 'merged into another base');
+  assert.equal(await r.operationOutcome('github_pr_merged', '404'), null, 'unknown PR');
+  assert.equal(await r.operationOutcome('circleci_gate_approved', '7'), null, 'kinds it does not know');
+  assert.equal(await r.operationOutcome('github_pr_merged', 'pipe-1'), null, 'not a PR number');
+  f.failGithub();
+  assert.equal(await r.operationOutcome('github_pr_merged', '7'), null);
+});

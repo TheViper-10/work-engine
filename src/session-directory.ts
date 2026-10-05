@@ -32,7 +32,7 @@ export class FakeSessionDirectory implements SessionDirectory {
   async threadOf(sessionId: string): Promise<ThreadLookup> {
     if (this.failAll || this.failing.has(sessionId)) return { error: 'session lookup failed' };
     const f = this.fields.get(this.dms.get(sessionId) ?? '');
-    return f ? { thread: `${f.slack_channel}:${f.slack_thread_ts}` } : { error: 'this conversation carries no Slack channel and thread' };
+    return f ? { thread: `${f.slack_channel}:${f.slack_thread_ts}`, prompt_ts: f.prompt_ts } : { error: 'this conversation carries no Slack channel and thread' };
   }
   /** Make lookups for one session (or every session with '*') fail until cleared. */
   fail(sessionId: string, on = true): void {

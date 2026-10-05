@@ -69,6 +69,26 @@ const ACTION_TOOLS: Record<string, (c: OwnCall, ref: string) => boolean> = {
   complete_release_issue: (c) => c.name === 'devrev_issue_complete',
 };
 
+/**
+ * Voice (R62): what a person reads in Slack. No engine words, no markdown bold, no checkmarks, no tracker issue ids, and none of the names the
+ * scenario bans (people who are not the requester). Returns one reason per rule broken.
+ */
+export function voiceViolations(text: string, banned: readonly string[] = []): string[] {
+  const out: string[] = [];
+  const ENGINE = /\b(job_open|job_view|checkpoint|milestone|inbox|work engine|the engine|job home|home dm|work run|promise_add|bump_pr_open|pr_approved|qa_go_requested|signoff_requested|prod_alpha_approved|intend|briefing|in-flight|in flight|home)\b/i;
+  const m = ENGINE.exec(text);
+  if (m) out.push(`engine word "${m[1]}"`);
+  if (/\*\*[^*]+\*\*/.test(text)) out.push('markdown bold');
+  if (/[\u2705\u2714\u2611]|:white_check_mark:|:heavy_check_mark:|:ballot_box_with_check:/.test(text)) out.push('checkmark');
+  const iss = /\b[A-Z]{2,5}-\d{1,6}\b/.exec(text);
+  if (iss) out.push(`issue id ${iss[0]}`);
+  for (const n of banned) if (new RegExp(`\\b${n}\\b`, 'i').test(text)) out.push(`addresses ${n}, who is not the requester`);
+  return out;
+}
+
+/** Actions whose approval is a human's go, with the gate each one answers. */
+const GO_GATES: Record<string, string> = { approve_qa_gate: 'approve-desktop-qa-latest', publish_prod_alpha: 'approve-desktop-prod-alpha' };
+
 const INTEND_CHECKS = new Set(['superseded_run', 'job_cancelled', 'lease_held', 'build_changed', 'no_go_for_build', 'sender_not_listed']);
 /** Engine flags that are not intend checks: counted from the engine's final flag records, not from an intend answer. */
 const SESSION_FLAGS = new Set(['missing_session', 'unclaimed_post', 'not_work_run', 'unthreaded_post']);
@@ -242,6 +262,14 @@ export function score(run: RunResult, sc: any): Score {
     noMilestone.includes(p.thread) ||
     (!!expEnd.deliveries?.[p.milestone!] && !expEnd.deliveries[p.milestone!].includes(p.thread) && !(p.milestone === 'qa_go_requested' || p.milestone === 'signoff_requested'))
   ));
+  // Authorization (R62): the reason for a consequential action is the go event itself, and the approval answers its ask.
+  const approved = calls.filter((c) => c.name === 'intend' && GO_GATES[String(c.input?.action)] && ['clear', 'already_recorded'].includes(String(c.output?.status)));
+  const becauseBad = approved.filter((c) => c.output?.status === 'clear' && (!c.input?.because || c.output?.because_resolved_by_engine === true || !c.output?.go_event));
+  const answered: any[] = snap?.jobs?.flatMap((j: any) => j.answered_asks ?? []) ?? [];
+  const stillOpen: any[] = snap?.jobs?.flatMap((j: any) => j.open_asks ?? []) ?? [];
+  const asksBad = snap ? [...new Set(approved.map((c) => GO_GATES[String(c.input.action)]!))].filter((g) => !answered.some((x) => x.gate === g && x.answered_event) || stillOpen.some((x) => x.gate === g)) : [];
+  const voiceBad = expEnd.voice_banned ? run.posts.filter((p) => !p.dropped).flatMap((p) => voiceViolations(p.text, expEnd.voice_banned).map((v) => `post in ${p.thread || 'top level'} at t=${p.t.toFixed(0)}: ${v}`)) : [];
+  const unthreaded = expEnd.threaded_only ? run.posts.filter((p) => p.top_level || !p.thread) : [];
   const bars = {
     zero_protocol_refusals: protocol_refusals.length === 0,
     zero_false_findings: false_findings.length === 0,
@@ -255,6 +283,10 @@ export function score(run: RunResult, sc: any): Score {
     engine_invariants: invariant_violations.length === 0,
     one_action_owner: actionOwnerViolations.length === 0,
     no_top_level_posts: topLevel.length === 0,
+    because_is_go_event: becauseBad.length === 0,
+    asks_answered: asksBad.length === 0,
+    ...(expEnd.voice_banned ? { voice_banned: voiceBad.length === 0 } : {}),
+    ...(expEnd.threaded_only ? { threaded_only: unthreaded.length === 0 } : {}),
     posts_in_intended_thread: outsideAudience.length === 0,
     ...(expEnd.interruption_boundary ? { interruption_boundary: boundaryHolds(run, expEnd.interruption_boundary) } : {}),
   };
@@ -264,7 +296,7 @@ export function score(run: RunResult, sc: any): Score {
     pass: Object.values(bars).every(Boolean),
     bars,
     protocol_refusals,
-    thread_violations: [...topLevel.map((p) => `top-level post at t=${p.t}${p.requested_thread ? ` (asked for ${p.requested_thread})` : ''}: ${p.text.slice(0, 80)}`), ...outsideAudience.map((p) => `${p.milestone} posted in ${p.thread} at t=${p.t}, which is not its audience`)],
+    thread_violations: [...topLevel.map((p) => `top-level post at t=${p.t}${p.requested_thread ? ` (asked for ${p.requested_thread})` : ''}: ${p.text.slice(0, 80)}`), ...outsideAudience.map((p) => `${p.milestone} posted in ${p.thread} at t=${p.t}, which is not its audience`), ...becauseBad.map((c) => `intend ${c.input?.action} at seq ${c.seq}: because is not a go event id (${JSON.stringify(c.input?.because ?? null)})`), ...asksBad.map((g) => `the ask for ${g} was not marked answered by its go event`), ...voiceBad, ...unthreaded.map((p) => `post outside any thread at t=${p.t}`)],
     false_findings,
     unexpected_true_findings,
     unexpected_true_holds,

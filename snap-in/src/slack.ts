@@ -70,6 +70,19 @@ export class PlatformSlackReader implements SlackReader {
     return root ? `${t.channel}:${root}` : null;
   }
 
+  /** R62: the Slack user id of a message's author in a thread (the root when ts is absent). null when Slack cannot say. One conversations.replies read. */
+  async authorOf(thread: string, ts?: string): Promise<string | null> {
+    const t = parseThread(thread);
+    if (!t) return null;
+    assertAllowed(this.o.allow, t.channel);
+    try {
+      const res = await this.o.api.get('conversations.replies', { channel: t.channel, ts: t.ts, limit: 200 });
+      const msgs: any[] = res?.messages ?? [];
+      const m = msgs.find((x) => x.ts === (ts ?? t.ts));
+      return typeof m?.user === 'string' && m.user ? m.user : null;
+    } catch { return null; }
+  }
+
   /** R54: the thread a message belongs to, `<channel>:<thread ts>`. null when Slack cannot say (the engine then takes the link as reported). */
   async threadOfLink(link: string): Promise<string | null> {
     const t = parseThread(link);

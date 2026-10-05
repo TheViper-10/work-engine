@@ -55,7 +55,7 @@ export interface EngineBinding {
   /** Optional: final engine-side state for scoring (job status, milestones, deliveries). */
   snapshot?(): any | Promise<any>;
   /** Optional: tell the engine which DM a session lives in (its session directory). Called once when a session starts. */
-  registerSession?(sessionId: string, dm: string, thread?: string): void;
+  registerSession?(sessionId: string, dm: string, thread?: string, promptTs?: string): void;
   /** Optional: the job's current home DM, read without side effects (for the one_action_owner bar). */
   homeOf?(job: string): Promise<string | undefined>;
 }

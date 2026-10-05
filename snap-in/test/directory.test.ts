@@ -64,12 +64,12 @@ function callerDir(f: FakePlatform) {
 
 test('R51: threadOf reads the channel and thread ts from the connector DM custom fields', async () => {
   const f = new FakePlatform(); const m = f.newConnectorDm(CH, '1791149910.562169', '1791149910.562169');
-  assert.deepEqual(await callerDir(f).threadOf(m.session), { thread: `${CH}:1791149910.562169` });
+  assert.deepEqual(await callerDir(f).threadOf(m.session), { thread: `${CH}:1791149910.562169`, prompt_ts: '1791149910.562169' });
 });
 
 test('R51: a reply mention resolves to the thread root, not the prompt ts', async () => {
   const f = new FakePlatform(); const m = f.newConnectorDm(CH, '1791149910.562169', '1791150443.050169');
-  assert.deepEqual(await callerDir(f).threadOf(m.session), { thread: `${CH}:1791149910.562169` });
+  assert.deepEqual(await callerDir(f).threadOf(m.session), { thread: `${CH}:1791149910.562169`, prompt_ts: '1791150443.050169' });
 });
 
 test('R51: a DM without connector fields, a 403 on chats.get, and an unknown session are error results', async () => {
@@ -80,7 +80,7 @@ test('R51: a DM without connector fields, a 403 on chats.get, and an unknown ses
   f.inject('chats.get', { status: 403, type: 'forbidden' });
   const bad = await d.threadOf(m.session);
   assert.ok('error' in bad && /403/.test(bad.error));
-  assert.deepEqual(await d.threadOf(m.session), { thread: `${CH}:1791149910.562169` });
+  assert.deepEqual(await d.threadOf(m.session), { thread: `${CH}:1791149910.562169`, prompt_ts: '1791149910.562169' });
   assert.ok('error' in (await d.threadOf(`${ORG}:ai_agent_session/404`)));
 });
 

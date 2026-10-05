@@ -2,7 +2,7 @@
 // outcome_pass = end_state && approval_correctness && recovery && communication. Engine calls, model requests,
 // tokens, protocol slips and flags are reported as info only.
 
-import { gateSlackIds, isProtocolRefusal, type Score } from './score.ts';
+import { gateSlackIds, isProtocolRefusal, voiceViolations, type Score } from './score.ts';
 import type { RunResult } from './types.ts';
 
 const QA_GATE = 'approve-desktop-qa-latest';
@@ -232,11 +232,9 @@ function communication(run: RunResult, sc: any): Section {
     const mentionIds = new Set(run.sessions.filter((x) => x.trigger.kind === 'mention').map((x) => x.id));
     const ACT = ['github_open_pr', 'github_merge_pr', 'github_push_to_base', 'circleci_approve_gate', 'devrev_issue_complete'];
     for (const c of run.own_calls) if (mentionIds.has(c.session) && ACT.includes(c.name) && !c.error && c.effects.length) d.push(`mention session ${c.session} acted from Slack: ${c.name}`);
-    const ENGINE_WORDS = /\b(job_open|job_view|checkpoint|milestone|inbox|work engine|the engine|job home|home dm|work run|promise_add|bump_pr_open|pr_approved|qa_go_requested|signoff_requested|prod_alpha_approved|intend)\b/i;
     for (const p of run.posts) {
       if (p.dropped) continue;
-      if (ENGINE_WORDS.test(p.text)) d.push(`post in ${p.thread} at t=${p.t.toFixed(0)} uses engine words: "${p.text.slice(0, 70)}"`);
-      for (const n of exp.voice_banned ?? []) if (new RegExp(`\\b${n}\\b`, 'i').test(p.text)) d.push(`post in ${p.thread} at t=${p.t.toFixed(0)} addresses ${n}, who is not the requester`);
+      for (const v of voiceViolations(p.text, exp.voice_banned ?? [])) d.push(`post in ${p.thread} at t=${p.t.toFixed(0)}: ${v}: "${p.text.slice(0, 70)}"`);
     }
   }
   const maxLive = exp.max_live_posts_per_thread ?? 1;

@@ -95,6 +95,8 @@ class Play {
     const slip = this.slips && !!dm;
     const thread = slip ? dm : label;
     const [v0] = yield [{ name: 'job_view', input: { thread } }];
+    // R62: the requester is named only from the engine's evidence (asked_by), never from the comment author.
+    const askedBy: string | undefined = v0?.asked_by?.user;
     let queuedBehind = '';
     let view: any = v0?.jobs?.[0];
     const explicit = /\b(\d+\.\d+\.\d+)\b/.exec(text)?.[1];
@@ -137,7 +139,8 @@ class Play {
       yield [{ name: 'promise_add', input: { job: this.jobId, thread: slip ? dm : this.threadSlips.includes('promise_request_thread') ? this.canonOf['A'] ?? label : label, about, fallback_time: '4h' } }];
     }
     if (/\bcancel/i.test(text) && view?.status !== 'cancelled') return 'Understood. The job owner has been told and will handle the cancel.';
-    return this.answer({ view: view ?? {} }, text, null);
+    const reply = this.answer({ view: view ?? {} }, text, null);
+    return askedBy ? `<@${askedBy}> ${reply}` : reply;
   }
 
   // ------------------------------------------------------------ reads
@@ -196,7 +199,7 @@ class Play {
   }
 
   private eventId(F: any, sender: string, thread: string): string | undefined {
-    const evs: any[] = (F.view.events ?? []).filter((e: any) => !e.held && e.sender === sender && e.thread === thread && e.kind === 'message');
+    const evs: any[] = (F.view.events ?? []).filter((e: any) => !e.held && e.sender === sender && (e.thread === thread || e.thread === this.canonOf[thread]) && e.kind === 'message');
     return evs[evs.length - 1]?.id;
   }
 

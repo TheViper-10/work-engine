@@ -62,7 +62,8 @@ export class PlatformSessionDirectory implements SessionDirectory {
     const channel = typeof f[CF_SLACK_CHANNEL] === 'string' ? f[CF_SLACK_CHANNEL] : '';
     const ts = typeof f[CF_SLACK_THREAD_TS] === 'string' && f[CF_SLACK_THREAD_TS] ? f[CF_SLACK_THREAD_TS] : typeof f[CF_PROMPT_TS] === 'string' ? f[CF_PROMPT_TS] : '';
     if (!channel || !ts) return { error: 'this conversation carries no Slack channel and thread' };
-    return { thread: `${channel}:${ts}` };
+    const prompt = typeof f[CF_PROMPT_TS] === 'string' && f[CF_PROMPT_TS] ? f[CF_PROMPT_TS] : undefined;
+    return prompt ? { thread: `${channel}:${ts}`, prompt_ts: prompt } : { thread: `${channel}:${ts}` };
   }
 }
 

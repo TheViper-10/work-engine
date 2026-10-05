@@ -22,8 +22,8 @@ Proven = seen working live as that identity on that path. "offline" = exercised 
 | `chats.update` | owner | none | hide the home DM | yes (owner) | yes: `{id, type:"dm", display_state:"hidden"}` only; without `type` 400 invalid_field (S4c, probe) |
 | `workflows.trigger` | owner | none | wake workflow/58; its comment step runs as the triggering user | yes (owner) | yes: `{id, step_reference_key:"start", payload{value{dm_id, continuation_note, receipt_key}}}` (probe; S5a used the same workflow) |
 | `timeline-entries.list` | owner | none | wake read-back on the home DM; needs DM membership | yes (owner, DMs devu/1 is a member of) | yes: `{object, limit}` (probe) |
-| `conversations.replies` (Slack) | none | none | Slack keyring `tony_slack_token`, read only, allowlisted channels; not a DevRev identity | yes | yes: GET `channel, ts, limit` (probe, read only) |
-| `github GET` | none | none | keyring `github_read`, one repo, one branch; not a DevRev identity | yes | yes: `commits/<branch>`, `pulls?base&state`, `contents/<path>?ref` (probe) |
+| `conversations.replies` (Slack) | none | none | Slack keyring `tony_slack_token`, read only, allowlisted channels; not a DevRev identity | yes | yes: GET `channel, ts, limit` (probe, read only). R62 adds authorOf (same read, for job_view `asked_by`); like threadExists it works on the operation path only if that path carries the Slack keyring, otherwise `asked_by` is absent and nobody is named |
+| `github GET` | none | none | keyring `github_read`, one repo, one branch; not a DevRev identity | yes | yes: `commits/<branch>`, `pulls/<n>` (R63, merged state, timer path), `pulls?base&state`, `contents/<path>?ref` (probe) |
 
 Notes
 - Timer path = `runTick`; operation path = `runOperation` (`src/index.ts`). On the operation path the owner keyring is not delivered, so an owner call there fails before sending anything.

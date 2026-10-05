@@ -55,6 +55,12 @@ export interface Spec {
 export interface SourceReader {
   /** Fresh read of the outside system: which build a gate is about right now. */
   currentBuild(job: { id: string; workflow: string; target: string }, gate: string): Promise<string | null>;
+  /**
+   * R63: did an operation whose source can be read actually happen? `proved_by` is the spec's event kind for the action and `ref` the
+   * operation's ref. 'done' only when the source shows it happened; null for anything else (not readable, not happened yet, not a kind the
+   * reader knows). It never reports failure: a failed or unknown outcome stays with the home. Optional.
+   */
+  operationOutcome?(proved_by: string, ref: string): Promise<'done' | null>;
 }
 export interface SlackReader {
   /** `relay` marks a reply to a mention; it never satisfies a claim. */
@@ -66,6 +72,11 @@ export interface SlackReader {
    * message, null when it could not be told (then the engine takes the thread as given). Optional: without it threads are taken as given.
    */
   threadExists?(thread: string): Promise<string | false | null>;
+  /**
+   * R62: the Slack user id of the author of a message in a thread (the thread root when `ts` is absent). null when it could not be told.
+   * Evidence for who asked: a mention session's requester is this person, never the DevRev comment author the connector writes as.
+   */
+  authorOf?(thread: string, ts?: string): Promise<string | null>;
 }
 export interface Waker {
   /** May report `stale_version` when the home session is pinned to an old agent version (A3): the engine then replaces the home. */
@@ -82,7 +93,8 @@ export interface Waker {
 }
 
 export type SessionLookup = { dm: string } | { error: string };
-export type ThreadLookup = { thread: string } | { error: string };
+/** `prompt_ts` is the ts of the Slack message that mentioned the agent (the connector writes it on the DM), when the platform has it. */
+export type ThreadLookup = { thread: string; prompt_ts?: string } | { error: string };
 /** A1: which DM a session lives in. Looked up, never passed by the caller. Phase 3: the platform's session record. */
 export interface SessionDirectory {
   /** `job` is a hint for offline defaults that map a session to a job's home; a real directory ignores it. */
@@ -234,6 +246,8 @@ export interface Ask {
   opened_at: number;
   answered_at: number | null;
   answered_by: string | null;
+  /** R62: the go event the approval named as its reason. */
+  answered_event?: string | null;
 }
 
 export interface Promise_ {

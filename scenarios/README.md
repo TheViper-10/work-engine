@@ -60,7 +60,7 @@ Placeholders: `<pr>` and `<id>` are replaced by the scenario's PR number and pip
 | `twin-mention.json` | derived | v2.18 mention burst, bad run 2026-10-03 | two mentions and a twin wake during an active run |
 | `missed-bot-post.json` | derived | handoff 28 section 2 (posting option B) | Tony's live post not seen; sweep reconciles |
 | `interruption-boundary.json` | derived | job-home contract A1, A4; stale-go base | B asks for status while the home worker waits on A's go; B answered in B by a non-home session, run unchanged; the go reaches the inbox and is applied to build abc |
-| `run1-replay.json` | derived (faithful mentions) | live run 1 timeline (`30-work-engine-live-qa-release.md` section 3) | connector-shaped mentions (DM comment, external_ref), DM id as thread and `next` target (scripted slips), duplicate go, one job, no acting from Slack, plain voice without Rashmi |
+| `run1-replay.json` | derived (faithful mentions) | live run 1 timeline (`30-work-engine-live-qa-release.md` section 3) | connector-shaped mentions (DM comment, external_ref), DM id as thread and `next` target (scripted slips), duplicate go, one job, no acting from Slack, plain voice without the DevRev comment author's name |
 | `thread-continuity-run2.json` | derived | live run 2 (`31-work-engine-live-qa-release-run2.md` F1, F2, F3) | fabricated thread ts refused, promise naming the request thread kept to the calling thread, every post a thread reply |
 | `thread-continuity-variation.json` | derived | run 1 replay shape | status asked in B answered in B, "ping me when live" kept to B, private C told nothing, sign-off in the QA thread |
 | `queued-second-release.json` | derived | call-map moment 3 (`release_in_progress`) | 5.2.12 requested mid-run becomes a queued job |

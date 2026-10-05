@@ -26,6 +26,7 @@ export class GithubSourceReader implements SourceReader {
     const q = new URLSearchParams(query);
     if (route === 'commits') { if (q.get('sha') !== this.o.branch) throw new GithubSourceError('ref not allowed'); }
     else if (route.startsWith('commits/')) { if (route !== `commits/${this.o.branch}`) throw new GithubSourceError('ref not allowed'); }
+    else if (/^pulls\/\d+$/.test(route)) { /* one pull request by number; the base is checked on the answer */ }
     else if (route === 'pulls') { if (q.get('base') !== this.o.branch) throw new GithubSourceError('base not allowed'); }
     else if (route.startsWith('contents/')) { if (route !== `contents/${this.o.statePath}` || q.get('ref') !== this.o.branch) throw new GithubSourceError('contents not allowed'); }
     else throw new GithubSourceError('route not allowed');
@@ -46,6 +47,15 @@ export class GithubSourceReader implements SourceReader {
       const list = await this.get(`/repos/${this.o.repo}/commits?sha=${encodeURIComponent(this.o.branch)}&per_page=10`);
       const c = Array.isArray(list) ? list.find((x: any) => typeof x?.sha === 'string' && !/\[skip ci\]/i.test(String(x?.commit?.message ?? ''))) : null;
       return typeof c?.sha === 'string' ? c.sha.slice(0, 8) : null;
+    } catch { return null; }
+  }
+
+  /** R63: a merged PR into the release base branch is `done` for an action proved by `github_pr_merged`. Anything else is null (never a failure). */
+  async operationOutcome(proved_by: string, ref: string): Promise<'done' | null> {
+    if (proved_by !== 'github_pr_merged' || !/^\d+$/.test(ref)) return null;
+    try {
+      const pr = await this.get(`/repos/${this.o.repo}/pulls/${ref}`);
+      return pr?.merged === true && pr?.base?.ref === this.o.branch ? 'done' : null;
     } catch { return null; }
   }
 
@@ -74,6 +84,8 @@ export class SnapshotSourceReader implements SourceReader {
   constructor(private readonly o: { live: GithubSourceReader; store: Store; env: string; bot: string; now: () => number }) {}
   private key(): string { return makeKey(this.o.env, this.o.bot, 'source', 'builds'); }
   private async read(): Promise<BuildSnapshot | null> { return this.o.store.get<BuildSnapshot>(this.key()).catch(() => null); }
+
+  operationOutcome(proved_by: string, ref: string): Promise<'done' | null> { return this.o.live.operationOutcome(proved_by, ref); }
 
   async currentBuild(job: { id: string; workflow: string; target: string }, gate: string): Promise<string | null> {
     const live = await this.o.live.currentBuild(job, gate);

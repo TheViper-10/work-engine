@@ -375,6 +375,8 @@ export class FakePlatform {
         const rest = path.slice(base.length);
         if (rest.startsWith('commits?')) return this.branchCommits ?? [{ sha: this.branchHead, commit: { message: 'mock: publish' }, parents: [] }];
         if (rest.startsWith('commits/')) return { sha: this.branchHead };
+        const one = /^pulls\/(\d+)$/.exec(rest);
+        if (one) { const pr = this.prs.find((p) => String(p.number) === one[1]); if (!pr) throw new ApiError(404, 'Not Found', 'not_found'); return pr; }
         if (rest.startsWith('pulls')) return this.prs.filter((p) => path.includes(`base=${encodeURIComponent(p.base.ref)}`) && path.includes('state=open'));
         if (rest.startsWith('contents/')) return { encoding: 'base64', content: Buffer.from(JSON.stringify(this.stateFile)).toString('base64') };
         throw new ApiError(404, 'Not Found', 'not_found');

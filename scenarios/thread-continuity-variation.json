@@ -577,7 +577,7 @@
     },
     "max_jobs": 1,
     "voice_banned": [
-      "Rashmi"
+      "Anil"
     ],
     "threaded_only": true,
     "privacy": {
@@ -622,6 +622,6 @@
   "scripted_slips": true,
   "connector_user": {
     "id": "devu/2",
-    "name": "Rashmi"
+    "name": "Anil"
   }
 }

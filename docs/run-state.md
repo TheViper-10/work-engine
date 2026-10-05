@@ -49,5 +49,11 @@ Done when the job-home work engine is fully deployed to QA and a live Slack mock
 
 ## Thread continuity slice (2026-10-05, offline, R61)
 - Fixes F1, F2, F3, F8 of live run 2 in engine, snap-in reader, harness world/scorer and the general playbook. Not deployed; the next step is one real-model run each of run1-replay-shaped `thread-continuity-run2` and `thread-continuity-variation` (`--checks deploy`), then redeploy with a probe first.
-- Still open from run 2: F4 (`because` as go event id, ask answered on approval), F5 (sender classification), F7 (voice, requester identity), F9/F10 (grader), F6.
+- Still open from run 2 after R62/R63: F5 was fixed in c91d609; F9/F10 fixed in c91d609. Open: live proof of all of this (v7 deploy, probe, live run 3 on 5.2.13).
 
+
+## Authorization and identity slice (2026-10-05, offline, R62, R63)
+- Fixes F4 (because is the go event, ask answered on approval), F7 (requester identity from Slack evidence; general voice rule; scorer keys `voice_banned`, `threaded_only`, new bars `because_is_go_event`, `asks_answered`) and F6 (engine settles a merge from a GitHub read). Not deployed. Scripted scenarios pass; no real-model runs made in this slice.
+- Next: real-model smoke (run1-replay, interruption-boundary, thread-continuity-run2/variation, `--checks deploy`, 1 run each), then probe, v7, live run 3 (5.2.13). The snap-in has a new read (`pulls/<n>`) and a Slack read (authorOf); run the live probe before deploy.
+- Parked (owner approval needed): the slack-agent-connector could put the Slack author's display name in the comment body or in the DM custom fields. Not changed. Until then `asked_by` gives the Slack user id and the model addresses `<@id>` or reads the name from the thread.
+- Parked: the IDENTITY.md row for `pulls/<n>` (GitHub read, timer path) and `conversations.replies` for authorOf (operation path has no Slack credential: `asked_by` is shown only where the SlackReader can read, i.e. the tick path and the probe; on the operation path `job_view` runs with the caller token and no Slack keyring, so live `asked_by` may be absent). This needs a decision: give `job_view` the Slack keyring, or have the tick path write the author into the thread index. Unknown author means no name is used, which is safe.

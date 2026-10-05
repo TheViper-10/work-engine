@@ -47,7 +47,7 @@ export const SKILLS = {
       { name: 'job', type: T, required: true, description: 'Job id.' },
       { name: 'action', type: T, required: true, description: 'The action name.' },
       { name: 'ref', type: T, required: true, description: 'The reference the action works on, for example the PR or build.' },
-      { name: 'because', type: T, description: 'The event or inbox id of the go.' },
+      { name: 'because', type: T, description: 'The reason: the id of the go event (or its #n inbox id) that authorized this action, exactly as job_view shows it. Not a sentence.' },
     ],
   },
   say: {

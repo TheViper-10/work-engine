@@ -39,7 +39,7 @@ export const REAL_ENGINE_TOOLS: ToolSchema[] = [
   },
   {
     name: 'intend',
-    description: 'Say what you are about to do, before you do it. Actions: open_bump_pr, merge_pr, approve_qa_gate, verify_qa, publish_prod_alpha, verify_served, complete_release_issue. because is the event id (or #n inbox id) of the human go. Only the session in the job home can act; others get route.',
+    description: 'Say what you are about to do, before you do it. Actions: open_bump_pr, merge_pr, approve_qa_gate, verify_qa, publish_prod_alpha, verify_served, complete_release_issue. because is the event id (or #n inbox id) of the human go, exactly as job_view shows it; the reason for a consequential action is the event that authorized it, not a sentence. Only the session in the job home can act; others get route.',
     input_schema: {
       type: 'object',
       properties: { job: S, action: S, ref: S, because: S },
@@ -121,19 +121,29 @@ export class RealEngineBinding implements EngineBinding {
     this.directory = new FakeSessionDirectory();
     for (const [sid, dm] of this.registered) {
       const th = this.registeredThread.get(sid)?.split(':');
-      if (th && th.length === 2) this.directory.setConnectorDm(sid, dm, { channel: th[0], threadTs: th[1] }); else this.directory.set(sid, dm);
+      if (th && th.length === 2) this.directory.setConnectorDm(sid, dm, { channel: th[0], threadTs: th[1], promptTs: this.registeredPrompt.get(sid) }); else this.directory.set(sid, dm);
     }
     const checks = this.mode === 'deploy' ? { ...DEPLOY_CHECKS } : Object.fromEntries(['superseded_run', 'job_cancelled', 'lease_held', 'build_changed', 'no_go_for_build', 'sender_not_listed'].map((c) => [c, this.mode]));
     this.engine = new Engine({
       store: this.store,
       clock: this.clock,
-      sourceReader: { currentBuild: async (_job, gate) => this.currentBuild(gate) },
+      sourceReader: {
+        currentBuild: async (_job, gate) => this.currentBuild(gate),
+        // R63: a merged PR is readable from GitHub; nothing else is settled by the engine.
+        operationOutcome: async (proved_by, ref) => (proved_by === 'github_pr_merged' && this.world?.data.github.prs?.[ref]?.merged ? 'done' : null),
+      },
       slackReader: {
         findOwnPostAfter: async (thread, ts) => {
           const p = this.world?.findOwnPostAfter(thread, ts);
           return p ? { link: `slack:${this.world!.channel}:${p.ts}` } : null;
         },
         // Faithful scenarios: a thread exists when a message with its ts was posted; scenarios with labels cannot tell (null: taken as given).
+        // The Slack author of a message (the thread root when no ts): what the engine shows as the requester (R62).
+        authorOf: async (t: string, ts?: string) => {
+          const label = this.toLabel[t] ?? t;
+          const msgs: any[] = this.world?.data.slack.threads[label]?.messages ?? [];
+          return (ts ? msgs.find((m) => m.ts === ts) : msgs[0])?.user ?? null;
+        },
         threadExists: async (t: string) => (this.faithful ? this.world?.threadRoot(t) ?? null : null),
         threadOfLink: async (l: string) => {
           const ts = l.split(':').pop() ?? '';
@@ -163,11 +173,13 @@ export class RealEngineBinding implements EngineBinding {
     return x;
   }
 
-  registerSession(sessionId: string, dm: string, thread?: string): void {
+  private registeredPrompt = new Map<string, string>();
+  registerSession(sessionId: string, dm: string, thread?: string, promptTs?: string): void {
     this.registered.set(sessionId, dm);
+    if (promptTs) this.registeredPrompt.set(sessionId, promptTs);
     if (thread) this.registeredThread.set(sessionId, this.canon(thread)!);
     const th = thread ? this.canon(thread)!.split(':') : [];
-    if (this.faithful && th.length === 2) this.directory.setConnectorDm(sessionId, dm, { channel: th[0], threadTs: th[1] });
+    if (this.faithful && th.length === 2) this.directory.setConnectorDm(sessionId, dm, { channel: th[0], threadTs: th[1], promptTs });
     else this.directory.set(sessionId, dm);
   }
 
@@ -275,6 +287,7 @@ export class RealEngineBinding implements EngineBinding {
         milestone_sources: d.milestones,
         deliveries: { owed: d.owed, claimed: d.claims, sent: d.sent },
         flags: d.flags,
+        answered_asks: d.answered_asks,
         operations: d.operations,
         promises: d.promises,
         generation: d.generation,
