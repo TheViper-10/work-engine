@@ -28,7 +28,9 @@ import difflib
 import json
 import os
 import re
+import socket
 import sys
+import time
 from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -54,6 +56,26 @@ class NotFound(Exception):
 
 # ----------------------------------------------------------------------------- live access (lazy; tests inject fakes)
 
+RETRIES, BACKOFF_S = 3, 2.0
+_sleep = time.sleep  # tests replace this
+
+
+def retrying(fn, tries=RETRIES, backoff=BACKOFF_S):
+    """Run fn(); retry transport failures (URLError/timeouts/resets, HTTP 429 and 5xx) with linear backoff, so a QA or Slack blip does not crash the grader.
+    A 404 (NotFound) and other 4xx answers are real answers and are not retried."""
+    import urllib.error
+    for attempt in range(1, tries + 1):
+        try:
+            return fn()
+        except urllib.error.HTTPError as e:
+            if e.code != 429 and e.code < 500 or attempt == tries:
+                raise
+        except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError, OSError):
+            if attempt == tries:
+                raise
+        _sleep(backoff * attempt)
+
+
 class Api:
     """DevRev QA reads. `call(path, body)` returns parsed JSON and raises NotFound on 404."""
 
@@ -72,7 +94,7 @@ class Api:
         req = urllib.request.Request(f"{self.host}/{path}", data=json.dumps(body).encode(),
                                      headers={"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"})
         try:
-            return json.loads(urllib.request.urlopen(req, timeout=30).read().decode(), strict=False)
+            return retrying(lambda: json.loads(urllib.request.urlopen(req, timeout=30).read().decode(), strict=False))
         except urllib.error.HTTPError as e:
             if e.code == 404:
                 raise NotFound(path)
@@ -96,7 +118,7 @@ class Slack:
         import urllib.request
         req = urllib.request.Request(f"https://slack.com/api/{method}", data=urllib.parse.urlencode(params).encode(),
                                      headers={"Authorization": f"Bearer {self.token}"})
-        return json.loads(urllib.request.urlopen(req, timeout=30).read().decode(), strict=False)
+        return retrying(lambda: json.loads(urllib.request.urlopen(req, timeout=30).read().decode(), strict=False))
 
 
 # ----------------------------------------------------------------------------- engine rows
@@ -191,6 +213,17 @@ def load_engine(rows, job_id):
 
 
 # ----------------------------------------------------------------------------- slack
+
+def slack_ts(link):
+    """The Slack ts a delivery's message_link points at. Accepts the engine's https permalink (.../p1791165864074369 -> 1791165864.074369,
+    optionally with ?thread_ts=...), `slack:<channel>:<ts>` and `<channel>:<ts>`. '' when it is none of those."""
+    link = (link or "").strip()
+    m = re.search(r"/p(\d{10})(\d{6})(?:[?#/]|$)", link)
+    if m:
+        return f"{m.group(1)}.{m.group(2)}"
+    m = re.search(r"(?:^|:)(\d{10}\.\d{6})$", link)
+    return m.group(1) if m else ""
+
 
 def norm_thread(t):
     m = re.match(r"^(?:slack:)?(C[A-Z0-9]+):(\d+\.\d+)$", t or "")
@@ -451,7 +484,7 @@ def grade_communication(run, eng, msgs_by_ts, read_errors, tony, sp):
             bad.append(f"{tag} is {d.get('state')}, not sent")
             continue
         link = d.get("message_link") or ""
-        mts = link.split(":")[-1] if link else ""
+        mts = slack_ts(link)
         m = slack_all.get(mts)
         if not m:
             bad.append(f"{tag} credited to {link or 'no link'}, which is not in the Slack threads")

@@ -110,7 +110,10 @@ export class SlackPoller {
       let cursor = w.last_ts;
       for (const m of msgs) {
         const isOwn = m.user === this.o.ownBotUserId;
-        const other = !!m.bot_id && !isOwn;
+        // A post is a bot's only if Slack says so (bot_profile / bot_message subtype) or it has no user at all. A person's xoxp user-token post made through an app
+        // carries `user` plus bot_id/app_id but no bot_profile; that is still the person.
+        const isBotMsg = !!m.bot_profile || m.subtype === 'bot_message' || (!m.user && !!m.bot_id);
+        const other = isBotMsg && !isOwn;
         const r: any = await this.o.ingest({
           source: 'slack', delivery_id: `${w.channel}:${m.ts}`, kind: 'message', thread: `${w.channel}:${w.thread_ts}`,
           sender_id: m.user ?? m.bot_id, sender_kind: other ? 'other_bot' : 'human', ref: `slack:${w.channel}:${m.ts}`,

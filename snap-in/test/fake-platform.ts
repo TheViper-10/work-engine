@@ -38,7 +38,7 @@ export interface TimelineEntry { id: string; object: string; body: string; creat
 interface Rule { path: string; status?: number; type?: string; message?: string; timeout?: 'before' | 'after'; times: number; skip: number; match?: (b: any) => boolean }
 interface Session { id: string; parent: string; agent: string; user: string }
 interface Chat { id: string; display_state: string; members: string[]; users: string[]; type: string; custom_fields?: Record<string, string> }
-export interface SlackMsg { ts: string; user?: string; bot_id?: string; text: string; thread_ts: string; metadata?: { event_type: string } }
+export interface SlackMsg { ts: string; user?: string; bot_id?: string; app_id?: string; subtype?: string; bot_profile?: { id: string; name: string }; text: string; thread_ts: string; metadata?: { event_type: string } }
 interface Pr { number: number; head: { sha: string }; base: { ref: string } }
 
 export class FakePlatform {
@@ -147,13 +147,18 @@ export class FakePlatform {
   insertRaw(leaf: string, uk: string, value: unknown): void {
     this.insert(leaf, uk, { tnt__kind: uk.split(':')[3] ?? '', tnt__job_key: '', tnt__state: '', tnt__version: Number(uk.split('@v')[1] ?? 1), tnt__body: JSON.stringify(value) }, 'raw');
   }
-  postSlack(channel: string, thread_ts: string | null, o: { user?: string; bot_id?: string; text: string; metadata?: { event_type: string } }): string {
+  postSlack(channel: string, thread_ts: string | null, o: { user?: string; bot_id?: string; app_id?: string; subtype?: string; bot_profile?: { id: string; name: string }; text: string; metadata?: { event_type: string } }): string {
     const ts = (this.clock.now() / 1000 + (this.seq += 1) / 1e6).toFixed(6);
     const list = (this.slack[channel] ??= []);
-    list.push({ ts, user: o.user, bot_id: o.bot_id, text: o.text, thread_ts: thread_ts ?? ts, metadata: o.metadata });
+    list.push({ ts, user: o.user, bot_id: o.bot_id, app_id: o.app_id, subtype: o.subtype, bot_profile: o.bot_profile, text: o.text, thread_ts: thread_ts ?? ts, metadata: o.metadata });
     return ts;
   }
   /** Root message of a thread. */
+  /** A post made with a person's xoxp user token through an app: real Slack sets `user` plus `bot_id`/`app_id` but no `bot_profile` and no bot_message subtype. */
+  postSlackAsUserToken(channel: string, thread_ts: string | null, user: string, text: string, o: { bot_id?: string; app_id?: string } = {}): string {
+    return this.postSlack(channel, thread_ts, { user, text, bot_id: o.bot_id ?? 'B0USRTOK01', app_id: o.app_id ?? 'A0USRTOK01' });
+  }
+
   root(channel: string, user: string, text: string): string { return this.postSlack(channel, null, { user, text }); }
 
   // ---------------------------------------------------------------- devrev

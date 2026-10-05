@@ -43,7 +43,7 @@ test('a poll ingests human, Tony and other-bot posts with the right sender kinds
   const root = f.root(ALLOWED, OWNER_SLACK, 'request'); await poller.watch(`${ALLOWED}:${root}`, 'j');
   f.postSlack(ALLOWED, root, { user: OWNER_SLACK, text: 'go' });
   f.postSlack(ALLOWED, root, { user: OWN_BOT, bot_id: 'B1', text: 'posted' });
-  f.postSlack(ALLOWED, root, { user: HARRY, bot_id: 'B2', text: 'signoff' });
+  f.postSlack(ALLOWED, root, { user: HARRY, bot_id: 'B2', bot_profile: { id: 'B2', name: 'harry' }, text: 'signoff' });
   const r = await poller.poll();
   assert.equal(r.ingested, 3);
   assert.deepEqual(events.map((e) => [e.sender_id, e.sender_kind]), [[OWNER_SLACK, 'human'], [OWN_BOT, 'human'], [HARRY, 'other_bot']]);
@@ -51,6 +51,19 @@ test('a poll ingests human, Tony and other-bot posts with the right sender kinds
   assert.equal(typeof events[0].attrs!.ts, 'number');
   const again = await poller.poll();
   assert.equal(again.ingested, 0); assert.equal(events.length, 3);
+});
+
+test('an owner user-token post that carries bot_id/app_id is human; real bot messages stay other_bot', async () => {
+  const f = new FakePlatform(); const { poller, events } = pollerFor(f);
+  const root = f.root(ALLOWED, OWNER_SLACK, 'request'); await poller.watch(`${ALLOWED}:${root}`, 'j');
+  f.postSlackAsUserToken(ALLOWED, root, 'U042GEDM4BB', 'go');
+  f.postSlack(ALLOWED, root, { user: HARRY, bot_id: 'B2', bot_profile: { id: 'B2', name: 'harry' }, text: 'profile bot' });
+  f.postSlack(ALLOWED, root, { user: HARRY, bot_id: 'B3', subtype: 'bot_message', text: 'subtype bot' });
+  f.postSlack(ALLOWED, root, { bot_id: 'B4', subtype: 'bot_message', text: 'webhook, no user' });
+  f.postSlack(ALLOWED, root, { user: OWN_BOT, bot_id: 'B1', bot_profile: { id: 'B1', name: 'tony' }, text: 'own' });
+  const r = await poller.poll();
+  assert.equal(r.ingested, 5);
+  assert.deepEqual(events.map((e) => [e.sender_id, e.sender_kind]), [['U042GEDM4BB', 'human'], [HARRY, 'other_bot'], [HARRY, 'other_bot'], ['B4', 'other_bot'], [OWN_BOT, 'human']]);
 });
 
 test('the cursor does not advance past a failed ingest, so the message is retried', async () => {

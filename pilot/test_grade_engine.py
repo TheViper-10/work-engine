@@ -73,7 +73,13 @@ def ms(ts):
     return int(float(ts) * 1000)
 
 
-def build(dup=False, leak=False):
+def link_for(mts, permalink):
+    if permalink:  # the engine's stored form: https permalink, p + ts without the dot
+        return f"https://devrev.slack.com/archives/{g.CHANNEL}/p{mts.replace('.', '')}"
+    return f"slack:{g.CHANNEL}:{mts}"
+
+
+def build(dup=False, leak=False, permalink=False):
     """A complete good run. dup adds a second identical Tony post in thread A; leak puts C's evidence in B."""
     api = FakeApi()
     go_qa, go_prod = "1790000500.000200", "1790001000.000200"
@@ -110,7 +116,7 @@ def build(dup=False, leak=False):
     api.put("inbox", f"{JOB}:slack:{g.CHANNEL}:{C}x", [{"key": "i", "kind": "message", "event": f"slack:{g.CHANNEL}:{C}x", "sender": OWNER, "private": True, "text": SECRET, "state": "processed"}])
     for t, mts in ((A, live_a), (B, live_b), (QA, live_q)):
         api.put("delivery", f"{JOB}:{g.CHANNEL}:{t}:live", [{"key": "d", "thread": f"{g.CHANNEL}:{t}", "milestone": "live", "state": "claimed", "claimed_at": ms(mts) - 5000},
-                {"key": "d", "thread": f"{g.CHANNEL}:{t}", "milestone": "live", "state": "sent", "claimed_at": ms(mts) - 5000, "sent_count": 1, "message_link": f"slack:{g.CHANNEL}:{mts}"}])
+                {"key": "d", "thread": f"{g.CHANNEL}:{t}", "milestone": "live", "state": "sent", "claimed_at": ms(mts) - 5000, "sent_count": 1, "message_link": link_for(mts, permalink)}])
     api.put("promise", f"{JOB}:{g.CHANNEL}:{B}:live", [{"key": "p", "state": "fulfilled"}])
     threads = {
         A: [msg(A, OWNER, "release please"), msg("1790000050.000100", TONY, "Opened the bump PR, link.", relay=True),
@@ -165,6 +171,62 @@ class GradeEngineTest(unittest.TestCase):
             "Communication": "PASS", "Privacy": "PASS", "Autonomy": "PASS"}, text)
         self.assertIn("Verdict: all rows pass", text)
         self.assertIn("Slack Tony posts per thread", res["Communication"]["detail"])
+
+    def test_permalink_deliveries_are_found_in_the_threads(self):
+        api, slack = build(permalink=True)
+        res, text = self.grade(api, slack)
+        self.assertEqual(res["Communication"]["status"], "PASS", res["Communication"]["detail"])
+        self.assertNotIn("not in the Slack threads", res["Communication"]["detail"])
+
+    def test_slack_ts_parses_every_link_form(self):
+        self.assertEqual(g.slack_ts("https://devrev.slack.com/archives/C0C4K4EGZT6/p1791165864074369"), "1791165864.074369")
+        self.assertEqual(g.slack_ts("https://x.slack.com/archives/C0C4K4EGZT6/p1791165864074369?thread_ts=1791165800.000100&cid=C0C4K4EGZT6"), "1791165864.074369")
+        self.assertEqual(g.slack_ts("C0C4K4EGZT6:1791165864.074369"), "1791165864.074369")
+        self.assertEqual(g.slack_ts("slack:C0C4K4EGZT6:1791165864.074369"), "1791165864.074369")
+        self.assertEqual(g.slack_ts(""), "")
+        self.assertEqual(g.slack_ts(None), "")
+        self.assertEqual(g.slack_ts("https://example.com/nothing"), "")
+
+    def test_transport_retries(self):
+        import urllib.error
+        sleeps = []
+        g._sleep = sleeps.append
+        try:
+            calls = {"n": 0}
+
+            def flaky():
+                calls["n"] += 1
+                if calls["n"] < 3:
+                    raise urllib.error.URLError("timed out")
+                return "ok"
+            self.assertEqual(g.retrying(flaky), "ok")
+            self.assertEqual((calls["n"], len(sleeps)), (3, 2))
+            calls["n"] = 0
+
+            def dead():
+                calls["n"] += 1
+                raise TimeoutError("timed out")
+            with self.assertRaises(TimeoutError):
+                g.retrying(dead)
+            self.assertEqual(calls["n"], 3)
+            calls["n"] = 0
+
+            def not_found():
+                calls["n"] += 1
+                raise urllib.error.HTTPError("u", 404, "nf", {}, None)
+            with self.assertRaises(urllib.error.HTTPError):
+                g.retrying(not_found)
+            self.assertEqual(calls["n"], 1)  # a 404 is an answer, not a transport failure
+            calls["n"] = 0
+
+            def busy():
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise urllib.error.HTTPError("u", 503, "busy", {}, None)
+                return "ok"
+            self.assertEqual(g.retrying(busy), "ok")
+        finally:
+            g._sleep = __import__("time").sleep
 
     def test_duplicate_post_fails_communication_only(self):
         api, slack = build(dup=True)
