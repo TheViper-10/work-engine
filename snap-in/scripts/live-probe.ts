@@ -23,7 +23,7 @@ const NON_HOME_SESSION = `${ORG}:ai_agent_session/474`;
 const NON_HOME_DM = `${ORG}:dm/nHH9Wn2Z`;
 const THREAD = 'C0C4K4EGZT6:0000000005.000005';
 const WORKFLOW = 'desktop-release';
-const TARGET = 'probe-1';
+const TARGET = '0.0.1'; // version-shaped (R52 target rule); never a real release
 const PREFIX = 'work-engine:probe:';
 const REPLY_TIMEOUT_MS = 5 * 60_000;
 
