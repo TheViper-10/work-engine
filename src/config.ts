@@ -10,8 +10,9 @@ export const CHECK_NAMES: readonly CheckName[] = [
 ];
 
 /**
- * Decision R31: the pilot's check modes, in one place so the snap-in and the harness (`--checks deploy`) read the same set.
- * Reversible config: change a value here, nothing else.
+ * Decision R31 (revised by R69): the pilot's check modes, in one place. The snap-in ships this set (snap-in/src/specs.ts) and the
+ * harness (`--checks deploy`) builds its engine from the snap-in's config, so the two cannot diverge. Reversible config: change a value here.
+ * R69: `sender_not_listed` holds, because a go from anyone not listed for a consequential gate must not be able to approve it (live run 3).
  */
 export const DEPLOY_CHECKS: Readonly<Record<CheckName, CheckMode>> = {
   build_changed: 'hold',
@@ -19,7 +20,7 @@ export const DEPLOY_CHECKS: Readonly<Record<CheckName, CheckMode>> = {
   job_cancelled: 'hold',
   superseded_run: 'hold',
   lease_held: 'flag',
-  sender_not_listed: 'flag',
+  sender_not_listed: 'hold',
 };
 
 export interface EngineConfig {

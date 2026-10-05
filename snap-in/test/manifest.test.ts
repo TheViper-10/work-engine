@@ -94,3 +94,10 @@ test('R47: the service account holds ai_agent:read (ai-agents.get on the timer p
   assert.ok(serviceScopesOf(m).includes('ai_agent:read'));
   assert.deepEqual(operationScopesOf(m).sort(), ['ai_agent_session:read', 'conversation:write', 'custom_object:work_event:all', 'custom_object:work_record:all', 'snap_in:read']);
 });
+
+test('R69: the shipped engine config holds every hold-class check, for any install inputs', () => {
+  for (const inputs of [{}, { env: 'prod' }, { guidance_version: 'x' }]) {
+    const c = engineConfig(readInputs(inputs));
+    for (const name of ['build_changed', 'job_cancelled', 'superseded_run', 'no_go_for_build', 'sender_not_listed'] as const) assert.equal(c.checks[name], 'hold', `${name} must be hold in the shipped config`);
+  }
+});

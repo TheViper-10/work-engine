@@ -3,7 +3,8 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { ManualClock } from '../src/clock.ts';
-import { DEPLOY_CHECKS, defineConfig } from '../src/config.ts';
+import { defineConfig } from '../src/config.ts';
+import { engineConfig, readInputs } from '../snap-in/src/specs.ts';
 import { Engine } from '../src/engine.ts';
 import { FakeSessionDirectory } from '../src/session-directory.ts';
 import { makeKey, MemoryStore } from '../src/store.ts';
@@ -123,7 +124,8 @@ export class RealEngineBinding implements EngineBinding {
       const th = this.registeredThread.get(sid)?.split(':');
       if (th && th.length === 2) this.directory.setConnectorDm(sid, dm, { channel: th[0], threadTs: th[1], promptTs: this.registeredPrompt.get(sid) }); else this.directory.set(sid, dm);
     }
-    const checks = this.mode === 'deploy' ? { ...DEPLOY_CHECKS } : Object.fromEntries(['superseded_run', 'job_cancelled', 'lease_held', 'build_changed', 'no_go_for_build', 'sender_not_listed'].map((c) => [c, this.mode]));
+    // R69: `deploy` is the configuration the snap-in ships (engineConfig of a default install), not a copy of it.
+    const checks = this.mode === 'deploy' ? { ...engineConfig(readInputs({})).checks } : Object.fromEntries(['superseded_run', 'job_cancelled', 'lease_held', 'build_changed', 'no_go_for_build', 'sender_not_listed'].map((c) => [c, this.mode]));
     this.engine = new Engine({
       store: this.store,
       clock: this.clock,

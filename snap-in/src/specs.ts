@@ -1,5 +1,5 @@
 // Workflow specs and engine configuration from install inputs. The spec is bundled by esbuild (JSON import).
-import { defineConfig, type EngineConfig } from '../../src/config.ts';
+import { defineConfig, DEPLOY_CHECKS, type EngineConfig } from '../../src/config.ts';
 import type { Spec } from '../../src/types.ts';
 import desktopRelease from '../../workflows/desktop-release/spec.json';
 import { DEFAULT_ALLOWLIST, parseAllowlist } from './slack.ts';
@@ -43,7 +43,7 @@ export function readInputs(values: Record<string, unknown> = {}): Inputs {
 }
 
 export function engineConfig(i: Inputs): EngineConfig {
-  return defineConfig({ env: i.env, bot: i.bot, ownBotUserId: i.own_bot_user, guidanceVersion: i.guidance_version || undefined });
+  return defineConfig({ env: i.env, bot: i.bot, ownBotUserId: i.own_bot_user, guidanceVersion: i.guidance_version || undefined, checks: { ...DEPLOY_CHECKS } });
 }
 
 /** `job=reason;job2=reason2`. A job id may contain ':' but not '=' or ';'. Malformed entries are ignored. */
