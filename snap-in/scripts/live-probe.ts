@@ -8,7 +8,8 @@ import { homedir } from 'node:os';
 import { DEPLOY_CHECKS, defineConfig } from '../../src/config.ts';
 import { SystemClock } from '../../src/clock.ts';
 import { assembleRuntime } from '../src/index.ts';
-import { httpDeps, QA_ENDPOINT, type Deps, type DevRevApi, type Identity } from '../src/platform.ts';
+import { httpDeps, QA_ENDPOINT, scoped, type Deps, type DevRevApi, type Identity } from '../src/platform.ts';
+import { PlatformSessionDirectory } from '../src/directory.ts';
 import { readInputs } from '../src/specs.ts';
 import { PlatformSlackReader } from '../src/slack.ts';
 import { GithubSourceReader } from '../src/source.ts';
@@ -148,6 +149,13 @@ async function journey(): Promise<void> {
   // (d) session lookup resolves to the logical home
   t = Date.now();
   const look = await directory.dmOf(homeSession);
+  // R51 (not run by the builder; the coordinator runs it): threadOf on a connector mention DM. Needs PROBE_CONNECTOR_SESSION (a session in a
+  // connector DM, owned by the connector's act-as user); the probe's token must be that user's, as the operation path runs as the caller. Skipped, and reported as skipped, when unset.
+  if (process.env.PROBE_CONNECTOR_SESSION) {
+    const callerDir = new PlatformSessionDirectory({ api: scoped(api, 'caller'), store, env: inputs.env, bot: inputs.bot });
+    const th = await callerDir.threadOf(process.env.PROBE_CONNECTOR_SESSION);
+    record('i', 'threadOf(connector mention session) via sessions.get + chats.get', 'thread' in th, `threadOf=${'thread' in th ? th.thread : th.error}; expected <channel>:<thread ts> from app_slack_agent_connector__slack_channel and __slack_thread_ts`);
+  } else record('i', 'threadOf(connector mention session)', true, 'SKIPPED: set PROBE_CONNECTOR_SESSION to a connector-DM session id to check chats.get as the caller');
   record('d', 'dmOf(Tony session) == logical home', 'dm' in look && look.dm === logical, `dmOf=${'dm' in look ? look.dm : look.error} expected=${logical} ${Date.now() - t}ms`);
   const nonHome = await directory.dmOf(NON_HOME_SESSION);
   console.log(`     (474 resolves to ${'dm' in nonHome ? short(nonHome.dm) : nonHome.error}, expected ${short(NON_HOME_DM)})`);

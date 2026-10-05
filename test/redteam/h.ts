@@ -6,6 +6,10 @@ const { MemoryStore, makeKey } = await import(R + '/src/store.ts');
 const { ManualClock } = await import(R + '/src/clock.ts');
 const { defineConfig, CHECK_NAMES } = await import(R + '/src/config.ts');
 export const spec = JSON.parse(readFileSync(R + '/workflows/desktop-release/spec.json', 'utf8'));
+// The repros use synthetic targets (T1); the one-open-job rule has its own tests.
+delete spec.one_open_job; delete spec.target_pattern;
+// These repros test claim and post mechanics with `say live` directly; the outcome-milestone rule (R55) has its own tests.
+for (const m of Object.values<any>(spec.milestones)) delete m.outcome;
 export const WF = 'desktop-release', J = 'desktop-release:T1', BOT = 'UBOT', OWNER = 'U042GEDM4BB', HARRY = 'U0C4YRX93PS', MIN = 60000;
 export function world(mode: 'flag' | 'hold' = 'flag', opts: { store?: any; clock?: any } = {}) {
   const w: any = { builds: { 'approve-desktop-qa-latest': 'abc', 'approve-desktop-prod-alpha': 'abc', pr_review: 'abc' }, sourceFail: false, posts: [] as any[], wakes: [] as any[], wakerFail: false };

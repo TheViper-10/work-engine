@@ -1,0 +1,578 @@
+{
+  "id": "run1-replay",
+  "source": [
+    "tony-shared-state/30-work-engine-live-qa-release.md:22-60"
+  ],
+  "summary": "Live run 1 (2026-10-04, release 5.2.11) replayed offline with connector-faithful mentions: the kickoff and the B question arrive as DM comments with external_ref, the model sees a DevRev DM id not a thread, the owner approves on GitHub, gives the go and repeats it, Harry posts in QA and signs off. One job, one home, no acting from Slack, plain words, no Rashmi.",
+  "derived_from": "interruption-boundary",
+  "synthetic": true,
+  "threads": {
+    "A": {
+      "role": "request",
+      "channel": "C0C4K4EGZT6",
+      "root_ts": "1791149910.562169",
+      "root_sender": "owner",
+      "private": false,
+      "root_text": "can we do a desktop app release until alpha?"
+    },
+    "B": {
+      "role": "side",
+      "channel": "C0C4K4EGZT6",
+      "root_ts": "1791150443.050169",
+      "root_sender": "owner",
+      "private": false,
+      "root_text": "which version / ETA / tell me when QA is ready"
+    },
+    "Q": {
+      "role": "qa",
+      "channel": "C0C4K4EGZT6",
+      "root_ts": "1791156130.270059",
+      "root_sender": "harry",
+      "private": false,
+      "root_text": "New version released in QA (desktop 5.2.11, mock)"
+    }
+  },
+  "jobs": [
+    {
+      "id": "J1",
+      "workflow": "desktop-release",
+      "target": "5.2.11",
+      "opened_by_thread": "A"
+    }
+  ],
+  "people": {
+    "owner": {
+      "slack": "U042GEDM4BB",
+      "name": "Priyadharshan (owner)",
+      "sender_kind": "human",
+      "github": "TheViper-10",
+      "circleci_user": "TheViper-10",
+      "gates": [
+        "pr_review",
+        "approve-desktop-qa-latest",
+        "approve-desktop-prod-alpha (stand-in)",
+        "cancel"
+      ]
+    },
+    "harry": {
+      "slack": "U0C4YRX93PS",
+      "name": "Harry (Sentinel signer; a bot posting as a person in the mock)",
+      "sender_kind": "other_bot",
+      "gates": [
+        "approve-desktop-prod-alpha (primary)"
+      ]
+    },
+    "tony": {
+      "slack": "U0C4FFYJGE6",
+      "name": "Tony (the replayed model)",
+      "sender_kind": "own_bot",
+      "github": "DevRevComputer"
+    },
+    "github": {
+      "name": "GitHub webhook",
+      "sender_kind": "system"
+    },
+    "circleci": {
+      "name": "CircleCI",
+      "sender_kind": "system"
+    },
+    "update_server": {
+      "name": "mock update server (state.json)",
+      "sender_kind": "system"
+    }
+  },
+  "initial_world": {
+    "github": {
+      "repo": "devrev/devrev-web",
+      "base_branch": "mock/tony-desktop-release",
+      "prs": {},
+      "head_sha": null,
+      "scripted_ids": {
+        "pr_number": 58101,
+        "merge_sha": "abc",
+        "pipeline_id": "pipe-sg",
+        "release_issue": "ISS-70",
+        "parent_issue": "ISS-37"
+      },
+      "review_approvers": [
+        "TheViper-10"
+      ]
+    },
+    "circleci": {
+      "pipelines": {},
+      "pipeline_template": "gh-config.yml deployment workflow: build-product-desktop-app -> publish-dev -> desktop-pw-e2e-tests-qa-computer + desktop-pw-e2e-tests-qa-agent-studio; approve-desktop-qa-latest (approval, requires publish-dev) -> desktop-app-publish-download-page-qa; approve-desktop-prod-alpha (approval, requires build only) -> desktop-app-publish-download-page-prod-alpha",
+      "durations_s": {
+        "build": 90,
+        "playwright_computer": 120,
+        "playwright_agent_studio": 150,
+        "publish": 60
+      },
+      "playwright": {
+        "computer": {
+          "outcome": "pass"
+        },
+        "agent-studio": {
+          "outcome": "fail",
+          "failures": [
+            {
+              "name": "should keep chat panel visible when clicking a preview row",
+              "file": "apps/product-pw-e2e/src/desktop/agent-studio/preview-panel.spec.ts",
+              "message": "TimeoutError: locator.click: Timeout 15000ms exceeded. overlay intercepts pointer events",
+              "flaky": true
+            }
+          ]
+        }
+      },
+      "gates": {
+        "approve-desktop-qa-latest": {
+          "state": "not_created"
+        },
+        "approve-desktop-prod-alpha": {
+          "state": "not_created"
+        }
+      }
+    },
+    "update_server": {
+      "qa_version": "5.2.9",
+      "alpha_version": "5.2.9"
+    },
+    "slack": {
+      "channel": "C0C4K4EGZT6",
+      "tony_user": "U0C4FFYJGE6"
+    },
+    "release_version": "5.2.11"
+  },
+  "world_paths": [
+    "github.prs.<n>.state (open|merged|closed)",
+    "github.prs.<n>.approved_by",
+    "github.prs.<n>.merged",
+    "github.base_head_sha",
+    "circleci.pipelines.<id>.jobs.<job>.state (not_created|hold|running|success|failed|approved)",
+    "circleci.gates.<gate>.state",
+    "update_server.qa_version",
+    "update_server.alpha_version",
+    "slack.threads.<T>.has_post_from_tony (true after Tony's first post there)",
+    "slack.threads.<T>.tony_posts (count)",
+    "job.<name>.state (engine-side, only for harness assertions)"
+  ],
+  "faults": [],
+  "timeline": [
+    {
+      "t": 0,
+      "type": "slack_message",
+      "thread": "A",
+      "sender": "owner",
+      "text": "can we do a desktop app release until alpha? Quick note since this channel is a rehearsal: the base branch is mock/tony-desktop-release instead of main, so your bump PR goes into it and merging it starts the mock deployment workflow. The parent issue is ISS-37, so the release issue should be a child of it and you read the link back. Harry is the Sentinel signer and is a person for this exercise, and the QA thread is Harry's 'New version released in QA' post, where you ask him once.",
+      "mentions_tony": true,
+      "event": {
+        "source": "slack",
+        "kind": "message",
+        "thread": "A",
+        "sender": "U042GEDM4BB",
+        "sender_kind": "human",
+        "ref": null,
+        "attrs": {
+          "mentions_tony": true
+        },
+        "delivered": true
+      },
+      "slack_ts": "1791149910.562169"
+    },
+    {
+      "t": 14,
+      "type": "github",
+      "kind": "pr_review_approved",
+      "sender": "owner",
+      "change": {
+        "github.prs.58101.approved_by": "TheViper-10"
+      },
+      "event": {
+        "source": "github",
+        "kind": "pr_review_approved",
+        "thread": null,
+        "sender": "TheViper-10",
+        "sender_kind": "human",
+        "ref": "github:pr:58101:review",
+        "attrs": {
+          "review_state": "APPROVED"
+        },
+        "delivered": true
+      },
+      "when": {
+        "github.prs.58101.state": "open"
+      },
+      "delay_s": 90,
+      "note": "no Slack message; GitHub-only event"
+    },
+    {
+      "t": 21,
+      "type": "github",
+      "kind": "pr_merged",
+      "sender": "github",
+      "change": {},
+      "event": {
+        "source": "github",
+        "kind": "pr_merged",
+        "thread": null,
+        "sender": "github",
+        "sender_kind": "system",
+        "ref": "github:pr:58101",
+        "attrs": {
+          "merged": true
+        },
+        "delivered": true
+      },
+      "when": {
+        "github.prs.58101.merged": true
+      },
+      "delay_s": 5
+    },
+    {
+      "t": 23,
+      "type": "circleci",
+      "kind": "pipeline_build_success",
+      "sender": "circleci",
+      "change": {
+        "circleci.pipelines.pipe-sg.jobs.build-product-desktop-app.state": "success",
+        "circleci.gates.approve-desktop-qa-latest.state": "hold",
+        "circleci.gates.approve-desktop-prod-alpha.state": "hold"
+      },
+      "event": {
+        "source": "circleci",
+        "kind": "pipeline_build_success",
+        "thread": null,
+        "sender": "circleci",
+        "sender_kind": "system",
+        "ref": "circleci:pipeline:pipe-sg",
+        "attrs": {},
+        "delivered": true
+      },
+      "when": {
+        "github.prs.58101.merged": true
+      },
+      "delay_s": 90
+    },
+    {
+      "t": 27,
+      "type": "circleci",
+      "kind": "playwright_finished",
+      "sender": "circleci",
+      "change": {
+        "circleci.pipelines.pipe-sg.jobs.desktop-pw-e2e-tests-qa-computer.state": "success",
+        "circleci.pipelines.pipe-sg.jobs.desktop-pw-e2e-tests-qa-agent-studio.state": "failed"
+      },
+      "event": {
+        "source": "circleci",
+        "kind": "playwright_finished",
+        "thread": null,
+        "sender": "circleci",
+        "sender_kind": "system",
+        "ref": "circleci:pipeline:pipe-sg",
+        "attrs": {},
+        "delivered": true
+      },
+      "when": {
+        "circleci.gates.approve-desktop-qa-latest.state": "hold"
+      },
+      "delay_s": 240,
+      "note": "agent-studio fails with the known overlay flake (gh-scenario.json)"
+    },
+    {
+      "t": 34,
+      "type": "slack_message",
+      "thread": "A",
+      "sender": "owner",
+      "text": "go, publish build abc to QA (that failure is the known flake)",
+      "mentions_tony": false,
+      "event": {
+        "source": "slack",
+        "kind": "message",
+        "thread": "A",
+        "sender": "U042GEDM4BB",
+        "sender_kind": "human",
+        "ref": null,
+        "attrs": {
+          "mentions_tony": false,
+          "inbox_kind": "approval"
+        },
+        "delivered": true
+      },
+      "when": {
+        "slack.threads.A.tony_asked_qa_go_for_build": "abc"
+      },
+      "delay_s": 150,
+      "note": "the go names build abc and arrives in A after B's status question; it lands in the job inbox, not in a session"
+    },
+    {
+      "t": 34,
+      "type": "slack_message",
+      "thread": "A",
+      "sender": "owner",
+      "text": "go, publish build abc to QA (that failure is the known flake)",
+      "mentions_tony": false,
+      "event": {
+        "source": "slack",
+        "kind": "message",
+        "thread": "A",
+        "sender": "U042GEDM4BB",
+        "sender_kind": "human",
+        "ref": null,
+        "attrs": {
+          "mentions_tony": false,
+          "inbox_kind": "approval"
+        },
+        "delivered": true
+      },
+      "when": {
+        "slack.threads.A.tony_asked_qa_go_for_build": "abc"
+      },
+      "delay_s": 160,
+      "note": "the owner repeats the go ten seconds later (live run 1 injected check); it must not approve twice"
+    },
+    {
+      "t": 36,
+      "type": "circleci",
+      "kind": "qa_publish_success",
+      "sender": "circleci",
+      "change": {
+        "circleci.pipelines.pipe-sg.jobs.desktop-app-publish-download-page-qa.state": "success"
+      },
+      "event": {
+        "source": "circleci",
+        "kind": "qa_publish_success",
+        "thread": null,
+        "sender": "circleci",
+        "sender_kind": "system",
+        "ref": "circleci:pipeline:pipe-sg",
+        "attrs": {},
+        "delivered": true
+      },
+      "when": {
+        "circleci.gates.approve-desktop-qa-latest.state": "approved"
+      },
+      "delay_s": 60
+    },
+    {
+      "t": 37,
+      "type": "update_server",
+      "kind": "qa_version_published",
+      "sender": "update_server",
+      "change": {
+        "update_server.qa_version": "5.2.11"
+      },
+      "event": {
+        "source": "update_server",
+        "kind": "qa_version_published",
+        "thread": null,
+        "sender": "update_server",
+        "sender_kind": "system",
+        "ref": "update_server:qa",
+        "attrs": {},
+        "delivered": true
+      },
+      "when": {
+        "circleci.pipelines.pipe-sg.jobs.desktop-app-publish-download-page-qa.state": "success"
+      },
+      "delay_s": 14
+    },
+    {
+      "t": 38,
+      "type": "bot_post",
+      "thread": "Q",
+      "sender": "harry",
+      "text": "New version released in QA :rocket: (desktop 5.2.11, mock)",
+      "mentions_tony": false,
+      "event": {
+        "source": "slack",
+        "kind": "message",
+        "thread": "Q",
+        "sender": "U0C4YRX93PS",
+        "sender_kind": "other_bot",
+        "ref": null,
+        "attrs": {
+          "mentions_tony": false
+        },
+        "delivered": true
+      },
+      "when": {
+        "update_server.qa_version": "5.2.11"
+      },
+      "delay_s": 10,
+      "note": "bot post, never starts a session; becomes the QA thread root",
+      "slack_ts": "1791156130.270059"
+    },
+    {
+      "t": 44,
+      "type": "slack_message",
+      "thread": "Q",
+      "sender": "harry",
+      "text": "signing off for Sentinel tests for 5.2.11",
+      "mentions_tony": false,
+      "event": {
+        "source": "slack",
+        "kind": "message",
+        "thread": "Q",
+        "sender": "U0C4YRX93PS",
+        "sender_kind": "other_bot",
+        "ref": null,
+        "attrs": {
+          "mentions_tony": false,
+          "inbox_kind": "approval"
+        },
+        "delivered": true
+      },
+      "when": {
+        "slack.threads.Q.has_post_from_tony": true
+      },
+      "delay_s": 52,
+      "note": "paraphrase from file 05:172"
+    },
+    {
+      "t": 50,
+      "type": "circleci",
+      "kind": "prod_alpha_publish_success",
+      "sender": "circleci",
+      "change": {
+        "circleci.pipelines.pipe-sg.jobs.desktop-app-publish-download-page-prod-alpha.state": "success"
+      },
+      "event": {
+        "source": "circleci",
+        "kind": "prod_alpha_publish_success",
+        "thread": null,
+        "sender": "circleci",
+        "sender_kind": "system",
+        "ref": "circleci:pipeline:pipe-sg",
+        "attrs": {},
+        "delivered": true
+      },
+      "when": {
+        "circleci.gates.approve-desktop-prod-alpha.state": "approved"
+      },
+      "delay_s": 60
+    },
+    {
+      "t": 51,
+      "type": "update_server",
+      "kind": "alpha_version_published",
+      "sender": "update_server",
+      "change": {
+        "update_server.alpha_version": "5.2.11"
+      },
+      "event": {
+        "source": "update_server",
+        "kind": "alpha_version_published",
+        "thread": null,
+        "sender": "update_server",
+        "sender_kind": "system",
+        "ref": "update_server:alpha",
+        "attrs": {},
+        "delivered": true
+      },
+      "when": {
+        "circleci.pipelines.pipe-sg.jobs.desktop-app-publish-download-page-prod-alpha.state": "success"
+      },
+      "delay_s": 14
+    },
+    {
+      "t": 60,
+      "type": "timer",
+      "kind": "sweep",
+      "note": "5-minute engine sweep (virtual); harness fires one every 5 virtual minutes"
+    },
+    {
+      "t": 32,
+      "type": "slack_message",
+      "thread": "B",
+      "sender": "owner",
+      "text": "quick one from me, is this release overlapping with anything else, what is the status and the ETA for it hitting alpha? and tell me when QA is ready.",
+      "mentions_tony": true,
+      "event": {
+        "source": "slack",
+        "kind": "message",
+        "thread": "B",
+        "sender": "U042GEDM4BB",
+        "sender_kind": "human",
+        "ref": null,
+        "attrs": {
+          "mentions_tony": true,
+          "inbox_kind": "request"
+        },
+        "delivered": true
+      },
+      "when": {
+        "slack.threads.A.tony_asked_qa_go_for_build": "abc"
+      },
+      "delay_s": 20,
+      "note": "arrives while the worker's home session is still active, right after it asked A for the go; the worker must not be interrupted or replaced",
+      "slack_ts": "1791150443.050169"
+    }
+  ],
+  "expected_end": {
+    "job_status": "done",
+    "milestones": [
+      "bump_pr_open",
+      "pr_approved",
+      "merged",
+      "qa_go_requested",
+      "qa_ready",
+      "signoff_requested",
+      "prod_alpha_approved",
+      "live"
+    ],
+    "deliveries": {
+      "qa_ready": [
+        "A",
+        "B"
+      ],
+      "live": [
+        "A",
+        "B",
+        "Q"
+      ]
+    },
+    "max_live_posts_per_thread": 1,
+    "no_unknown_operations": true,
+    "no_unknown_release_issue_open": true,
+    "gate_approvals": {
+      "approve-desktop-qa-latest": {
+        "builds_approved": [
+          "abc"
+        ],
+        "max": 1
+      }
+    },
+    "interruption_boundary": {
+      "answered_in": "B",
+      "mention_session_actions": 0,
+      "replacements": 0,
+      "go_applies_to_build": "abc"
+    },
+    "max_jobs": 1,
+    "voice_banned": [
+      "Rashmi"
+    ]
+  },
+  "expected_checks": [
+    {
+      "at_action": "approve_qa_gate",
+      "ref_build": "abc",
+      "because": "go given for build abc, the current build",
+      "check": "build_changed",
+      "expected": "silent",
+      "why": "the ask and the go name abc and the source still shows abc"
+    },
+    {
+      "at_action": "approve_qa_gate",
+      "check": "sender_not_listed",
+      "expected": "silent",
+      "why": "owner listed"
+    }
+  ],
+  "notes": "Build id is the placeholder 'abc' (the merge commit). No fix is pushed in this scenario; the point is the boundary between the home session and a mention session. B's question is gated on the ask for abc being posted in A (tony_asked_qa_go_for_build), so it lands while the worker is still writing its checkpoint for that ask. The scripted harness delivers notices into an active home session as a new user message (steer). Synthetic variant: base timeline is the compact happy path (scenarios/README.md), all ts are omitted, times are nominal. | faithful: thread ids are <channel>:<ts>; the engine rejects anything else (R51). scripted_slips makes the scripted Tony repeat the two run 1 slips (DM id as thread, target next) so the engine, not the script, must get them right.",
+  "faithful": true,
+  "scripted_slips": true,
+  "connector_user": {
+    "id": "devu/2",
+    "name": "Rashmi"
+  }
+}

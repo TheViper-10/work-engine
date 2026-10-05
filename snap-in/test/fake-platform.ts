@@ -4,6 +4,7 @@ import { ManualClock } from '../../src/clock.ts';
 import { readFileSync } from 'node:fs';
 import { ApiError, type Deps, type DevRevApi, type GithubApi, type Identity, type SlackApi } from '../src/platform.ts';
 
+const SOURCE_ROW = /:source:builds@/;
 export const ORG = 'don:core:dvrv-us-1:devo/1lKlCUXYGG';
 export const EPOCH = 1_800_000_000_000;
 export const TONY = `${ORG}:ai_agent/2`;
@@ -36,7 +37,7 @@ interface Row { id: string; leaf_type: string; unique_key: string; title: string
 export interface TimelineEntry { id: string; object: string; body: string; created_by: { id: string }; created_at: number; visible_at: number }
 interface Rule { path: string; status?: number; type?: string; message?: string; timeout?: 'before' | 'after'; times: number; skip: number; match?: (b: any) => boolean }
 interface Session { id: string; parent: string; agent: string; user: string }
-interface Chat { id: string; display_state: string; members: string[]; users: string[]; type: string }
+interface Chat { id: string; display_state: string; members: string[]; users: string[]; type: string; custom_fields?: Record<string, string> }
 export interface SlackMsg { ts: string; user?: string; bot_id?: string; text: string; thread_ts: string; metadata?: { event_type: string } }
 interface Pr { number: number; head: { sha: string }; base: { ref: string } }
 
@@ -83,6 +84,8 @@ export class FakePlatform {
   readonly slackReads: Array<{ method: string; channel: string }> = [];
   // ---- github state
   branchHead = '39f8a8c8aa11bb22cc33dd44ee55ff6600112233';
+  /** Real-shaped `GET commits?sha=<branch>` list (newest first); null serves just the branch head. */
+  branchCommits: any[] | null = null;
   prs: Pr[] = [];
   stateFile: unknown = { qa: { latest: '5.2.10' }, prod: { alpha: '5.2.10' } };
   readonly githubRequests: Array<{ method: string; path: string }> = [];
@@ -123,10 +126,23 @@ export class FakePlatform {
     this.chats.set(dm, { id: dm, display_state: 'global', members: [TONY], users: [OWNER_USER], type: 'dm' });
     return { dm, session: this.newSession(dm) };
   }
+  /** R51: a mention DM the way the Slack connector leaves it: custom fields with the channel, thread ts and prompt ts (buildDmFields). */
+  newConnectorDm(channel: string, threadTs: string, promptTs = threadTs): { dm: string; session: string } {
+    const m = this.newMentionDm();
+    this.chats.get(m.dm)!.custom_fields = {
+      app_slack_agent_connector__slack_channel: channel,
+      app_slack_agent_connector__slack_thread_ts: threadTs,
+      app_slack_agent_connector__prompt_ts: promptTs,
+      app_slack_agent_connector__last_imported_ts: promptTs,
+    };
+    return m;
+  }
   sessionIn(dm: string): string { return this.newSession(dm); }
   comments(dm: string): TimelineEntry[] { return this.timeline.get(dm) ?? []; }
   /** Successful row creates so far (each is one new immutable version row). The row-budget counter. */
-  get creates(): number { return this.createdKeys.length; }
+  get creates(): number { return this.createdKeys.filter((k) => !SOURCE_ROW.test(k)).length; }
+  /** R57: rows of the build snapshot, counted on their own (one per 10 minutes while a job is open). */
+  get sourceRows(): number { return this.createdKeys.filter((k) => SOURCE_ROW.test(k)).length; }
   rowCount(leaf?: string): number { return [...this.rows.values()].filter((r) => !leaf || r.leaf_type === leaf).length; }
   insertRaw(leaf: string, uk: string, value: unknown): void {
     this.insert(leaf, uk, { tnt__kind: uk.split(':')[3] ?? '', tnt__job_key: '', tnt__state: '', tnt__version: Number(uk.split('@v')[1] ?? 1), tnt__body: JSON.stringify(value) }, 'raw');
@@ -169,7 +185,7 @@ export class FakePlatform {
       case 'ai-agents.get': return 'ai_agent:read';
       case 'ai-agent.sessions.get': return 'ai_agent_session:read';
       case 'snap-ins.get': return 'snap_in:read';
-      case 'chats.create': case 'chats.update': case 'timeline-entries.list': return 'conversation:write';
+      case 'chats.create': case 'chats.update': case 'chats.get': case 'timeline-entries.list': return 'conversation:write';
       case 'custom-objects.create': return `custom_object:${b?.leaf_type}:all`;
       case 'custom-objects.get': return `custom_object:${this.rows.get(b?.unique_key)?.leaf_type ?? leafFromKey(String(b?.unique_key ?? ''))}:all`;
       case 'custom-objects.delete': return `custom_object:${[...this.rows.values()].find((x) => x.id === b?.id)?.leaf_type ?? 'work_record'}:all`;
@@ -279,6 +295,13 @@ export class FakePlatform {
         this.chats.set(id, { id, display_state: b.display_state ?? 'global', members: (b.agent_members ?? []).map((m: any) => m.agent), users: b.users ?? [], type: b.type });
         return { chat: { id } };
       }
+      case 'chats.get': {
+        // Live (run 1): the owner token (devu/1) got 403 on chats.get for a DM of another user (devu/2); a member can read it.
+        const c = this.chats.get(b.id);
+        if (!c) throw new ApiError(404, 'not_found', 'not_found');
+        this.requireMember(as, b.id);
+        return { chat: { id: c.id, type: c.type, display_state: c.display_state, custom_fields: { ...(c.custom_fields ?? {}) } } };
+      }
       case 'chats.update': {
         // Live QA (S4c): chats.update without `type` is 400 invalid_field; {id, type:"dm", display_state} is 200.
         if (b.type !== 'dm') throw new ApiError(400, 'Invalid field: type', 'invalid_field');
@@ -327,7 +350,9 @@ export class FakePlatform {
           throw new ApiError(429, `slack ${method} failed (ratelimited)`, 'ratelimited');
         }
         if (method !== 'conversations.replies') throw new ApiError(404, 'unknown method', 'unknown_method');
-        const all = (this.slack[channel] ?? []).filter((m) => m.thread_ts === String(params.ts));
+        // Slack: conversations.replies with a reply's ts returns the thread that reply belongs to (parent first).
+        const self = (this.slack[channel] ?? []).find((m) => m.ts === String(params.ts));
+        const all = (this.slack[channel] ?? []).filter((m) => m.thread_ts === (self ? self.thread_ts : String(params.ts)));
         const oldest = params.oldest !== undefined ? Number(params.oldest) : 0;
         return { ok: true, messages: all.filter((m) => Number(m.ts) >= oldest).map((m) => ({ ...m })) };
       },
@@ -343,6 +368,7 @@ export class FakePlatform {
         const base = '/repos/devrev/devrev-web/';
         if (!path.startsWith(base)) throw new ApiError(404, 'Not Found', 'not_found');
         const rest = path.slice(base.length);
+        if (rest.startsWith('commits?')) return this.branchCommits ?? [{ sha: this.branchHead, commit: { message: 'mock: publish' }, parents: [] }];
         if (rest.startsWith('commits/')) return { sha: this.branchHead };
         if (rest.startsWith('pulls')) return this.prs.filter((p) => path.includes(`base=${encodeURIComponent(p.base.ref)}`) && path.includes('state=open'));
         if (rest.startsWith('contents/')) return { encoding: 'base64', content: Buffer.from(JSON.stringify(this.stateFile)).toString('base64') };

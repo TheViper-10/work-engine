@@ -239,6 +239,26 @@ const cases: Array<[string, (mode: Mode) => Promise<void>]> = [
     await settle(w, true);
   }],
 
+  ['one open job per workflow: next, a placeholder and another version join the open job; queue and replace are explicit (live run 1 F2/F3)', async (mode) => {
+    const w = new World(mode, 2, {}, 'flag', true);
+    const first = await w.api('jobOpen', { workflow: WF, target: '5.2.11', thread: 'A' }, 's1');
+    assert.equal(first.status, 'opened');
+    const J1 = first.job as string;
+    for (const target of ['next', '', 'latest']) {
+      const r = await w.api('jobOpen', { workflow: WF, target, thread: 'B', role: 'side' }, 'm1');
+      assert.equal(r.status, 'joined', `target "${target}"`);
+      assert.equal(r.job, J1);
+    }
+    const other = await w.api('jobOpen', { workflow: WF, target: '5.2.12', thread: 'D' }, 'm1');
+    assert.equal(other.status, 'joined');
+    assert.equal(other.job, J1);
+    assert.ok((await view(w, { job: J1 }, 's1')).flags.some((f: any) => f.check === 'target_mismatch'));
+    const q = await w.api('jobOpen', { workflow: WF, target: '5.2.12', thread: 'D', intent: 'queue' }, 's1');
+    assert.equal(q.status, 'queued');
+    assert.equal((await w.peek<any>('open_jobs', 'all')).ids.filter((id: string) => id.startsWith(`${WF}:`) && id !== q.job).length, 1);
+    await settle(w);
+  }],
+
   ['queue: lease release promotes the queued job', async (mode) => {
     const w = new World(mode);
     await open(w, 's1', 'A');

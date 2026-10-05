@@ -22,7 +22,9 @@ export const REAL_ENGINE_TOOLS: ToolSchema[] = [
     input_schema: {
       type: 'object',
       properties: {
-        workflow: S, target: S, thread: S,
+        workflow: S, target: { type: 'string', description: 'The exact version, for example 5.2.11. Never a placeholder such as next.' },
+        thread: { type: 'string', description: 'The Slack thread as <channel>:<ts>: the request comment external_ref without the slack: prefix.' },
+        workflow_: S,
         role: { type: 'string', description: 'request, side or qa' },
         private: { type: 'boolean' },
         intent: { type: 'string', enum: ['join', 'replace', 'queue'] },
@@ -99,6 +101,11 @@ export class RealEngineBinding implements EngineBinding {
   private seenDeliveries = new Set<string>();
   private directory = new FakeSessionDirectory();
   private registered = new Map<string, string>();
+  private registeredThread = new Map<string, string>();
+  /** Faithful scenarios: engine threads are <channel>:<ts>; scenario labels (A, B, Q) exist only for scoring. */
+  private faithful = false;
+  private toCanon: Record<string, string> = {};
+  private toLabel: Record<string, string> = {};
 
   constructor(root: string, private guidanceVersion?: string) {
     this.spec = JSON.parse(readFileSync(join(root, 'workflows/desktop-release/spec.json'), 'utf8')) as Spec;
@@ -112,7 +119,10 @@ export class RealEngineBinding implements EngineBinding {
     this.seenDeliveries = new Set();
     // A1: a real directory, not the homeForAllSessions default. The driver registers each session's DM when it starts.
     this.directory = new FakeSessionDirectory();
-    for (const [sid, dm] of this.registered) this.directory.set(sid, dm);
+    for (const [sid, dm] of this.registered) {
+      const th = this.registeredThread.get(sid)?.split(':');
+      if (th && th.length === 2) this.directory.setConnectorDm(sid, dm, { channel: th[0], threadTs: th[1] }); else this.directory.set(sid, dm);
+    }
     const checks = this.mode === 'deploy' ? { ...DEPLOY_CHECKS } : Object.fromEntries(['superseded_run', 'job_cancelled', 'lease_held', 'build_changed', 'no_go_for_build', 'sender_not_listed'].map((c) => [c, this.mode]));
     this.engine = new Engine({
       store: this.store,
@@ -122,6 +132,11 @@ export class RealEngineBinding implements EngineBinding {
         findOwnPostAfter: async (thread, ts) => {
           const p = this.world?.findOwnPostAfter(thread, ts);
           return p ? { link: `slack:${this.world!.channel}:${p.ts}` } : null;
+        },
+        threadOfLink: async (l: string) => {
+          const ts = l.split(':').pop() ?? '';
+          const label = Object.entries<any>(this.world?.data.slack.threads ?? {}).find(([, t]) => (t.messages ?? []).some((m: any) => m.ts === ts))?.[0];
+          return label ? this.canon(label) : null;
         },
       },
       waker: {
@@ -133,13 +148,25 @@ export class RealEngineBinding implements EngineBinding {
       config: defineConfig({ env: 'replay', bot: 'tony', ownBotUserId: this.ownBot, checks }),
       specs: [this.spec],
       sessionDirectory: this.directory,
+      strictThreads: this.faithful,
       guidanceVersion: this.guidanceVersion,
     });
   }
 
-  registerSession(sessionId: string, dm: string): void {
+  private canon(t: string | undefined): string | undefined { return t === undefined ? t : this.toCanon[t] ?? t; }
+  private relabel<T>(x: T): T {
+    if (typeof x === 'string') return (this.toLabel[x] ?? x) as T;
+    if (Array.isArray(x)) return x.map((y) => this.relabel(y)) as T;
+    if (x && typeof x === 'object') return Object.fromEntries(Object.entries(x).map(([k, v]) => [k, this.relabel(v)])) as T;
+    return x;
+  }
+
+  registerSession(sessionId: string, dm: string, thread?: string): void {
     this.registered.set(sessionId, dm);
-    this.directory.set(sessionId, dm);
+    if (thread) this.registeredThread.set(sessionId, this.canon(thread)!);
+    const th = thread ? this.canon(thread)!.split(':') : [];
+    if (this.faithful && th.length === 2) this.directory.setConnectorDm(sessionId, dm, { channel: th[0], threadTs: th[1] });
+    else this.directory.set(sessionId, dm);
   }
 
   async homeOf(job: string): Promise<string | undefined> {
@@ -161,6 +188,9 @@ export class RealEngineBinding implements EngineBinding {
   attach(world: World, scenario: any): void {
     this.world = world;
     this.ownBot = scenario.people?.tony?.slack ?? world.tonySlack ?? this.ownBot;
+    this.faithful = !!scenario.faithful;
+    this.toCanon = {}; this.toLabel = {};
+    if (this.faithful) for (const [label, t] of Object.entries<any>(scenario.threads ?? {})) if (t.root_ts) { const c = `${t.channel}:${t.root_ts}`; this.toCanon[label] = c; this.toLabel[c] = label; }
     this.build();
   }
   setMode(mode: Mode): void {
@@ -196,7 +226,7 @@ export class RealEngineBinding implements EngineBinding {
       source: e.source,
       delivery_id: deliveryId,
       kind: e.kind,
-      thread: e.thread,
+      thread: this.canon(e.thread),
       sender_id: e.sender_id,
       sender_kind: e.sender_kind === 'own_bot' ? undefined : e.sender_kind,
       ref,
@@ -249,13 +279,13 @@ export class RealEngineBinding implements EngineBinding {
     }
     const invariants = await this.engine.checkInvariants(this.jobs);
     const first = jobs[0];
-    return {
+    return this.relabel({
       jobs,
       job_ids: [...this.jobs],
       job_status: first?.status ?? null,
       milestones: first?.milestones ?? [],
       invariants,
       mode: this.mode,
-    };
+    });
   }
 }

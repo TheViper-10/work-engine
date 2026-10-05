@@ -101,13 +101,20 @@ export function buildSystemPrompt(playbook: string, sc: any, dmId: string): stri
     .filter(([, p]) => p.slack)
     .map(([k, p]) => `- ${p.name ?? k}: <@${p.slack}>`)
     .join('\n');
+  const faith = !!sc.faithful;
+  const threadLines = faith
+    ? Object.entries<any>(sc.threads ?? {}).map(([id, t]) => `- ${id} = ${t.channel}:${t.root_ts ?? '(not posted yet)'}${t.private ? ' (PRIVATE thread)' : ''}`).join('\n')
+    : threads;
+  const threadRule = faith
+    ? '- Slack threads are identified as <channel>:<ts> (the request comment\'s external_ref without the slack: prefix). Use that as the `thread` argument in every engine call and in `slack_post` and `slack_read_thread`. Labels (A, B, Q) are for the people reading the report only.'
+    : '- Slack threads are labelled. Use the label (for example A) as the `thread` argument in every engine call and in `slack_post` and `slack_read_thread`.';
   return `${playbook.trim()}
 
 ## Replay context
 
 This is a rehearsal. Every tool is a stand-in for the real system, and time is simulated. Behave exactly as the playbook says.
-- Slack threads are labelled. Use the label (for example A) as the \`thread\` argument in every engine call and in \`slack_post\` and \`slack_read_thread\`.
-${threads}
+${threadRule}
+${threadLines}
 - People (Slack ids):
 ${people}
 - Tony's own Slack id is ${sc.initial_world?.slack?.tony_user ?? 'U0C4FFYJGE6'}.

@@ -47,12 +47,16 @@ class Play {
   private retrySoon = false;
   used = 0; // tool calls spent so far this session (set by ScriptedTony)
 
-  constructor(private sys: string, private trigger: string) {
+  private canonOf: Record<string, string> = {};
+  private labelOf: Record<string, string> = {};
+
+  constructor(private sys: string, private trigger: string, private slips = false) {
+    for (const m of sys.matchAll(/^- (\w+) = ([A-Z0-9]+:\d+\.\d+)/gm)) { this.canonOf[m[1]!] = m[2]!; this.labelOf[m[2]!] = m[1]!; }
     this.owner = /\(owner\): <@(\w+)>/.exec(sys)?.[1] ?? this.owner;
     this.harry = /Harry[^\n]*?: <@(\w+)>/.exec(sys)?.[1] ?? this.harry;
     this.tony = /Tony's own Slack id is (\w+)/.exec(sys)?.[1] ?? this.tony;
     this.issue = /release tracking issue is ([A-Z]+-\d+)/.exec(sys)?.[1] ?? this.issue;
-    for (const m of sys.matchAll(/^- (\w+): channel [^\n]*$/gm)) {
+    for (const m of sys.matchAll(/^- (\w+)(?::| =) (?:channel |[A-Z0-9]+:\d)[^\n]*$/gm)) {
       this.labels.push(m[1]!);
       if (/PRIVATE/.test(m[0])) this.privateLabels.add(m[1]!);
     }
@@ -61,6 +65,12 @@ class Play {
 
   // ------------------------------------------------------------ entry
   async *main(): G<string> {
+    const fm = /\(external_ref: slack:([A-Z0-9]+:\d+\.\d+)\)/.exec(this.trigger);
+    if (fm) {
+      const dm = /conversation (\S+) from/.exec(this.trigger)?.[1] ?? '';
+      const text = (/Request:\n@Tony ([\s\S]*?)(?:\n\nThread history|$)/.exec(this.trigger)?.[1] ?? '').trim();
+      return yield* this.mentionSession(this.labelOf[fm[1]!] ?? fm[1]!, text, dm);
+    }
     const mention = /^\[[^\]]+\] Slack message in thread (\w+) from/.exec(this.trigger);
     if (mention) return yield* this.mentionSession(mention[1]!, this.trigger.split(':\n\n').slice(1).join(':\n\n'));
     const w = /for job (desktop-release:\S+?)(?: \(home generation \d+\))?: /.exec(this.trigger);
@@ -80,7 +90,10 @@ class Play {
   }
 
   /** A mention session runs outside the job home (A1): it answers from job_view, links its thread, records promises. It never acts. */
-  private async *mentionSession(thread: string, text: string): G<string> {
+  private async *mentionSession(label: string, text: string, dm = ''): G<string> {
+    // Live run 1 slips, on purpose (scenario.scripted_slips): the DM id as the thread, and the placeholder target "next".
+    const slip = this.slips && !!dm;
+    const thread = slip ? dm : label;
     const [v0] = yield [{ name: 'job_view', input: { thread } }];
     let queuedBehind = '';
     let view: any = v0?.jobs?.[0];
@@ -96,8 +109,14 @@ class Play {
         target = /\d+\.\d+\.\d+/.exec(String(is?.title ?? ''))?.[0] ?? '0.0.0';
       }
       if (after && open.length) { intent = 'queue'; queuedBehind = open[0]!; }
-      const [o] = yield [{ name: 'job_open', input: { workflow: 'desktop-release', target, thread, role: this.roleOf(thread), private: this.privateLabels.has(thread) || undefined, intent } }];
-      this.target = target;
+      let [o] = yield [{ name: 'job_open', input: { workflow: 'desktop-release', target: slip && !open.length ? 'next' : target, thread, role: this.roleOf(label), private: this.privateLabels.has(label) || undefined, intent } }];
+      if (o?.status === 'bad_target') {
+        // The engine refused the placeholder. Read the release issue for the exact version and open with it.
+        const [is] = yield [{ name: 'devrev_issue_read', input: { id: this.issue } }];
+        target = /\d+\.\d+\.\d+/.exec(String(is?.title ?? ''))?.[0] ?? '0.0.0';
+        [o] = yield [{ name: 'job_open', input: { workflow: 'desktop-release', target, thread, role: this.roleOf(label), private: this.privateLabels.has(label) || undefined, intent } }];
+      }
+      this.target = o?.view?.target ?? target;
       // route: the request needs the job owner. Nothing was started; say so.
       if (o?.status === 'route') return 'The job owner has been told and will follow up here.';
       this.jobId = o?.job ?? '';
@@ -111,7 +130,7 @@ class Play {
     const wantsPromise = /tell me when|let me know when|ping me when/i.test(text);
     if (wantsPromise && this.jobId) {
       const about = /\blive|alpha done|on alpha\b/i.test(text) && !/QA/i.test(text) ? 'live' : 'qa_ready';
-      yield [{ name: 'promise_add', input: { job: this.jobId, thread, about, fallback_time: '4h' } }];
+      yield [{ name: 'promise_add', input: { job: this.jobId, thread: slip ? dm : label, about, fallback_time: '4h' } }];
     }
     if (/\bcancel/i.test(text) && view?.status !== 'cancelled') return 'Understood. The job owner has been told and will handle the cancel.';
     return this.answer({ view: view ?? {} }, text, null);
@@ -477,7 +496,10 @@ class Play {
 }
 
 /** One Play per session, keyed by the session's first message object (the driver keeps it for the whole session). */
+const THREAD_TOOLS = new Set(['job_open', 'job_view', 'say', 'promise_add']);
+
 export class ScriptedTony implements TonyModel {
+  constructor(private slips = false) {}
   readonly name = 'scripted';
   readonly usage = { input_tokens: 0, output_tokens: 0, requests: 0 };
   private plays = new WeakMap<object, { gen: G<string>; n: number; play: Play }>();
@@ -489,7 +511,7 @@ export class ScriptedTony implements TonyModel {
     let step: IteratorResult<Call[], string>;
     if (!s) {
       const trigger = typeof key.content === 'string' ? key.content : '';
-      const play = new Play(req.system, trigger);
+      const play = new Play(req.system, trigger, this.slips);
       s = { gen: play.main(), n: 0, play };
       this.plays.set(key, s);
       step = await s.gen.next();
@@ -501,7 +523,9 @@ export class ScriptedTony implements TonyModel {
     }
     if (!step.done) s.play.used = s.n + (step.value as Call[]).length;
     if (step.done) return { stop_reason: 'end_turn', content: [{ type: 'text', text: step.value }] };
-    const content: Block[] = (step.value as Call[]).map((c) => ({ type: 'tool_use', id: `toolu_s${++s!.n}`, name: c.name, input: c.input }));
+    const canon = (s.play as any).canonOf as Record<string, string>;
+    // A faithful scenario names threads <channel>:<ts>; the scripted play thinks in labels, so this is its only translation.
+    const content: Block[] = (step.value as Call[]).map((c) => ({ type: 'tool_use', id: `toolu_s${++s!.n}`, name: c.name, input: THREAD_TOOLS.has(c.name) && canon[c.input?.thread] ? { ...c.input, thread: canon[c.input.thread] } : c.input }));
     return { stop_reason: 'tool_use', content };
   }
 }

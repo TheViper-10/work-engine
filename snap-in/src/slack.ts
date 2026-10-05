@@ -49,6 +49,17 @@ export class PlatformSlackReader implements SlackReader {
     }
     return null;
   }
+
+  /** R54: the thread a message belongs to, `<channel>:<thread ts>`. null when Slack cannot say (the engine then takes the link as reported). */
+  async threadOfLink(link: string): Promise<string | null> {
+    const t = parseThread(link);
+    if (!t) return null;
+    assertAllowed(this.o.allow, t.channel);
+    const res = await this.o.api.get('conversations.replies', { channel: t.channel, ts: t.ts, limit: 1 });
+    const m = (res?.messages ?? [])[0];
+    const root = typeof m?.thread_ts === 'string' && m.thread_ts ? m.thread_ts : typeof m?.ts === 'string' ? m.ts : null;
+    return root ? `${t.channel}:${root}` : null;
+  }
 }
 
 // ---------------------------------------------------------------- poller
@@ -125,3 +136,6 @@ export class SlackPoller {
     }
   }
 }
+
+/** R51: the `<channel>:<ts>` of a thread given as a ref or permalink, else the text unchanged (the engine then refuses it as bad_thread). */
+export { normalizeThread as slackThread } from '../../src/thread.ts';

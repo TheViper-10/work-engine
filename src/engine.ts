@@ -5,6 +5,7 @@ import { CHECK_NAMES, type EngineConfig } from './config.ts';
 import { makeKey, MAX_BATCH, type Store } from './store.ts';
 import { homeForAllSessions } from './session-directory.ts';
 import { WakeConfigError } from './types.ts';
+import { normalizeThread, parseMessageLink, THREAD_HELP } from './thread.ts';
 import type {
   Answer, Ask, CheckName, Claim, Clock, Ctx, Delivery, EventRecord, FlagKind, FlagRecord, IngestEvent,
   InboxItem, InboxKind, Job, JobStatus, Lease, Operation, Promise_, Run, SessionDirectory, SlackReader, SourceReader,
@@ -24,6 +25,8 @@ export interface EngineDeps {
   sessionDirectory?: SessionDirectory;
   /** R24: version of the agent guidance, recorded on each job at open. */
   guidanceVersion?: string;
+  /** R51: when true a thread must be `<channel>:<ts>` (after normalizing); anything else answers bad_thread. Off by default so labelled threads still work offline. */
+  strictThreads?: boolean;
 }
 
 /** The caller's relation to the job's home (A1, A2, A3). */
@@ -61,6 +64,9 @@ const CURSOR_LAG_BUCKETS = 12;
 const WAKE_BACKOFF_CAP_MIN = 30;
 const WAKE_CONFIG_RECHECK_MIN = 60;
 const WAKE_ESCALATE_ATTEMPTS = 4;
+/** R56: minutes a woken home gets to call the engine before it is woken again, and how many such re-wakes in a row. */
+const WAKE_REPLY_MIN = 5;
+const WAKE_REWAKES = 3;
 
 function ans(ok: boolean, status: string, say_to_tony: string, extra: Record<string, unknown> = {}): Answer {
   return { ok, status, say_to_tony, ...extra };
@@ -77,6 +83,7 @@ export class Engine {
   private chain: Promise<unknown> = Promise.resolve();
   private readonly directory: SessionDirectory;
   private readonly guidance: string | null;
+  private readonly strictThreads: boolean;
   /** Successful session lookups only; failures are never cached (A1). */
   private readonly dmCache = new Map<string, string>();
   /** Set by addInboxItem: the item already existed (a duplicate or a retry), so no new notice is owed. */
@@ -85,6 +92,7 @@ export class Engine {
   constructor(deps: EngineDeps) {
     this.directory = deps.sessionDirectory ?? homeForAllSessions;
     this.guidance = deps.guidanceVersion ?? deps.config.guidanceVersion ?? null;
+    this.strictThreads = !!deps.strictThreads;
     this.store = deps.store;
     this.clock = deps.clock;
     this.sourceReader = deps.sourceReader;
@@ -99,7 +107,7 @@ export class Engine {
   // ---------------------------------------------------------------- public calls
 
   jobOpen(
-    args: { workflow: string; target: string; thread: string; role?: string; private?: boolean;
+    args: { workflow: string; target: string; thread?: string; role?: string; private?: boolean;
       intent?: 'join' | 'replace' | 'queue'; requester?: string },
     ctx: Ctx = {},
   ): Promise<Answer> {
@@ -111,11 +119,11 @@ export class Engine {
   intend(args: { job: string; action: string; ref: string; because?: string }, ctx: Ctx = {}): Promise<Answer> {
     return this.serial(() => this.doIntend(args, ctx));
   }
-  say(args: { job: string; thread: string; milestone: string; posted_link?: string }, ctx: Ctx = {}): Promise<Answer> {
+  say(args: { job: string; thread?: string; milestone: string; posted_link?: string }, ctx: Ctx = {}): Promise<Answer> {
     return this.serial(() => this.doSay(args, ctx));
   }
   promiseAdd(
-    args: { job: string; thread: string; about: string; fallback_time?: number | string },
+    args: { job: string; thread?: string; about: string; fallback_time?: number | string },
     ctx: Ctx = {},
   ): Promise<Answer> {
     return this.serial(() => this.doPromiseAdd(args, ctx));
@@ -229,8 +237,12 @@ export class Engine {
   private nextWakeMs(spec: Spec | undefined): number { return (spec?.defaults?.next_wake_minutes ?? 30) * MIN; }
   private staleMs(spec: Spec | undefined): number { return (spec?.defaults?.claim_stale_minutes ?? 10) * MIN; }
   private bucketOf(t: number): number { return Math.floor(t / (this.config.sweepMinutes * MIN)); }
+  /** R56: a wake run that no session in the home has answered is given WAKE_REPLY_MIN, not the full run timeout. */
+  private runTimeoutMs(run: Run): number {
+    return (run.origin === 'wake' && !run.answered ? WAKE_REPLY_MIN : this.config.runTimeoutMinutes) * MIN;
+  }
   private runActive(run: Run | null): boolean {
-    return !!run && run.state === 'active' && this.now() - run.last_activity_at < this.config.runTimeoutMinutes * MIN;
+    return !!run && run.state === 'active' && this.now() - run.last_activity_at < this.runTimeoutMs(run);
   }
   private addReason(job: Job, reason: string): void {
     if (!job.wake_reasons.includes(reason)) job.wake_reasons.push(reason);
@@ -280,6 +292,7 @@ export class Engine {
     if (!sid) return 'unknown';
     // A1: only a session in the job's home can be, bind or refresh the run. Everyone else just reads the run state.
     if (own.state !== 'home') return cr && this.runActive(cr) ? 'other' : 'none';
+    if (cr && !cr.answered) cr.answered = true; // R56: a session in the home has called the engine; saved by whichever branch follows
     if (cr && cr.session_id === sid) {
       cr.state = 'active';
       cr.last_activity_at = now;
@@ -288,15 +301,15 @@ export class Engine {
       return 'you';
     }
     if (cr && cr.session_id === null && cr.state === 'active') {
-      if (!bindPending) return 'none';
+      if (!bindPending) { await this.save('run', cr.id, cr); return 'none'; }
       cr.session_id = sid;
       cr.last_activity_at = now;
       await this.save('run', cr.id, cr);
       job.session_gen[sid] = job.generation;
       return 'you';
     }
-    if (cr && this.runActive(cr)) return 'other';
-    if (!mayAdopt) return 'none';
+    if (cr && this.runActive(cr)) { if (cr.answered) await this.save('run', cr.id, cr); return 'other'; }
+    if (!mayAdopt) { if (cr?.answered) await this.save('run', cr.id, cr); return 'none'; }
     if (cr && cr.state === 'active') { cr.state = 'superseded'; await this.save('run', cr.id, cr); }
     const n = job.run_seq + 1;
     const run: Run = { id: `${job.id}:${n}`, job: job.id, n, generation: job.generation, session_id: sid, origin, started_at: now, last_activity_at: now, state: 'active' };
@@ -634,32 +647,98 @@ export class Engine {
     };
   }
 
+
+  // ---------------------------------------------------------------- threads (R51)
+
+  /**
+   * The thread a call means. A valid thread (after normalizing `slack:` refs and permalinks) is used as given. A missing or invalid one
+   * is replaced by the thread the platform holds for the caller's conversation, when the directory can say; otherwise the call is
+   * refused with bad_thread and words on where to find it. Nothing is recorded on a refusal.
+   */
+  private async resolveThread(raw: string | undefined, ctx: Ctx, call: string, optional = false): Promise<{ thread?: string; note?: string } | { answer: Answer }> {
+    const given = typeof raw === 'string' ? raw.trim() : '';
+    const norm = given ? normalizeThread(given) : null;
+    if (norm) return { thread: norm };
+    if (given && !this.strictThreads) return { thread: given };
+    if (!given && optional) return {};
+    if (ctx.session_id && this.directory.threadOf) {
+      let r: Awaited<ReturnType<NonNullable<SessionDirectory['threadOf']>>>;
+      try { r = await this.directory.threadOf(ctx.session_id); } catch (e) { r = { error: (e as Error).message }; }
+      if ('thread' in r && normalizeThread(r.thread)) {
+        const t = normalizeThread(r.thread)!;
+        return { thread: t, note: given ? `"${given}" is not a thread, so the thread of this conversation (${t}) was used.` : `No thread was given, so the thread of this conversation (${t}) was used.` };
+      }
+    }
+    const what = given ? `"${given}" is not a thread` : 'no thread was given';
+    return { answer: ans(false, !given && !this.strictThreads ? 'bad_input' : 'bad_thread', `${call}: ${what}, so nothing was recorded. ${THREAD_HELP}`) };
+  }
+
+  /**
+   * R54: the thread a posted message belongs to, from the engine's own event record of it (the poller ingests every post of a linked
+   * thread; this works on the operation path, which has no Slack credential), else from the Slack reader. null means it could not be told.
+   */
+  private async threadOfLink(link: string): Promise<string | null> {
+    const m = parseMessageLink(link);
+    if (!m) return null;
+    const ev = await this.get<EventRecord>('event', `slack:${m.channel}:${m.ts}`);
+    if (ev?.thread) return ev.thread;
+    if (!this.slackReader.threadOfLink) return null;
+    try { return (await this.slackReader.threadOfLink(`${m.channel}:${m.ts}`)) ?? null; } catch { return null; }
+  }
+
   // ---------------------------------------------------------------- 1. job_open
 
   private async doJobOpen(
-    a: { workflow: string; target: string; thread: string; role?: string; private?: boolean; intent?: 'join' | 'replace' | 'queue'; requester?: string },
+    a0: { workflow: string; target: string; thread?: string; role?: string; private?: boolean; intent?: 'join' | 'replace' | 'queue'; requester?: string },
     ctx: Ctx,
   ): Promise<Answer> {
-    const spec = this.specs[a.workflow];
+    const spec = this.specs[a0.workflow];
     if (!spec) {
-      return ans(false, 'unknown_workflow', `job_open: no workflow called "${a.workflow}" is loaded, so nothing was recorded. Loaded: ${Object.keys(this.specs).join(', ') || 'none'}.`);
+      return ans(false, 'unknown_workflow', `job_open: no workflow called "${a0.workflow}" is loaded, so nothing was recorded. Loaded: ${Object.keys(this.specs).join(', ') || 'none'}.`);
     }
-    if (!a.target || !a.thread) {
-      return ans(false, 'bad_input', `job_open: ${!a.target ? 'target' : 'thread'} is missing, so nothing was recorded. Give both a target and the thread you are in.`);
+    if (!a0.target && !spec.one_open_job) {
+      return ans(false, 'bad_input', 'job_open: target is missing, so nothing was recorded. Give both a target and the thread you are in.');
     }
+    const rt = await this.resolveThread(a0.thread, ctx, 'job_open');
+    if ('answer' in rt) return rt.answer;
+    const a = { ...a0, thread: rt.thread! };
     const now = this.now();
     const intent = a.intent ?? 'join';
     const role = a.role ?? spec.link_roles[0] ?? 'request';
     const notes: string[] = [];
+    if (rt.note) notes.push(rt.note);
     if (!spec.link_roles.includes(role)) notes.push(`Role "${role}" is not in the workflow's link roles (${spec.link_roles.join(', ')}); recorded anyway.`);
-    const idxId = `${a.workflow}:${a.target}`;
+    // R52: one open job per workflow. A target that is not a version (or is empty) names no job; a join with another target joins the open one.
+    let target = a.target ?? '';
+    let blocker: Job | null = null;
+    let mismatch: string | null = null;
+    if (spec.one_open_job) {
+      const openIds = (await this.get<IdList>('open_jobs', 'all'))?.ids ?? [];
+      const openJobs = (await this.manyPresent<Job>('job', openIds.slice(0, MAX_BATCH))).filter((j) => j.workflow === spec.workflow && j.status !== 'queued' && j.status !== 'done' && j.status !== 'cancelled');
+      const open = openJobs.find((j) => j.target === target) ?? openJobs[0] ?? null;
+      const looksLikeTarget = !!target && (!spec.target_pattern || new RegExp(spec.target_pattern).test(target));
+      if (!looksLikeTarget) {
+        if (!open || intent !== 'join') {
+          return ans(false, 'bad_target', `job_open: "${target}" is not a target this workflow can run, so nothing was recorded. ${open ? `Use the target of the job you mean, not a placeholder (${open.id} is open)` : 'Read the target from the request, then open with that exact target'}.`);
+        }
+        notes.push(`"${target}" names no job, so this thread joined the open job ${open.id}.`);
+        target = open.target;
+      } else if (open && open.target !== target) {
+        if (intent === 'join') {
+          mismatch = `This request named ${target}, but ${open.id} is already open for this workflow, so the thread joined it. Tell the requester ${open.id} is running; start ${target} with intent queue (after it) or replace (owner's call).`;
+          notes.push(mismatch);
+          target = open.target;
+        } else blocker = open;
+      }
+    }
+    const idxId = `${a.workflow}:${target}`;
     let idx = (await this.get<JobIndex>('job_index', idxId)) ?? { seq: 0, primary: null, queued: [], winding: [] };
-    const primary = idx.primary ? await this.get<Job>('job', idx.primary) : null;
+    const primary = blocker ?? (idx.primary ? await this.get<Job>('job', idx.primary) : null);
 
     // A1: replacing or queueing is the job owner's call; anyone else leaves an inbox item instead.
     if (primary && (intent === 'replace' || intent === 'queue')) {
       const po = await this.ownership(primary, ctx);
-      const what = `job_open (${intent}) for ${a.target} from ${a.thread}`;
+      const what = `job_open (${intent}) for ${target} from ${a.thread}`;
       if (po.state === 'superseded') return this.fencedAnswer(primary, ctx, 'job_open', what);
       if (po.state === 'unconfirmed') return this.unconfirmedCall(primary, ctx, 'job_open', po.why, what);
       if (po.state === 'non_home') return this.routedAnswer(primary, ctx, 'job_open', what, 'request', a.thread, `Tell the person the job owner decides whether to ${intent} the running job.`);
@@ -672,7 +751,7 @@ export class Engine {
       job = primary;
       joined = true;
     } else {
-      job = this.emptyJob(spec, a.target, idx.seq + 1, now);
+      job = this.emptyJob(spec, target, idx.seq + 1, now);
       idx.seq += 1;
       opened = true;
       job.requester = a.requester ?? null;
@@ -701,6 +780,7 @@ export class Engine {
     }
     if (idx.primary === null && !opened) idx.primary = job.id;
     const linked = await this.linkThread(job, a.thread, role, !!a.private);
+    if (mismatch) await this.addFlag(job, 'target_mismatch', `${a.thread} asked for ${a.target}; joined ${job.id}`, 'job_open');
     const own = await this.ownership(job, ctx);
     if (own.state === 'unconfirmed') await this.noteUnconfirmed(job, ctx, 'job_open', own.why, true);
     const rel = await this.touchRun(job, ctx, 'job_open', job.status !== 'queued', true, own);
@@ -726,7 +806,7 @@ export class Engine {
       : rel === 'unknown' ? 'No session id arrived, so no work run was assigned (flagged).' : 'No one is the work run yet.';
     return ans(true, joined ? 'joined' : job.status === 'queued' ? 'queued' : 'opened',
       [head, runText, ...notes, view.text].join('\n'),
-      { job: job.id, work_run: workRun, view: view.data });
+      { job: job.id, thread: a.thread, work_run: workRun, view: view.data });
   }
 
   // ---------------------------------------------------------------- cancel / finish
@@ -1187,13 +1267,16 @@ export class Engine {
     return true;
   }
 
-  private async doSay(a: { job: string; thread: string; milestone: string; posted_link?: string }, ctx: Ctx): Promise<Answer> {
-    const L = await this.loadJob(a.job, 'say');
+  private async doSay(a0: { job: string; thread?: string; milestone: string; posted_link?: string }, ctx: Ctx): Promise<Answer> {
+    const L = await this.loadJob(a0.job, 'say');
     if ('answer' in L) return L.answer;
     const job = L.job;
-    if (!a.thread || !a.milestone) {
-      return ans(false, 'bad_input', `say: ${!a.thread ? 'thread' : 'milestone'} is missing, so no claim was recorded.`, { job: job.id });
+    if (!a0.milestone) {
+      return ans(false, 'bad_input', 'say: milestone is missing, so no claim was recorded.', { job: job.id });
     }
+    const rt = await this.resolveThread(a0.thread, ctx, 'say');
+    if ('answer' in rt) return rt.answer;
+    const a = { ...a0, thread: rt.thread! };
     if (job.status === 'done' || job.status === 'cancelled') {
       await this.addFlag(job, 'job_ended', `say ${a.milestone} in ${a.thread} arrived after the job was ${job.status}; recorded, no claim`, 'say');
       await this.saveJob(job);
@@ -1222,8 +1305,23 @@ export class Engine {
       return ans(true, 'unknown_milestone', `${this.unknownText(spec, unknownSay)}. Nothing was claimed or recorded for it. Say again with one of those ids.`, { job: job.id, unknown_milestones: unknownSay, milestones: Object.keys(spec?.milestones ?? {}) });
     }
 
+    // R55: an outcome milestone is reached by checkpoint(reached), after the source was read; say only claims what is reached.
+    if (spec?.milestones?.[a.milestone]?.outcome && !job.milestones[a.milestone]) {
+      await this.saveJob(job);
+      return ans(true, 'not_reached', `${a.milestone} is not reached yet, so nothing was claimed and nothing is owed. Read the source; when it shows ${a.milestone}, record it with checkpoint(reached: ["${a.milestone}"]), then say it. If the source shows it has not happened, tell the person the real state in your own words.`, { job: job.id });
+    }
+
     // Confirm route: the agent posted and tells the engine where. Reported by the agent (L3); clears the claim.
     if (a.posted_link) {
+      // R54: the link must be a message in this delivery's thread (same channel and thread ts); a link from another thread is not this delivery.
+      const linkThread = await this.threadOfLink(a.posted_link);
+      const linkChannel = parseMessageLink(a.posted_link)?.channel;
+      const wrongChannel = !!linkChannel && linkChannel !== a.thread.split(':')[0];
+      if ((linkThread && linkThread !== a.thread) || wrongChannel) {
+        const where = linkThread ?? `channel ${linkChannel}`;
+        await this.saveJob(job);
+        return ans(true, 'wrong_thread', `wrong_thread: that link is a message in ${where}, but ${a.milestone} is owed in ${a.thread}. Nothing was recorded as sent. Post ${a.milestone} in ${a.thread} and send that message's link.`, { job: job.id, link_thread: where, thread: a.thread });
+      }
       await this.markReached(job, spec, a.milestone);
       const d = await this.ensureDelivery(job, a.thread, a.milestone, 'claimed');
       if (d.state === 'sent') {
@@ -1330,13 +1428,16 @@ export class Engine {
 
   // ---------------------------------------------------------------- 5. promise_add
 
-  private async doPromiseAdd(a: { job: string; thread: string; about: string; fallback_time?: number | string }, ctx: Ctx): Promise<Answer> {
-    const L = await this.loadJob(a.job, 'promise_add');
+  private async doPromiseAdd(a0: { job: string; thread?: string; about: string; fallback_time?: number | string }, ctx: Ctx): Promise<Answer> {
+    const L = await this.loadJob(a0.job, 'promise_add');
     if ('answer' in L) return L.answer;
     const job = L.job;
-    if (!a.thread || !a.about) {
-      return ans(false, 'bad_input', `promise_add: ${!a.thread ? 'thread' : 'about (a milestone id)'} is missing, so no promise was recorded.`, { job: job.id });
+    if (!a0.about) {
+      return ans(false, 'bad_input', 'promise_add: about (a milestone id) is missing, so no promise was recorded.', { job: job.id });
     }
+    const rt = await this.resolveThread(a0.thread, ctx, 'promise_add');
+    if ('answer' in rt) return rt.answer;
+    const a = { ...a0, thread: rt.thread! };
     if (job.status === 'done' || job.status === 'cancelled') {
       await this.addFlag(job, 'job_ended', `promise_add for ${a.about} in ${a.thread} arrived after the job was ${job.status}; recorded, no promise`, 'promise_add');
       await this.saveJob(job);
@@ -1582,9 +1683,15 @@ export class Engine {
 
   // ---------------------------------------------------------------- 2. job_view
 
-  private async doJobView(a: { job?: string; thread?: string }, ctx: Ctx): Promise<Answer> {
+  private async doJobView(a0: { job?: string; thread?: string }, ctx: Ctx): Promise<Answer> {
     let jobs: Job[] = [];
     let viewer: string | null = null;
+    const a = { ...a0 };
+    if (!a.job && (a.thread || (ctx.session_id && this.directory.threadOf))) {
+      const rt = await this.resolveThread(a.thread, ctx, 'job_view');
+      if ('answer' in rt) return rt.answer;
+      a.thread = rt.thread;
+    }
     if (a.job) {
       const L = await this.loadJob(a.job, 'job_view');
       if ('answer' in L) return L.answer;
@@ -2134,7 +2241,7 @@ export class Engine {
     const cr = job.current_run ? await this.get<Run>('run', `${job.id}:${job.current_run}`) : null;
     if (this.runActive(cr)) {
       // A run is working: do not steer twice; recover if that run is lost. Pending reasons stay.
-      job.next_wake_at = cr!.last_activity_at + this.config.runTimeoutMinutes * MIN;
+      job.next_wake_at = cr!.last_activity_at + this.runTimeoutMs(cr!);
       await this.saveJob(job);
       await this.schedule(job.id, job.next_wake_at);
       return no('run_active', `A run is already active for ${jobId}; no new wake.`);
@@ -2158,7 +2265,11 @@ export class Engine {
     const posting = [...job.wake_reasons];
     job.run_seq = n;
     job.current_run = n;
-    job.next_wake_at = now + this.nextWakeMs(this.spec(job));
+    // R56: when the previous wake was never answered from the home, look again after WAKE_REPLY_MIN, up to WAKE_REWAKES times in a row.
+    const tries = cr && cr.answered ? 0 : job.wake_tries ?? 0;
+    const quick = tries < WAKE_REWAKES;
+    job.wake_tries = quick ? tries + 1 : tries; // exhausted stays exhausted until a home session answers (the run flag resets it)
+    job.next_wake_at = now + (quick ? WAKE_REPLY_MIN * MIN : this.nextWakeMs(this.spec(job)));
     await this.saveJob(job);
     await this.schedule(job.id, job.next_wake_at);
     const text = `Work engine wake for job ${job.id}${job.generation > 1 ? ` (home generation ${job.generation})` : ''}: ${reason}. Call job_view first, then carry on. If you do nothing, the engine wakes you again at ${new Date(job.next_wake_at).toISOString()}.`;

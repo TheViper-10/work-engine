@@ -4,8 +4,13 @@
 //   dmrev:<sha(real DM)>  -> { logical }
 // dmOf returns the logical id when the session's DM is a job home, else the real DM id (a mention DM: non-home).
 import { makeKey, type Store } from '../../src/store.ts';
-import type { SessionDirectory, SessionLookup } from '../../src/types.ts';
+import type { SessionDirectory, SessionLookup, ThreadLookup } from '../../src/types.ts';
 import { ApiError, sha, type DevRevApi } from './platform.ts';
+
+/** Custom fields the Slack connector writes on the DM it opens for a mention (slack-agent-connector src/agent/constants.ts, buildDmFields). */
+export const CF_SLACK_CHANNEL = 'app_slack_agent_connector__slack_channel';
+export const CF_SLACK_THREAD_TS = 'app_slack_agent_connector__slack_thread_ts';
+export const CF_PROMPT_TS = 'app_slack_agent_connector__prompt_ts';
 
 export interface DmMapRow { state: 'creating' | 'created' | 'ready'; dm: string | null; agent_version: string | null; created_at: number }
 export interface DmRevRow { logical: string }
@@ -38,4 +43,27 @@ export class PlatformSessionDirectory implements SessionDirectory {
     }
     return { dm: rev?.logical ?? parent };
   }
+
+  /**
+   * R51: the Slack thread a connector DM was opened for: session -> parent DM (sessions.get) -> the DM's custom fields (chats.get).
+   * A failure (403, no fields, a DM that is not a connector DM) is an error result, never a guess.
+   */
+  async threadOf(sessionId: string): Promise<ThreadLookup> {
+    if (typeof sessionId !== 'string' || !sessionId) return { error: 'no session id' };
+    let parent: string | null;
+    try {
+      const res = await this.o.api.call('ai-agent.sessions.get', { id: sessionId });
+      parent = typeof res?.agent_session?.parent === 'string' && res.agent_session.parent ? res.agent_session.parent : null;
+    } catch (e) { return { error: `session lookup failed (${why(e)})` }; }
+    if (!parent) return { error: 'session has no parent conversation' };
+    let chat: any;
+    try { chat = (await this.o.api.call('chats.get', { id: parent }))?.chat; } catch (e) { return { error: `conversation lookup failed (${why(e)})` }; }
+    const f = chat?.custom_fields ?? {};
+    const channel = typeof f[CF_SLACK_CHANNEL] === 'string' ? f[CF_SLACK_CHANNEL] : '';
+    const ts = typeof f[CF_SLACK_THREAD_TS] === 'string' && f[CF_SLACK_THREAD_TS] ? f[CF_SLACK_THREAD_TS] : typeof f[CF_PROMPT_TS] === 'string' ? f[CF_PROMPT_TS] : '';
+    if (!channel || !ts) return { error: 'this conversation carries no Slack channel and thread' };
+    return { thread: `${channel}:${ts}` };
+  }
 }
+
+function why(e: unknown): string { return e instanceof ApiError ? `${e.status} ${e.type ?? ''}`.trim() : (e as Error).message; }

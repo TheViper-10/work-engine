@@ -24,6 +24,14 @@ Each job has one home: an engine-owned DM. Only the session in the home acts. Ot
 
 `checkpoint` status is exactly one word: `working`, `waiting`, `blocked`, `done` or `cancelled`; the sentence goes in `waiting_for`. The engine closes a job only on `done` or `cancelled`, and only when nothing is owed.
 
+## Threads
+A thread is written `<channel>:<ts>` (for a Slack mention, the comment's `external_ref` without `slack:`). Anything else answers
+`bad_thread` and nothing is recorded. In a Slack conversation the engine can also read the thread from the platform when you omit it
+or pass something wrong. A `job_open` with a placeholder target (`next`, empty) joins the job already running, or answers `bad_target`
+when none runs; another version joins the running job with a flag unless you say `queue` (after it) or `replace` (the owner's call).
+`say` with a post link from another thread answers `wrong_thread`: post in the owed thread and send that message's link. `say` for an
+outcome milestone answers `not_reached` until `checkpoint(reached)` recorded it after you read the source.
+
 ## Special answers
 - `route`: you are not in the home. The action was recorded for the job owner, who will do it.
   Nothing was started; tell the person the job owner will follow up.

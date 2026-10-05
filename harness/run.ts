@@ -61,7 +61,7 @@ async function main() {
     for (const mode of modes) {
       for (let n = 1; n <= runs; n++) {
         const binding = makeBinding(bindingKind, guidance_version.combined);
-        const tony: TonyModel = tonyKind === 'scripted' ? new ScriptedTony() : new GatewayTony();
+        const tony: TonyModel = tonyKind === 'scripted' ? new ScriptedTony(!!sc.scripted_slips) : new GatewayTony();
         const driver = new Driver({ scenario: sc, playbook, binding, tony, mode, log: a.quiet ? undefined : (l) => console.log('  ' + l) });
         const run = await driver.run();
         run.config = { playbook_path: playbookPath, reference_paths: referencePaths, playbook_sha256: sha256(playbookText), prompt_sha256: sha256(driver.system), guidance_version };

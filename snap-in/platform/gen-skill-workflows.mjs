@@ -27,7 +27,7 @@ export const SKILLS = {
     fields: [
       { name: 'workflow', type: T, required: true, description: 'Workflow id of the job to open, for example desktop-release.' },
       { name: 'target', type: T, required: true, description: 'The target of the job, for example the version being released.' },
-      { name: 'thread', type: T, required: true, description: 'The Slack thread you are in, as <channel>:<ts>.' },
+      { name: 'thread', type: T, required: true, description: 'The Slack thread as <channel>:<ts>. In a Slack mention it is the request comment external_ref (slack:<channel>:<ts>) without the slack: prefix; a DevRev DM id is not a thread.' },
       { name: 'role', type: T, description: 'Role of this thread for the job: request, side or qa.' },
       { name: 'private', type: 'bool', description: 'True to keep this thread private.' },
       { name: 'intent', type: 'enum', values: ['join', 'replace', 'queue'], description: 'Join the running job, replace its home, or queue behind it.' },

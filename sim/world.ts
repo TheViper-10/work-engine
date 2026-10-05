@@ -18,8 +18,11 @@ export const HARRY = 'U0C4YRX93PS';
 export const OUTSIDER = 'UOUTSIDER';
 export const PRIVATE_THREAD = 'C';
 
-export function loadSpec(): Spec {
-  return JSON.parse(readFileSync(new URL('../workflows/desktop-release/spec.json', import.meta.url), 'utf8')) as Spec;
+/** The general sim uses many synthetic targets (T1, T2), so the one-open-job rule is off; its named case turns it on. */
+export function loadSpec(oneOpenJob = false): Spec {
+  const spec = JSON.parse(readFileSync(new URL('../workflows/desktop-release/spec.json', import.meta.url), 'utf8')) as Spec;
+  if (!oneOpenJob) { delete spec.one_open_job; delete spec.target_pattern; }
+  return spec;
 }
 
 export class Violation extends Error {}
@@ -49,7 +52,7 @@ export type CallName = 'jobOpen' | 'jobView' | 'intend' | 'say' | 'promiseAdd' |
 export class World {
   readonly store = new MemoryStore();
   readonly clock = new ManualClock(T0);
-  readonly spec = loadSpec();
+  readonly spec: Spec;
   readonly mode: 'flag' | 'hold';
   /** Two engine instances share one store: function invocations in phase 3 are not serialised across processes. */
   readonly engines: Engine[] = [];
@@ -70,8 +73,9 @@ export class World {
   privateThreadsSeen = new Set<string>([PRIVATE_THREAD]);
   private linkSeq = 0;
 
-  constructor(mode: 'flag' | 'hold', instances = 2, overrides: { inboxMaxUnprocessed?: number; noticeCoalesceMinutes?: number } = {}, noGo: 'flag' | 'hold' = 'flag') {
+  constructor(mode: 'flag' | 'hold', instances = 2, overrides: { inboxMaxUnprocessed?: number; noticeCoalesceMinutes?: number } = {}, noGo: 'flag' | 'hold' = 'flag', oneOpenJob = false) {
     this.mode = mode;
+    this.spec = loadSpec(oneOpenJob);
     // no_go_for_build stays a flag in the general sim: many cases intend a gated action with no ask on purpose. Its own named case sets it.
     const checks = Object.fromEntries(CHECK_NAMES.map((n) => [n, n === 'no_go_for_build' ? noGo : mode]));
     for (let k = 0; k < instances; k++) {

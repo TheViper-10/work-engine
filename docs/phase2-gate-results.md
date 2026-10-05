@@ -156,3 +156,23 @@ Scripted replay with `--checks deploy` (stale-go, cancel-mid-publish, interrupti
 ### Checks
 
 lint ok; 54 unit tests; sim 1,000 + 1,000 orders and 46 named cases (new: `no-go-for-build`); 28 repros clear; 83 snap-in tests; snap-in build and pack ok. Tarball `snap-in/dist-tarballs/work-engine-qa-v1.tgz`, secret scan no matches, sha256 recorded in the commit message body.
+
+## Live run 1 repros (v6, R51 to R57)
+Each defect from live run 1 (`30-work-engine-live-qa-release.md`) has an offline test that failed before its fix. Repro tests: `test/live-run1.test.ts` (engine), `snap-in/test/{directory,source,e2e-offline}.test.ts` (adapters and dispatcher), `sim/named.ts` ("one open job per workflow"), `pilot/test_grade_engine.py` (grader), scenario `scenarios/run1-replay.json`.
+
+| F | Repro | Fix | Layer |
+|---|---|---|---|
+| F1 | bad_thread tests; threadOf tests; dispatcher test with a DM id as thread | normalize or refuse; thread from the platform (R51); faithful mention rendering in the harness | engine, snap-in adapter, harness, skill text |
+| F2/F3 | engine tests, named sim case, run1-replay (max_jobs 1) | one open job per workflow; placeholder target joins or bad_target (R52) | engine + spec data |
+| F7 | real-shaped commits fixture, snapshot tests | timer snapshot for the operation path; newest non-[skip ci] commit (R53) | snap-in adapter |
+| F9 | wrong_thread tests (engine and dispatcher) | link must be in the delivery's thread (R54) | engine |
+| F10 | not_reached test | outcome milestones only via checkpoint (R55) | engine + spec data + playbook |
+| F4 | re-wake test | 5 minute reply window, 3 re-wakes (R56) | engine |
+| F5/F6/F8 | run1-replay outcome bars (no acting from a mention, no engine words, no Rashmi) | playbook sections: Reading a Slack request, Voice, settle actions | knowledge |
+| F11/F13 | grader tests | internal custom-objects.get; grade every job; Ownership fails on more than one job (R57) | pilot |
+
+Results. Engine checks green: lint, unit, sim (2x1000 + named), red-team repros, snapin:test, grader tests. Scripted (--checks deploy): interruption-boundary PASS, run1-replay PASS (with the DM-id and `next` slips, recovered by the engine).
+
+Real model (Sonnet 5.5, gateway, --checks deploy, 1 run each):
+- run1-replay: score PASS, outcome FAIL on one bar: the first relay addressed "Rashmi" (the DevRev comment author), reproducing F6. The connector body names nobody, so the playbook now tells the model to read the thread and address its author. NOT RERUN (call budget spent).
+- interruption-boundary: FAIL (6/8 milestones, 18 sessions). The home waited for Harry's sign-off that never came, and the run looped on 5 minute wakes. Not yet diagnosed; the first candidate is that the model never asked Harry in the QA thread (the scenario's sign-off fires on Tony's post there). It needs a trace read, then one rerun of this scenario. The connector-faithful interruption-boundary smoke is therefore NOT green.

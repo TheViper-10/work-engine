@@ -1,0 +1,58 @@
+[
+ {
+  "sha": "1bbe07cf54b7a7d96d9129dca8ff982573ab3022",
+  "commit": {
+   "message": "chore(desktop): mock publish 5.2.11 to qa [skip ci]",
+   "committer": {
+    "date": "2026-10-04T23:21:52Z"
+   }
+  },
+  "parents": [
+   {
+    "sha": "f32f69b27ced3e925915d29609cf4a4a7f148c8b"
+   }
+  ]
+ },
+ {
+  "sha": "f32f69b27ced3e925915d29609cf4a4a7f148c8b",
+  "commit": {
+   "message": "chore(desktop): bump version to 5.2.11 (#58058)",
+   "committer": {
+    "date": "2026-10-04T22:15:39Z"
+   }
+  },
+  "parents": [
+   {
+    "sha": "39f8a8c8b8365919cf5721ff91def06a225e85da"
+   }
+  ]
+ },
+ {
+  "sha": "39f8a8c8b8365919cf5721ff91def06a225e85da",
+  "commit": {
+   "message": "mock: publish desktop 5.2.10 to prod/alpha",
+   "committer": {
+    "date": "2026-10-04T04:27:09Z"
+   }
+  },
+  "parents": [
+   {
+    "sha": "4f8e533bc8e80d84acbe4cb10b7ff981b7bcdd5d"
+   }
+  ]
+ },
+ {
+  "sha": "4f8e533bc8e80d84acbe4cb10b7ff981b7bcdd5d",
+  "commit": {
+   "message": "chore(desktop): mock publish 5.2.10 to alpha [skip ci]",
+   "committer": {
+    "date": "2026-10-04T04:22:22Z"
+   }
+  },
+  "parents": [
+   {
+    "sha": "be681ddb8fca2255aa8dcd124f16803a7cbf8959"
+   }
+  ]
+ }
+]

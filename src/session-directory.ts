@@ -1,5 +1,5 @@
 // Session directory implementations (A1). The interface lives in types.ts.
-import type { SessionDirectory, SessionLookup } from './types.ts';
+import type { SessionDirectory, SessionLookup, ThreadLookup } from './types.ts';
 
 export type { SessionDirectory, SessionLookup } from './types.ts';
 
@@ -21,7 +21,19 @@ export class FakeSessionDirectory implements SessionDirectory {
   failAll = false;
   lookups = 0;
 
+  /** Custom fields of connector DMs, as the Slack connector writes them (channel, thread ts, prompt ts), keyed by DM. */
+  private readonly fields = new Map<string, Record<string, string>>();
   set(sessionId: string, dm: string): void { this.dms.set(sessionId, dm); }
+  /** A connector DM: the session lives in `dm`, which carries the Slack channel and thread as custom fields (R51). */
+  setConnectorDm(sessionId: string, dm: string, f: { channel: string; threadTs: string; promptTs?: string }): void {
+    this.dms.set(sessionId, dm);
+    this.fields.set(dm, { slack_channel: f.channel, slack_thread_ts: f.threadTs, prompt_ts: f.promptTs ?? f.threadTs });
+  }
+  async threadOf(sessionId: string): Promise<ThreadLookup> {
+    if (this.failAll || this.failing.has(sessionId)) return { error: 'session lookup failed' };
+    const f = this.fields.get(this.dms.get(sessionId) ?? '');
+    return f ? { thread: `${f.slack_channel}:${f.slack_thread_ts}` } : { error: 'this conversation carries no Slack channel and thread' };
+  }
   /** Make lookups for one session (or every session with '*') fail until cleared. */
   fail(sessionId: string, on = true): void {
     if (sessionId === '*') this.failAll = on;

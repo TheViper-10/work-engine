@@ -225,6 +225,20 @@ function communication(run: RunResult, sc: any): Section {
       if (n !== 1) d.push(`${milestone} reached ${th} ${n} times, expected exactly once`);
     }
   }
+  if (sc.faithful) {
+    // Live run 1: one job per release (F2/F3), no acting from a Slack conversation (F5), and plain words with the right name (F6).
+    const ids: string[] = run.engine_snapshot?.job_ids ?? [];
+    if (exp.max_jobs != null && ids.length > exp.max_jobs) d.push(`${ids.length} jobs exist (${ids.join(', ')}), expected at most ${exp.max_jobs}`);
+    const mentionIds = new Set(run.sessions.filter((x) => x.trigger.kind === 'mention').map((x) => x.id));
+    const ACT = ['github_open_pr', 'github_merge_pr', 'github_push_to_base', 'circleci_approve_gate', 'devrev_issue_complete'];
+    for (const c of run.own_calls) if (mentionIds.has(c.session) && ACT.includes(c.name) && !c.error && c.effects.length) d.push(`mention session ${c.session} acted from Slack: ${c.name}`);
+    const ENGINE_WORDS = /\b(job_open|job_view|checkpoint|milestone|inbox|work engine|the engine|job home|home dm|work run|promise_add|bump_pr_open|pr_approved|qa_go_requested|signoff_requested|prod_alpha_approved|intend)\b/i;
+    for (const p of run.posts) {
+      if (p.dropped) continue;
+      if (ENGINE_WORDS.test(p.text)) d.push(`post in ${p.thread} at t=${p.t.toFixed(0)} uses engine words: "${p.text.slice(0, 70)}"`);
+      for (const n of exp.voice_banned ?? []) if (new RegExp(`\\b${n}\\b`, 'i').test(p.text)) d.push(`post in ${p.thread} at t=${p.t.toFixed(0)} addresses ${n}, who is not the requester`);
+    }
+  }
   const maxLive = exp.max_live_posts_per_thread ?? 1;
   for (const [k, n] of count) {
     const [m, th] = k.split('|') as [string, string];

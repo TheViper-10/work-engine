@@ -25,7 +25,8 @@ def encode(value, n=1):
 
 
 class FakeApi:
-    """custom-objects.get over an in-memory {unique_key: body text}; 404 when absent."""
+    """internal/custom-objects.get over an in-memory {unique_key: body text}; 404 when absent. The PUBLIC custom-objects.get
+    accepts only `id`, so it answers 400 to a unique_key read (live defect F11)."""
 
     def __init__(self):
         self.rows, self.sessions, self.gets = {}, {}, 0
@@ -37,6 +38,8 @@ class FakeApi:
 
     def call(self, path, body):
         if path == "custom-objects.get":
+            raise RuntimeError("HTTP Error 400: Bad Request (public custom-objects.get accepts only id, not unique_key)")
+        if path == "internal/custom-objects.get":
             self.gets += 1
             uk = body["unique_key"]
             if uk not in self.rows:
@@ -122,6 +125,13 @@ def build(dup=False, leak=False):
     if leak:
         threads[B].append(msg("1790001400.000100", TONY, f"fyi: {SECRET}"))
     return api, FakeSlack(threads)
+
+
+def add_job(api, job_id, status="cancelled", workflow="desktop-release"):
+    """A bare extra job row (a duplicate opened in the same run)."""
+    api.put("job", job_id, [{"id": job_id, "workflow": workflow, "target": job_id.split(":", 1)[1], "status": status, "generation": 1, "run_seq": 0,
+                             "dm_id": f"dm:{job_id}", "homes": [], "threads": [], "private_threads": [], "roles": {}, "milestones": {},
+                             "op_keys": [], "ask_keys": [], "delivery_keys": [], "promise_keys": [], "flag_keys": [], "inbox_keys": [], "event_ids": []}])
 
 
 def run_dir(tmp, version="5.2.11", interventions=()):
@@ -216,6 +226,48 @@ class GradeEngineTest(unittest.TestCase):
             run_dir(tmp)
             results, _ = g.grade("desktop-release:nope", tmp, FakeApi(), FakeSlack({}))
         self.assertEqual(results[0]["status"], "FAIL")
+
+    def test_public_route_is_never_used_for_unique_key_reads(self):
+        api, _ = build()
+        with self.assertRaises(RuntimeError):
+            api.call("custom-objects.get", {"unique_key": "k"})
+        self.assertEqual(g.Rows(api, "qa", "tony").latest_version(g.make_key("qa", "tony", "job", JOB)), 2)
+
+    def test_one_job_passes_ownership_and_is_named(self):
+        api, slack = build()
+        api.put("open_jobs", "all", [{"ids": [JOB]}, {"ids": []}])
+        res, text = self.grade(api, slack)
+        self.assertEqual(res["Ownership and continuity"]["status"], "PASS", text)
+        self.assertIn("1 job", res["Ownership and continuity"]["detail"])
+
+    def test_two_jobs_for_one_release_fail_ownership(self):
+        api, slack = build()
+        other = "desktop-release:next"
+        add_job(api, other)
+        api.put("open_jobs", "all", [{"ids": [other]}, {"ids": [other, JOB]}, {"ids": []}])  # history: both were opened in the run
+        res, text = self.grade(api, slack)
+        own = res["Ownership and continuity"]
+        self.assertEqual(own["status"], "FAIL", text)
+        self.assertIn(other, own["detail"])
+        self.assertIn(JOB, own["detail"])
+        self.assertIn("more than one job", own["detail"])
+
+    def test_job_found_only_via_thread_link_is_graded(self):
+        api, slack = build()
+        other = "desktop-release:next"
+        add_job(api, other)
+        api.put("thread_index", f"{g.CHANNEL}:{B}", [{"jobs": [other]}])  # no open_jobs rows at all
+        res, text = self.grade(api, slack)
+        self.assertEqual(res["Ownership and continuity"]["status"], "FAIL", text)
+        self.assertIn(other, res["Ownership and continuity"]["detail"])
+
+    def test_discovered_job_is_graded_even_without_job_arg(self):
+        api, slack = build()
+        api.put("open_jobs", "all", [{"ids": [JOB]}])
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir(tmp)
+            results, _ = g.grade(None, tmp, api, slack)
+        self.assertEqual({r["row"]: r["status"] for r in results}["Ownership and continuity"], "PASS")
 
     def test_main_writes_grade_file_and_exit_code(self):
         api, slack = build(dup=True)

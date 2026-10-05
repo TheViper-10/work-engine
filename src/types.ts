@@ -12,7 +12,7 @@ export type FlagKind =
   | CheckName | 'missing_session' | 'unclaimed_post' | 'not_work_run' | 'job_ended'
   | 'source_unreadable' | 'ambiguous_outcome' | 'unknown_outcome'
   | 'identity_unconfirmed' | 'ambiguous_association' | 'escalate' | 'unknown_milestone' | 'unknown_action'
-  | 'wake_failed' | 'admin_close';
+  | 'wake_failed' | 'admin_close' | 'target_mismatch';
 
 export interface Clock {
   now(): number; // epoch ms
@@ -28,12 +28,18 @@ export interface Spec {
   workflow: string;
   version: number;
   link_roles: string[];
+  /** R52: at most one open job for the workflow. A join for anything else (a placeholder target, another target) joins the open job. */
+  one_open_job?: boolean;
+  /** R52: regular expression a target must match to name a job of its own. A target that does not match is never a job. */
+  target_pattern?: string;
   resources?: string[];
   people?: Record<string, { slack?: string; name?: string }>;
   gates?: Record<string, { responders: { primary: string[]; stand_ins?: string[] } }>;
   milestones?: Record<
     string,
-    { audience: { roles: string[]; promise_holders?: boolean }; opens_ask?: string }
+    { audience: { roles: string[]; promise_holders?: boolean }; opens_ask?: string;
+      /** R55: an outcome milestone is reached only through checkpoint(reached), after the source was read. `say` claims it only once reached. */
+      outcome?: boolean }
   >;
   actions?: Record<string, { resource?: string; gate?: string; proved_by?: string }>;
   defaults?: {
@@ -51,6 +57,8 @@ export interface SourceReader {
 export interface SlackReader {
   /** `relay` marks a reply to a mention; it never satisfies a claim. */
   findOwnPostAfter(thread: string, ts: number): Promise<{ link?: string; ts?: number; relay?: boolean } | null>;
+  /** R54: the thread a posted message belongs to, from its link. null means it could not be told. Optional: without it links are taken as reported. */
+  threadOfLink?(link: string): Promise<string | null>;
 }
 export interface Waker {
   /** May report `stale_version` when the home session is pinned to an old agent version (A3): the engine then replaces the home. */
@@ -67,12 +75,15 @@ export interface Waker {
 }
 
 export type SessionLookup = { dm: string } | { error: string };
+export type ThreadLookup = { thread: string } | { error: string };
 /** A1: which DM a session lives in. Looked up, never passed by the caller. Phase 3: the platform's session record. */
 export interface SessionDirectory {
   /** `job` is a hint for offline defaults that map a session to a job's home; a real directory ignores it. */
   dmOf(sessionId: string, job?: { id: string; dm: string; generation: number }): Promise<SessionLookup>;
   /** false when the answer depends on the job hint, so the engine must not cache it per session. */
   readonly cacheable?: boolean;
+  /** R51: the external thread (channel and thread ts) a conversation was opened for, read from the platform record of the session's DM. Optional. */
+  threadOf?(sessionId: string): Promise<ThreadLookup>;
 }
 
 export type JobStatus = 'queued' | 'open' | 'closing' | 'cancel_requested' | 'done' | 'cancelled';
@@ -135,6 +146,8 @@ export interface Job {
   guidance_version: string | null;
   /** R41: the state of a failing wake; absent when wakes work. */
   wake_fail?: WakeFail;
+  /** R56: wakes in a row whose run was never answered by a session in the home. */
+  wake_tries?: number;
 }
 
 /** R45: thrown by a Waker when no retry can help until configuration changes (not an outage). The engine flags it once and rechecks hourly. */
@@ -179,6 +192,8 @@ export interface Run {
   started_at: number;
   last_activity_at: number;
   state: 'active' | 'idle' | 'superseded';
+  /** R56: a session in the home has called the engine since this run was woken (a read counts). */
+  answered?: boolean;
 }
 
 export type OpOutcome = 'in_flight' | 'done' | 'failed' | 'unknown' | 'held';

@@ -2,6 +2,8 @@
   "workflow": "desktop-release",
   "version": 1,
   "link_roles": ["request", "side", "qa"],
+  "one_open_job": true,
+  "target_pattern": "^\\d+\\.\\d+\\.\\d+$",
   "resources": ["alpha", "main"],
   "people": {
     "owner": { "slack": "U042GEDM4BB", "name": "Priyadharshan (owner)" },
@@ -46,6 +48,7 @@
     },
     "qa_ready": {
       "audience": { "roles": ["request"], "promise_holders": true },
+      "outcome": true,
       "notes": "The build is in QA and Harry's 'New version released in QA' post was seen in the QA thread. This is the milestone thread B subscribes to ('tell me when QA is ready'). Source: 22-tony-coordinator-call-map.md:228-235 (moment 2, subscribe qa_ready) and :278-287 (moment 7)."
     },
     "signoff_requested": {
@@ -59,6 +62,7 @@
     },
     "live": {
       "audience": { "roles": ["request", "qa"], "promise_holders": true },
+      "outcome": true,
       "notes": "The version is live on prod alpha and the served revision was read from the update server. One message per audience thread. Audience: 28-handoff-work-engine-build.md section 3 D3 (request thread, every thread with a promise for live, and the QA thread). Source: 22-tony-coordinator-call-map.md:298-312 (moments 9 and 10; run 6 posted twice and missed B)."
     },
     "cancel_notice": {

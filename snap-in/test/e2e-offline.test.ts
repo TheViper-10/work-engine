@@ -13,7 +13,7 @@ import { readFileSync } from 'node:fs';
 
 const WF = 'desktop-release';
 /** Rows created by the interruption-boundary journey. Lower it when a change removes writes; never raise it without a decision-log entry. */
-const ROW_BUDGET = 67; // R50: +1 for the dmmap `created` row written before the hide (was 66; 77 before R42)
+const ROW_BUDGET = 67; // the R57 build snapshot rows are counted apart, with their own cap (see the 'snapshot cost' test) // R50: +1 for the dmmap `created` row written before the hide (was 66; 77 before R42)
 
 test('interruption-boundary journey through the dispatcher', async () => {
   const f = new FakePlatform(); const d = dispatcher(f);
@@ -111,7 +111,8 @@ test('interruption-boundary journey through the dispatcher', async () => {
   for (const k of f.rows.keys()) { const kind = k.split(':')[3] ?? '?'; byKind[kind] = (byKind[kind] ?? 0) + 1; }
   if (process.env.ROWS_DETAIL) { const per: Record<string, number> = {}; for (const k of f.rows.keys()) { const b = k.replace(/@v\d+$/, ''); per[b] = (per[b] ?? 0) + 1; } console.log(Object.entries(per).filter(([, n]) => n > 1).map(([k, n]) => `${n} ${k.split(':').slice(3).join(':')}`).join('\n')); }
   console.log(`ROWS interruption-boundary journey: ${f.rows.size} total ${JSON.stringify(byKind)}`);
-  assert.ok(f.rows.size <= ROW_BUDGET, `journey created ${f.rows.size} rows, budget ${ROW_BUDGET}: ${JSON.stringify(byKind)}`);
+  const snap = [...f.rows.keys()].filter((k) => /:source:builds@/.test(k)).length;
+  assert.ok(f.rows.size - snap <= ROW_BUDGET, `journey created ${f.rows.size} rows, budget ${ROW_BUDGET}: ${JSON.stringify(byKind)}`);
 });
 
 test('dispatcher rejects authority fields, unknown calls and unsupported events', async () => {
@@ -163,7 +164,7 @@ test('store failure mid-call returns an engine_unavailable answer, never a throw
 
 test('oversized record returns a clear record_too_large answer', async () => {
   const f = new FakePlatform(); const d = dispatcher(f);
-  const a = await d.call({ call: 'job_open', workflow: WF, target: 'x'.repeat(140_000), thread: `${ALLOWED}:1800000000.000901`, intent: 'join' });
+  const a = await d.call({ call: 'job_open', workflow: WF, target: '5.2.' + '9'.repeat(140_000), thread: `${ALLOWED}:1800000000.000901`, intent: 'join' });
   assert.equal(a.status, 'record_too_large');
 });
 
@@ -326,7 +327,8 @@ test('R49: a failed version read of any kind never stops the wake; one diagnosti
     f.installInputs.tony_agent = TONY;
     const mention = f.newMentionDm();
     await d.call({ call: 'job_open', workflow: WF, target: '5.2.11', thread: `${ALLOWED}:1.000001`, role: 'request', intent: 'join', requester: 'U1', agent_session_id: mention.session });
-    for (let i = 0; i < 4; i += 1) { await d.tick(); f.clock.advanceMinutes(2); }
+    // R56: a home that stays silent is woken again after 5 minutes, so this check stays inside the first wake's window.
+    for (let i = 0; i < 4; i += 1) { await d.tick(); f.clock.advanceMinutes(1); }
     // ensureHome needs chats.create, which is also gated by agent access in the fake, so only the 403 case shares that gate
     if (how !== '403') {
       assert.equal(f.triggers.length, 1, how);
@@ -345,4 +347,55 @@ test('R47: with the manifest as shipped the same journey creates the home (scope
   await d.tick(); f.clock.advanceMinutes(2); await d.tick();
   assert.equal(f.chats.size, 2);
   assert.ok(f.log.filter((l) => l.path === 'ai-agents.get').every((l) => l.status === 200));
+});
+
+// ---- live run 1 through the dispatcher (R51 to R56)
+test('R51 live run 1 F1: a mention session that passes its DevRev DM as the thread gets the connector thread, the watch follows it', async () => {
+  const f = new FakePlatform(); const d = dispatcher(f);
+  const m = f.newConnectorDm(ALLOWED, '1791149910.562169');
+  const a = await d.call({ call: 'job_open', workflow: WF, target: '5.2.11', thread: m.dm, role: 'request', intent: 'join', agent_session_id: m.session });
+  assert.equal(a.ok, true, a.say_to_tony);
+  assert.equal(a.thread, `${ALLOWED}:1791149910.562169`);
+  const watch = JSON.parse(String([...f.rows.values()].find((r) => r.unique_key.includes(':watch:'))?.custom_fields.tnt__body ?? '{}'));
+  assert.ok(JSON.stringify(watch).includes('1791149910.562169'), 'the poller watches the resolved thread');
+});
+
+test('R51: a DM id as the thread with no platform answer is bad_thread and nothing is recorded or watched', async () => {
+  const f = new FakePlatform(); const d = dispatcher(f);
+  const m = f.newMentionDm(); // no connector fields
+  const before = f.rowCount();
+  const a = await d.call({ call: 'job_open', workflow: WF, target: '5.2.11', thread: m.dm, role: 'request', intent: 'join', agent_session_id: m.session });
+  assert.equal(a.status, 'bad_thread');
+  assert.match(a.say_to_tony, /external_ref/);
+  assert.equal(f.rowCount(), before);
+});
+
+test('R54 live run 1 F9: through the dispatcher, a post link from another thread is wrong_thread and B is not marked told', async () => {
+  const f = new FakePlatform(); const d = dispatcher(f);
+  const A = f.postSlack(ALLOWED, null, { user: 'U1', text: 'root A' });
+  const B = f.postSlack(ALLOWED, null, { user: 'U1', text: 'root B' });
+  const inA = f.postSlack(ALLOWED, A, { user: OWN_BOT, text: 'reply in A' });
+  const mention = f.newMentionDm();
+  const o = await d.call({ call: 'job_open', workflow: WF, target: '5.2.11', thread: `${ALLOWED}:${A}`, role: 'request', intent: 'join', agent_session_id: mention.session });
+  await d.call({ call: 'job_open', workflow: WF, target: '5.2.11', thread: `${ALLOWED}:${B}`, role: 'side', intent: 'join', agent_session_id: mention.session });
+  const home = f.sessionIn([...f.chats.keys()].find((k) => k.endsWith('home')) ?? 'x');
+  void o; void home; void inA;
+  // the job home session is needed for say; use the dispatcher's own home created by a tick
+  await d.tick(); f.clock.advanceMinutes(2); await d.tick(); // the poller records the own post in A as an event
+  const homeDm = [...f.chats.keys()].find((k) => k.endsWith('home'))!;
+  const hs = f.sessionIn(homeDm);
+  await d.call({ call: 'checkpoint', job: `${WF}:5.2.11`, status: 'working', reached: ['qa_ready'], agent_session_id: hs });
+  const bad = await d.call({ call: 'say', job: `${WF}:5.2.11`, thread: `${ALLOWED}:${B}`, milestone: 'qa_ready', posted_link: `slack:${ALLOWED}:${inA}`, agent_session_id: hs });
+  assert.equal(bad.status, 'wrong_thread', bad.say_to_tony);
+});
+
+test('R57 snapshot cost: while a job is open the build snapshot costs at most one row per 10 minutes, and nothing without an open job', async () => {
+  const f = new FakePlatform(); const d = dispatcher(f);
+  for (let i = 0; i < 30; i++) { f.clock.advanceMinutes(1); await d.tick(); }
+  assert.equal(f.sourceRows, 0, 'no open job, no snapshot');
+  await openAndWake(f, d, '5.3.7');
+  const before = f.sourceRows;
+  for (let i = 0; i < 60; i++) { f.clock.advanceMinutes(1); await d.tick(); }
+  assert.ok(f.sourceRows - before <= 7, `60 ticks wrote ${f.sourceRows - before} snapshot rows`);
+  assert.ok(f.sourceRows >= 1);
 });

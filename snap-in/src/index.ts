@@ -2,13 +2,14 @@
 // Every call builds the engine on a PlatformStore and runs exactly one engine entry point. There is no queue:
 // the engine's own compare-and-set is the only ordering it relies on.
 import { Engine } from '../../src/engine.ts';
+import { makeKey } from '../../src/store.ts';
 import type { EngineConfig } from '../../src/config.ts';
 import { SystemClock } from '../../src/clock.ts';
 import type { Answer, Ctx } from '../../src/types.ts';
 import { PlatformSessionDirectory } from './directory.ts';
 import { ApiError, httpDeps, scoped, type Deps, type DevRevApi, type Identity } from './platform.ts';
 import { PlatformSlackReader, SlackPoller, normThread } from './slack.ts';
-import { GithubSourceReader } from './source.ts';
+import { GithubSourceReader, SnapshotSourceReader } from './source.ts';
 import { BodyTooLargeError, PlatformStore } from './store-platform.ts';
 import { engineConfig, parseAdminClose, readInputs, SPECS, type Inputs } from './specs.ts';
 import { PlatformWaker } from './waker.ts';
@@ -18,6 +19,8 @@ export type CallName = (typeof CALLS)[number];
 /** Authority is never caller-supplied: the DM comes from the looked-up session (D1). */
 export const FORBIDDEN_AUTHORITY = new Set(['caller_id', 'actor_id', 'grant', 'approval', 'state', 'capabilities', 'slack', 'dm', 'dm_id', 'session_object', 'scheduled', 'scheduled_actor', 'session_id', 'generation']);
 export const PR_GATES = ['pr_review'] as const;
+/** Gates whose ask names a build (the milestones that open an ask). */
+export const SOURCE_GATES = [...new Set(SPECS.flatMap((sp) => Object.values(sp.milestones ?? {}).map((m) => m.opens_ask).filter((g): g is string => !!g)))];
 export const TICK_BUDGET_MS = 100_000;
 
 export interface Runtime {
@@ -27,6 +30,7 @@ export interface Runtime {
   store: PlatformStore;
   directory: PlatformSessionDirectory;
   waker: PlatformWaker;
+  source: SnapshotSourceReader;
 }
 
 const isObj = (v: unknown): v is Record<string, any> => !!v && typeof v === 'object' && !Array.isArray(v);
@@ -55,9 +59,13 @@ export function assembleRuntime(event: any, deps: Deps, as: Identity, inputs: In
     tonyAgent: inputs.tony_agent, wakeUser: inputs.wake_user, wakeWorkflow: inputs.wake_workflow,
   });
   const slackApi = deps.slack(event);
+  const source = new SnapshotSourceReader({
+    live: new GithubSourceReader({ api: deps.github(event), repo: inputs.github_repo, branch: inputs.mock_branch, statePath: inputs.state_path, prGates: PR_GATES }),
+    store, env: inputs.env, bot: inputs.bot, now: () => deps.clock.now(),
+  });
   const engine = new Engine({
-    store, clock: deps.clock, config, specs: SPECS, sessionDirectory: directory, waker,
-    sourceReader: new GithubSourceReader({ api: deps.github(event), repo: inputs.github_repo, branch: inputs.mock_branch, statePath: inputs.state_path, prGates: PR_GATES }),
+    store, clock: deps.clock, config, specs: SPECS, sessionDirectory: directory, waker, strictThreads: true,
+    sourceReader: source,
     slackReader: new PlatformSlackReader({ api: slackApi, allow: inputs.slack_channel_allowlist, ownBotUserId: inputs.own_bot_user }),
     guidanceVersion: inputs.guidance_version || undefined,
   });
@@ -65,7 +73,7 @@ export function assembleRuntime(event: any, deps: Deps, as: Identity, inputs: In
     api: slackApi, store, clock: deps.clock, env: inputs.env, bot: inputs.bot, allow: inputs.slack_channel_allowlist,
     ownBotUserId: inputs.own_bot_user, ingest: (ev) => engine.ingest(ev),
   });
-  return { engine, poller, inputs, store, directory, waker };
+  return { engine, poller, inputs, store, directory, waker, source };
 }
 
 // ---------------------------------------------------------------- argument shaping
@@ -138,8 +146,8 @@ export async function runOperation(event: any, deps: Deps): Promise<Answer> {
       case 'checkpoint': answer = await rt.engine.checkpoint(args as any, ctx); break;
     }
     // A linked Slack thread becomes a watched thread for the poller (the allowlist is enforced inside watch()).
-    if (call === 'job_open' && answer.ok && typeof answer.job === 'string' && typeof args.thread === 'string') {
-      await rt.poller.watch(args.thread, answer.job).catch(() => undefined);
+    if (call === 'job_open' && answer.ok && typeof answer.job === 'string' && typeof answer.thread === 'string') {
+      await rt.poller.watch(answer.thread, answer.job).catch(() => undefined);
     }
     return answer;
   } catch (e) {
@@ -162,6 +170,11 @@ export async function runTick(event: any, deps: Deps): Promise<TickResult> {
   for (const { job, reason } of parseAdminClose(rt.inputs.admin_close_jobs)) {
     try { out.admin.push(await rt.engine.adminClose(job, reason)); } catch (e) { out.errors.push(`admin_close ${job}: ${(e as Error).message}`); }
   }
+  // R57: while a job is open, keep the per-gate build snapshot fresh for the operation path (which has no GitHub credential).
+  try {
+    const open = await rt.store.get<{ ids: string[] }>(makeKey(rt.inputs.env, rt.inputs.bot, 'open_jobs', 'all'));
+    if (open?.ids?.length) await rt.source.refresh(SOURCE_GATES);
+  } catch (e) { out.errors.push(`source: ${(e as Error).message}`); }
   try { out.poll = await rt.poller.poll(); out.errors.push(...out.poll.errors); } catch (e) { out.errors.push(`poll: ${(e as Error).message}`); }
   if (deps.clock.now() - started > TICK_BUDGET_MS) { out.errors.push('tick budget spent after the poll; sweep left for the next tick'); return out; }
   try { out.sweep = await rt.engine.sweep(); } catch (e) { out.errors.push(`sweep: ${(e as Error).message}`); }

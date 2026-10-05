@@ -151,7 +151,10 @@ export function score(run: RunResult, sc: any): Score {
     if (done) holds_worked_past.push({ hold: h, tool_call: done.name, t: done.t });
   }
 
+  // A scenario that scripts the live run 1 slips (scripted_slips) expects the engine to refuse them; those two answers are not Tony's slips.
+  const expectedRefusal = (c: EngineCall) => !!sc.scripted_slips && ['bad_target', 'bad_thread'].includes(String(c.output?.status));
   const protocol_refusals = calls
+    .filter((c) => !expectedRefusal(c))
     .map((c) => ({ seq: c.seq, name: c.name, why: isProtocolRefusal(c) }))
     .filter((x): x is { seq: number; name: string; why: string } => !!x.why);
 
