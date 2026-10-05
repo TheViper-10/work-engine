@@ -41,10 +41,8 @@ if (!githubToken) { try { githubToken = execFileSync('gh', ['auth', 'token'], { 
 const missing = [['AGENTCORE_RUNTIME_INSTANCE_ORG_TOKEN', devrevToken], ['TONY_SLACK_BOT_TOKEN', slackToken], ['GITHUB_TOKEN', githubToken]].filter(([, v]) => !v).map(([n]) => n);
 if (missing.length) { console.error(`missing credentials: ${missing.join(', ')}`); process.exit(2); }
 
-// R61: job_open verifies the thread exists, so the probe links a REAL thread: the newest message of the allowlisted channel (read only, nothing is posted).
-const histTop = await fetch('https://slack.com/api/conversations.history?channel=C0C4K4EGZT6&limit=1', { headers: { Authorization: `Bearer ${slackToken}` } }).then((r) => r.json()).catch(() => ({})) as any;
-const THREAD = `C0C4K4EGZT6:${String(histTop?.messages?.[0]?.thread_ts ?? histTop?.messages?.[0]?.ts ?? '')}`;
-if (!/^C0C4K4EGZT6:\d+\.\d+$/.test(THREAD)) { console.error('cannot read a real thread from C0C4K4EGZT6 (conversations.history)'); process.exit(2); }
+// R61: job_open verifies the thread exists, so main() links a REAL thread: the newest message of the allowlisted channel (read only, nothing is posted).
+let THREAD = '';
 
 // One event carries the local tokens in every slot the real adapters read: caller, service and owner are all devu/1 here.
 const event = {
@@ -256,6 +254,9 @@ async function cleanup(): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  const histTop = await fetch('https://slack.com/api/conversations.history?channel=C0C4K4EGZT6&limit=1', { headers: { Authorization: `Bearer ${slackToken}` } }).then((r) => r.json()).catch(() => ({})) as any;
+  THREAD = `C0C4K4EGZT6:${String(histTop?.messages?.[0]?.thread_ts ?? histTop?.messages?.[0]?.ts ?? '')}`;
+  if (!/^C0C4K4EGZT6:\d+\.\d+$/.test(THREAD)) { console.error('cannot read a real thread from C0C4K4EGZT6 (conversations.history)'); process.exit(2); }
   try { await journey(); } catch (e) { record('x', 'probe aborted', false, `${(e as Error).name}: ${(e as Error).message.slice(0, 200)}`); }
   finally { try { await cleanup(); } catch (e) { record('h', 'cleanup', false, (e as Error).message.slice(0, 200)); } }
 
